@@ -30,8 +30,8 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Use semantic HTML (header, main, footer, section, nav)
     - _Requirements: 1.1, 1.4, 7.1, 7.2, 7.3, 7.4, 8.4_
 
-- [ ] 2. Build Challenge Matrix and Filter System
-  - [ ] 2.1 Create the Challenge Matrix grid component
+- [x] 2. Build Challenge Matrix and Filter System
+  - [x] 2.1 Create the Challenge Matrix grid component
     - Add a 7-column grid showing 31 days with glassmorphism cell styling
     - Each cell shows day number with visual states: has-content (glowing border), pending (dimmed)
     - Color-code cells by difficulty: tricky (cyan), nasty (red/error), cursed (accent yellow-green)
@@ -39,7 +39,7 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Responsive: collapse to 4 columns on mobile
     - _Requirements: 1.2, 1.5_
 
-  - [ ] 2.2 Create the Filter Bar
+  - [x] 2.2 Create the Filter Bar
     - Add filter buttons: All, Behavior, Pattern, Performance, Logic, ☠ Cursed Only
     - Style with glassmorphism/outline buttons, active state with primary fill
     - Wire filter logic to show/hide topic cards by category

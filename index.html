@@ -174,6 +174,106 @@
     font-weight: 600;
   }
 
+  /* ── Challenge Matrix ──────────────────────────────────── */
+  .matrix-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 6px;
+  }
+
+  .matrix-cell {
+    aspect-ratio: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--tw-outline-variant, #424754);
+    border-radius: 0.25rem;
+    transition: all 0.2s ease;
+  }
+
+  .matrix-cell.has-content {
+    cursor: pointer;
+    border-color: #4cd7f6;
+    color: #4cd7f6;
+    background: rgba(76, 215, 246, 0.05);
+  }
+
+  .matrix-cell.has-content:hover {
+    box-shadow: 0 0 12px rgba(76, 215, 246, 0.3);
+  }
+
+  .matrix-cell.pending {
+    color: rgba(194, 198, 214, 0.4);
+    border-color: rgba(66, 71, 84, 0.3);
+  }
+
+  .matrix-cell.diff-tricky.has-content {
+    border-color: #4cd7f6;
+    color: #4cd7f6;
+  }
+
+  .matrix-cell.diff-nasty.has-content {
+    border-color: #ffb4ab;
+    color: #ffb4ab;
+  }
+
+  .matrix-cell.diff-cursed.has-content {
+    border-color: #adc6ff;
+    color: #adc6ff;
+    background: rgba(173, 198, 255, 0.05);
+  }
+
+  .matrix-cell.empty {
+    border-color: transparent;
+    pointer-events: none;
+  }
+
+  /* ── Filter Bar ─────────────────────────────────────── */
+  .filter-bar {
+    padding: 20px 40px;
+    border-bottom: 1px solid #424754;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .filter-label {
+    font-family: monospace;
+    font-size: 10px;
+    color: rgba(194, 198, 214, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+  }
+
+  .filter-btn {
+    font-family: monospace;
+    font-size: 11px;
+    padding: 6px 14px;
+    border: 1px solid #424754;
+    background: transparent;
+    color: rgba(194, 198, 214, 0.6);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    letter-spacing: 0.05em;
+    border-radius: 0.5rem;
+  }
+
+  .filter-btn:hover {
+    border-color: #4cd7f6;
+    color: #4cd7f6;
+  }
+
+  .filter-btn.active {
+    background: #4cd7f6;
+    color: #003640;
+    border-color: #4cd7f6;
+    font-weight: 600;
+  }
+
   /* ── Responsive ──────────────────────────────────────── */
   @media (max-width: 600px) {
     .hero-title {
@@ -181,6 +281,12 @@
     }
     .watermark {
       font-size: 140px;
+    }
+    .matrix-grid {
+      grid-template-columns: repeat(4, 1fr);
+    }
+    .filter-bar {
+      padding: 20px;
     }
   }
 </style>
@@ -241,6 +347,25 @@
   </div>
 
 </header>
+
+<!-- ═══ Challenge Matrix Section ═════════════════════════ -->
+<section class="px-margin py-5 border-b border-outline-variant max-sm:px-5" id="matrix-section">
+  <div class="matrix-label font-code-snippet text-[10px] text-on-surface-variant/50 uppercase tracking-[0.15em] mb-3">Challenge Matrix</div>
+  <div class="matrix-grid" id="matrix-grid">
+    <!-- Will be populated by JS in Task 5 -->
+  </div>
+</section>
+
+<!-- ═══ Filter Bar ══════════════════════════════════════ -->
+<nav class="filter-bar" id="filter-bar" aria-label="Topic filters">
+  <span class="filter-label">Filter →</span>
+  <button class="filter-btn active" data-filter="all">All</button>
+  <button class="filter-btn" data-filter="behavior">Behavior</button>
+  <button class="filter-btn" data-filter="pattern">Pattern</button>
+  <button class="filter-btn" data-filter="performance">Performance</button>
+  <button class="filter-btn" data-filter="logic">Logic</button>
+  <button class="filter-btn" data-filter="cursed">☠ Cursed Only</button>
+</nav>
 
 <!-- ═══ Main Content Area ═══════════════════════════════ -->
 <main id="challenge-container" class="flex-1">
