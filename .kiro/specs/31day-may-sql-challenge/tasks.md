@@ -46,14 +46,14 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Hide empty week sections when filter is active
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 
-- [ ] 3. Build Week Sections and Topic Cards
-  - [ ] 3.1 Create Week Section component with sticky header
+- [x] 3. Build Week Sections and Topic Cards
+  - [x] 3.1 Create Week Section component with sticky header
     - Week number (display font, large, accent color), theme title, day count
     - Sticky header on scroll with background matching page bg
     - Border separators between weeks
     - _Requirements: 1.3_
 
-  - [ ] 3.2 Create Topic Card component
+  - [x] 3.2 Create Topic Card component
     - Day badge, difficulty badge (color-coded), format badge, topic name, description, tags
     - Cards with content get left accent border + pointer cursor + arrow indicator on hover
     - Glassmorphism hover effect (subtle background shift)
