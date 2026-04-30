@@ -61,8 +61,8 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Grid layout: auto-fill, minmax(340px, 1fr)
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 8.2, 8.3_
 
-- [ ] 4. Build Content Modal system
-  - [ ] 4.1 Create modal overlay and structure
+- [x] 4. Build Content Modal system
+  - [x] 4.1 Create modal overlay and structure
     - Fixed overlay with dark backdrop (88% opacity)
     - Modal container with glassmorphism styling, max-width 840px
     - Header: day badge, difficulty badge, title, description
@@ -70,7 +70,7 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Fade-in/slide-up animation, body scroll lock
     - _Requirements: 4.1, 4.2, 4.8, 4.9, 10.1, 10.2_
 
-  - [ ] 4.2 Create Step Block rendering (code, result, insight, warning blocks)
+  - [x] 4.2 Create Step Block rendering (code, result, insight, warning blocks)
     - Step number (display font), label, title, body text
     - Code block: dark recessed container, accent left border, syntax highlighting colors
     - Result block: monospace table format, cyan left border, highlighted values

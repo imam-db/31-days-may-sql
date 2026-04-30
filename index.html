@@ -461,6 +461,215 @@
     border-radius: 0.25rem;
   }
 
+  /* ── Modal ─────────────────────────────────────────────── */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.88);
+    z-index: 1000;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 20px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    overflow-y: auto;
+  }
+
+  .modal-overlay.open {
+    opacity: 1;
+    pointer-events: all;
+  }
+
+  .modal {
+    background: #0d0f1a;
+    border: 1px solid #424754;
+    max-width: 840px;
+    width: 100%;
+    transform: translateY(20px);
+    transition: transform 0.25s;
+    border-radius: 1rem;
+    box-shadow: 0 0 60px rgba(0, 0, 0, 0.5), 0 0 20px rgba(76, 215, 246, 0.05);
+  }
+
+  .modal-overlay.open .modal {
+    transform: translateY(0);
+  }
+
+  .modal-header {
+    padding: 36px 44px 28px;
+    border-bottom: 1px solid #424754;
+    position: relative;
+  }
+
+  .modal-close {
+    position: absolute;
+    top: 20px;
+    right: 24px;
+    font-family: monospace;
+    font-size: 18px;
+    color: #8c909f;
+    cursor: pointer;
+    background: none;
+    border: none;
+    transition: color 0.15s;
+    line-height: 1;
+    padding: 4px 8px;
+  }
+
+  .modal-close:hover {
+    color: #dce1fb;
+  }
+
+  .modal-eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+
+  .modal-title {
+    font-family: monospace;
+    font-size: 20px;
+    font-weight: 600;
+    color: #dce1fb;
+    line-height: 1.3;
+    margin-bottom: 12px;
+  }
+
+  .modal-desc {
+    font-size: 13px;
+    color: rgba(194, 198, 214, 0.6);
+    line-height: 1.7;
+    max-width: 620px;
+  }
+
+  .modal-body {
+    padding: 36px 44px;
+  }
+
+  /* ── Step Blocks ───────────────────────────────────────── */
+  .step {
+    margin-bottom: 40px;
+    padding-bottom: 40px;
+    border-bottom: 1px solid #424754;
+  }
+
+  .step:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+  }
+
+  .step-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .step-num {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 36px;
+    font-weight: 800;
+    color: #4cd7f6;
+    line-height: 1;
+    flex-shrink: 0;
+    opacity: 0.6;
+  }
+
+  .step-meta {
+    flex: 1;
+  }
+
+  .step-label {
+    font-family: monospace;
+    font-size: 9px;
+    color: rgba(194, 198, 214, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    margin-bottom: 4px;
+  }
+
+  .step-title {
+    font-family: monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: #dce1fb;
+  }
+
+  .step-body {
+    font-size: 13px;
+    color: rgba(194, 198, 214, 0.6);
+    line-height: 1.7;
+    margin-bottom: 18px;
+  }
+
+  /* Code Block */
+  .code-block {
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid #424754;
+    border-left: 3px solid #4cd7f6;
+    padding: 20px 24px;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.9;
+    color: #c8c8c0;
+    overflow-x: auto;
+    margin-bottom: 14px;
+    white-space: pre;
+    border-radius: 0.5rem;
+  }
+
+  /* Result Block */
+  .result-block {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid #424754;
+    border-left: 3px solid #adc6ff;
+    padding: 16px 24px;
+    font-family: monospace;
+    font-size: 11.5px;
+    line-height: 1.9;
+    color: rgba(194, 198, 214, 0.4);
+    overflow-x: auto;
+    margin-bottom: 14px;
+    white-space: pre;
+    border-radius: 0.5rem;
+  }
+
+  .result-block .col { color: #adc6ff; font-weight: 600; }
+  .result-block .hi  { color: #4cd7f6; }
+  .result-block .dim { color: rgba(194, 198, 214, 0.2); }
+
+  /* Insight Block */
+  .insight-block {
+    background: rgba(76, 215, 246, 0.05);
+    border: 1px solid rgba(76, 215, 246, 0.15);
+    padding: 14px 20px;
+    font-family: monospace;
+    font-size: 11.5px;
+    line-height: 1.7;
+    color: rgba(76, 215, 246, 0.8);
+    margin-bottom: 10px;
+    border-radius: 0.5rem;
+  }
+
+  .insight-block strong { color: #4cd7f6; }
+
+  /* Warning Block */
+  .warn-block {
+    background: rgba(255, 180, 171, 0.05);
+    border: 1px solid rgba(255, 180, 171, 0.15);
+    padding: 14px 20px;
+    font-family: monospace;
+    font-size: 11.5px;
+    line-height: 1.7;
+    color: rgba(255, 180, 171, 0.8);
+    border-radius: 0.5rem;
+  }
+
   /* ── Responsive ──────────────────────────────────────── */
   @media (max-width: 600px) {
     .hero-title {
@@ -484,6 +693,9 @@
     .topic-grid {
       grid-template-columns: 1fr;
     }
+    .modal-overlay { padding: 0; align-items: flex-start; }
+    .modal { border-radius: 0; }
+    .modal-header, .modal-body { padding: 24px 20px; }
   }
 </style>
 </head>
@@ -579,6 +791,19 @@
     31 DAYS · MAY 2026 · #31DaysOfTrickySQL
   </div>
 </footer>
+
+<!-- ═══ Content Modal ═══════════════════════════════════ -->
+<div class="modal-overlay" id="modal" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="modal" id="modal-box">
+    <div class="modal-header">
+      <button class="modal-close" id="modal-close-btn" aria-label="Close modal">✕</button>
+      <div class="modal-eyebrow" id="modal-eyebrow"></div>
+      <div class="modal-title" id="modal-title"></div>
+      <div class="modal-desc" id="modal-desc"></div>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
 
 </body>
 </html>
