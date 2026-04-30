@@ -805,5 +805,455 @@
   </div>
 </div>
 
+<script>
+// ─── WEEKS DATA ───────────────────────────────────────────
+const weeks = [
+  {
+    number: "01",
+    title: "The Lies SQL Tells You — NULL & Type Traps",
+    topics: [
+      { day:1, name:"NULL Is Three Values, Not Two", desc:"Why does WHERE col != 'x' silently drop rows where col is NULL? SQL operates on three-valued logic — TRUE, FALSE, and UNKNOWN — and most developers never realize it.", difficulty:"nasty", format:"progressive", tags:["null","logic","behavior"], category:"behavior", hasContent:true },
+      { day:2, name:"COUNT(*) vs COUNT(col) vs COUNT(DISTINCT col)", desc:"Three expressions that look almost identical but can return wildly different numbers on the same dataset. A trap that slips through code review regularly.", difficulty:"tricky", format:"mixed", tags:["aggregation","null","behavior"], category:"behavior", hasContent:true },
+      { day:3, name:"The Floating Point Trap in SUM()", desc:"0.1 + 0.2 ≠ 0.3 in SQL. Why SUM() on a FLOAT column can silently lie to you, and when you must use NUMERIC/DECIMAL instead.", difficulty:"nasty", format:"progressive", tags:["numeric","precision","behavior"], category:"behavior" },
+      { day:4, name:"DISTINCT Inside a Window Function Doesn't Exist", desc:"COUNT(DISTINCT x) OVER (...) is not directly supported in PostgreSQL. Why not, and what's the most elegant workaround using the dense_rank trick?", difficulty:"nasty", format:"single", tags:["window","distinct","behavior"], category:"behavior" },
+      { day:5, name:"NULL in ORDER BY — Who Goes First?", desc:"Standard SQL, PostgreSQL, MySQL, and BigQuery have different defaults for where NULLs land when sorting. NULLS FIRST / NULLS LAST and why it silently breaks pagination.", difficulty:"tricky", format:"mixed", tags:["null","sorting","behavior"], category:"behavior" },
+      { day:6, name:"Implicit Type Coercion That Kills Your Index", desc:"WHERE varchar_col = 123 looks fine, runs fine, but your index is dead. How implicit casting silently destroys your query plan.", difficulty:"nasty", format:"progressive", tags:["type","index","performance"], category:"performance" },
+      { day:7, name:"GROUP BY Ordinal Position — Feature or Time Bomb?", desc:"GROUP BY 1, 2 is valid shorthand in many databases. But why is it a time bomb the moment someone reorders the SELECT columns?", difficulty:"tricky", format:"single", tags:["groupby","behavior","gotcha"], category:"behavior" },
+    ]
+  },
+  {
+    number: "02",
+    title: "Rare Patterns — Classic Problems Few Actually Understand",
+    topics: [
+      { day:8, name:"The Gaps and Islands Problem", desc:"Finding breaks in sequential data. A classic pattern — but most people memorize the solution without understanding why row_number() - dense_rank() actually works.", difficulty:"nasty", format:"progressive", tags:["window","pattern","sequence"], category:"pattern" },
+      { day:9, name:"Relational Division — 'Find Who Bought Everything'", desc:"The query 'find customers who bought ALL products in category X'. A relational division operation that 90% of developers solve inefficiently.", difficulty:"nasty", format:"mixed", tags:["relational","pattern","logic"], category:"logic" },
+      { day:10, name:"Pivot Without the PIVOT Keyword", desc:"Dynamic pivot using pure conditional aggregation. Then: dynamic column names unknown at query-write time.", difficulty:"nasty", format:"progressive", tags:["pivot","aggregation","pattern"], category:"pattern" },
+      { day:11, name:"Slowly Changing Dimensions in Raw SQL", desc:"Reading 'the value as of a specific date' from a history table without dbt or any framework. AS OF queries and bitemporal patterns.", difficulty:"nasty", format:"progressive", tags:["temporal","scd","pattern"], category:"pattern" },
+      { day:12, name:"Running Total With a Conditional Reset", desc:"A running SUM that resets to 0 when a condition is met. Looks like cumulative sum but requires state machine logic — SUM() OVER won't cut it.", difficulty:"cursed", format:"progressive", tags:["window","pattern","stateful"], category:"pattern" },
+      { day:13, name:"Median and Percentile Without PERCENTILE_CONT", desc:"Computing median from scratch using only window functions, on databases with no built-in percentile support. Exposes how SQL's ordered statistics really work.", difficulty:"nasty", format:"progressive", tags:["statistics","window","pattern"], category:"pattern" },
+      { day:14, name:"Bitwise Operations for a Permission Flag System", desc:"Storing multiple boolean permissions in a single integer column using bitmasks. How to query, filter, and update individual permissions without multiple columns.", difficulty:"nasty", format:"mixed", tags:["bitwise","pattern","storage"], category:"pattern" },
+    ]
+  },
+  {
+    number: "03",
+    title: "SQL as a Logic Engine — Recursive & Graph",
+    topics: [
+      { day:15, name:"Recursive CTE — Graph Traversal in SQL", desc:"SQL can traverse graphs like Neo4j — BFS on self-referencing tables (org charts, category trees, dependency graphs). Including cycle detection.", difficulty:"cursed", format:"progressive", tags:["recursive","graph","cte"], category:"logic" },
+      { day:16, name:"Simulating a Stack in Pure SQL", desc:"Implementing LIFO stack behavior using window functions and recursive CTEs. Useful for expression parsers and undo-history patterns.", difficulty:"cursed", format:"progressive", tags:["recursive","pattern","advanced"], category:"logic" },
+      { day:17, name:"Topological Sort in SQL", desc:"Ordering nodes in a DAG by dependency — pure SQL dependency resolution without an application layer.", difficulty:"cursed", format:"single", tags:["graph","recursive","algorithm"], category:"logic" },
+      { day:18, name:"Fibonacci and Mathematical Sequences via CTE", desc:"Not about Fibonacci — about understanding that recursive CTEs are Turing-complete and can compute any sequence. Edge cases included.", difficulty:"nasty", format:"progressive", tags:["recursive","math","cte"], category:"logic" },
+      { day:19, name:"Solving Sudoku in SQL", desc:"A constraint satisfaction problem solved in pure SQL using recursive CTEs. Not practical — but proves the expressive power of SQL that people constantly underestimate.", difficulty:"cursed", format:"single", tags:["recursive","csp","cursed"], category:"logic" },
+      { day:20, name:"Monte Carlo Simulation in SQL", desc:"Generate random samples, simulate probabilistic outcomes, and aggregate results — all in SQL. RANDOM(), GENERATE_SERIES(), and statistical reasoning.", difficulty:"nasty", format:"mixed", tags:["statistics","simulation","pattern"], category:"logic" },
+      { day:21, name:"Interval Overlaps — Scheduling Conflict Detection", desc:"Find all pairs of overlapping intervals. Naive approach is O(n²). There's an elegant window function approach that's significantly faster.", difficulty:"nasty", format:"progressive", tags:["temporal","interval","pattern"], category:"pattern" },
+    ]
+  },
+  {
+    number: "04",
+    title: "Performance Traps & Query Plan Secrets",
+    topics: [
+      { day:22, name:"NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL", desc:"Three ways to write 'find rows not in another table' — with completely different behavior when NULLs are involved. NOT IN with a NULL in the subquery always returns zero rows. Always.", difficulty:"nasty", format:"mixed", tags:["performance","null","join"], category:"performance" },
+      { day:23, name:"Function on Indexed Column — Index Is Dead", desc:"WHERE YEAR(created_at) = 2024 vs WHERE created_at >= '2024-01-01'. Why the first causes a full scan and the second uses index seek — detected via EXPLAIN.", difficulty:"nasty", format:"progressive", tags:["index","performance","query-plan"], category:"performance" },
+      { day:24, name:"The Hidden Cost of Correlated Subqueries", desc:"A correlated subquery runs N times — once per outer row. When is this acceptable, when must you rewrite it, and when does the optimizer fix it for you?", difficulty:"nasty", format:"mixed", tags:["subquery","performance","optimizer"], category:"performance" },
+      { day:25, name:"Statistics Staleness — Why Queries Suddenly Get Slow", desc:"A query that was fast yesterday is 10x slower today with no changes. Table statistics, ANALYZE, and PostgreSQL's planner histogram.", difficulty:"nasty", format:"single", tags:["statistics","planner","performance"], category:"performance" },
+      { day:26, name:"LATERAL JOIN — The Subquery That Knows Its Context", desc:"LATERAL lets a subquery reference columns from earlier in the FROM clause. The most powerful pattern for top-N per group without window function hacks.", difficulty:"nasty", format:"progressive", tags:["join","lateral","pattern"], category:"pattern" },
+      { day:27, name:"Partial Index — Smaller, Faster, Smarter", desc:"An index that only covers a subset of rows based on a WHERE condition. Essential for tables with heavily skewed distributions.", difficulty:"nasty", format:"mixed", tags:["index","performance","advanced"], category:"performance" },
+      { day:28, name:"VACUUM, Table Bloat, and Dead Tuples in PostgreSQL", desc:"Why DELETE doesn't free disk space, what table bloat is, and how VACUUM and autovacuum work under the hood.", difficulty:"nasty", format:"single", tags:["internals","performance","postgresql"], category:"performance" },
+    ]
+  },
+  {
+    number: "05",
+    title: "Final Boss — Weird, Obscure, Mind-bending",
+    topics: [
+      { day:29, name:"SQL Injection via Second-Order Attack", desc:"First-order injection is well-known. Second-order: data that's safe when stored, but becomes an injection vector when read back and used in another query.", difficulty:"cursed", format:"progressive", tags:["security","injection","advanced"], category:"logic" },
+      { day:30, name:"Write-Skew and Phantom Reads — Isolation Levels You're Probably Getting Wrong", desc:"Why REPEATABLE READ isn't enough for some race conditions. Write-skew anomaly, phantom reads, and when you actually need SERIALIZABLE.", difficulty:"cursed", format:"mixed", tags:["transaction","concurrency","internals"], category:"behavior" },
+      { day:31, name:"SQL Is Declarative — And That Has Consequences", desc:"You write WHAT, not HOW. But the optimizer can fundamentally rewrite your query. Predicate pushdown, join reordering, and non-obvious query equivalence.", difficulty:"cursed", format:"mixed", tags:["theory","optimizer","declarative"], category:"logic" },
+    ]
+  }
+];
+
+const dayContent = {
+  1: [
+    {
+      num:"01", label:"Setup — the dataset", title:"Create a simple table with NULLs",
+      body:"We start with a straightforward products table. Some items have a category, some don't. Nothing unusual — this is real-world data.",
+      code:`<span class="kw">CREATE TABLE</span> products (
+  id       <span class="kw">INT</span>,
+  name     <span class="kw">TEXT</span>,
+  category <span class="kw">TEXT</span>   <span class="cm">-- some rows will be NULL</span>
+);
+
+<span class="kw">INSERT INTO</span> products <span class="kw">VALUES</span>
+  (<span class="num">1</span>, <span class="str">'Keyboard'</span>,   <span class="str">'Electronics'</span>),
+  (<span class="num">2</span>, <span class="str">'Desk'</span>,        <span class="str">'Furniture'</span>),
+  (<span class="num">3</span>, <span class="str">'USB Cable'</span>,  <span class="str">'Electronics'</span>),
+  (<span class="num">4</span>, <span class="str">'Notebook'</span>,   <span class="kw">NULL</span>),          <span class="cm">-- uncategorized</span>
+  (<span class="num">5</span>, <span class="str">'Headphones'</span>, <span class="str">'Electronics'</span>),
+  (<span class="num">6</span>, <span class="str">'Stapler'</span>,    <span class="kw">NULL</span>);         <span class="cm">-- uncategorized</span>`,
+      result: null, insight: null, warn: null
+    },
+    {
+      num:"02", label:"The trap", title:"WHERE category != 'Furniture' — how many rows do you expect?",
+      body:"You want everything that's NOT furniture. You expect 5 rows back. You write the obvious query. Watch what actually happens.",
+      code:`<span class="kw">SELECT</span> name, category
+<span class="kw">FROM</span>   products
+<span class="kw">WHERE</span>  category <span class="op">!=</span> <span class="str">'Furniture'</span>;`,
+      result:`<span class="col">name         | category   </span>
+─────────────────────────────
+Keyboard     | Electronics
+USB Cable    | Electronics
+Headphones   | Electronics
+
+<span class="dim">(3 rows)</span>`,
+      insight:`<strong>Only 3 rows.</strong> Notebook and Stapler — both NULL — vanished without a trace. No error. No warning. Just silently missing data.`,
+      warn:`The NULL rows were not excluded as "not furniture". They were dropped because SQL couldn't determine whether NULL != 'Furniture'. The comparison returned UNKNOWN — not TRUE — so WHERE discarded them.`
+    },
+    {
+      num:"03", label:"Why it happens", title:"Three-valued logic: TRUE, FALSE, UNKNOWN",
+      body:"In SQL, any comparison with NULL produces UNKNOWN — not FALSE. The WHERE clause only passes rows where the result is TRUE. Rows that evaluate to UNKNOWN are silently dropped, just like FALSE.",
+      code:`<span class="cm">-- Make the logic explicit</span>
+<span class="kw">SELECT</span>
+  name,
+  category,
+  (category <span class="op">!=</span> <span class="str">'Furniture'</span>) <span class="kw">AS</span> comparison_result
+<span class="kw">FROM</span> products;`,
+      result:`<span class="col">name         | category     | comparison_result</span>
+──────────────────────────────────────────────────
+Keyboard     | Electronics  | <span class="hi">true</span>
+Desk         | Furniture    | false
+USB Cable    | Electronics  | <span class="hi">true</span>
+Notebook     | NULL         | <span class="hi">NULL</span>   ← UNKNOWN
+Headphones   | Electronics  | <span class="hi">true</span>
+Stapler      | NULL         | <span class="hi">NULL</span>   ← UNKNOWN`,
+      insight:`<strong>The comparison itself returns NULL</strong> for rows with a NULL category. WHERE only passes TRUE — UNKNOWN rows are silently discarded.`,
+      warn: null
+    },
+    {
+      num:"04", label:"The fix", title:"Handle NULL explicitly with IS NULL",
+      body:"If you want all non-Furniture rows including uncategorized ones, you must explicitly include them. SQL never assumes what a NULL means — you have to tell it.",
+      code:`<span class="kw">SELECT</span> name, category
+<span class="kw">FROM</span>   products
+<span class="kw">WHERE</span>  category <span class="op">!=</span> <span class="str">'Furniture'</span>
+   <span class="kw">OR</span>  category <span class="kw">IS NULL</span>;`,
+      result:`<span class="col">name         | category   </span>
+─────────────────────────────
+Keyboard     | Electronics
+USB Cable    | Electronics
+<span class="hi">Notebook     | NULL</span>
+Headphones   | Electronics
+<span class="hi">Stapler      | NULL</span>
+
+<span class="dim">(5 rows)</span>`,
+      insight:`<strong>5 rows now.</strong> The NULL rows are back. You had to explicitly ask for them — SQL never infers intent from NULL.`,
+      warn: null
+    },
+    {
+      num:"05", label:"Bonus — the deeper trap", title:"NULL != NULL is also UNKNOWN",
+      body:"Logical conclusion: two NULL values are not equal to each other in SQL. You cannot use = or != to compare NULLs — ever. IS NULL is the only way.",
+      code:`<span class="cm">-- Does NULL equal NULL?</span>
+<span class="kw">SELECT</span>
+  <span class="kw">NULL</span> <span class="op">=</span>  <span class="kw">NULL</span>   <span class="kw">AS</span> null_equals_null,
+  <span class="kw">NULL</span> <span class="op">!=</span> <span class="kw">NULL</span>   <span class="kw">AS</span> null_not_equals_null,
+  <span class="kw">NULL</span> <span class="kw">IS NULL</span>    <span class="kw">AS</span> null_is_null;`,
+      result:`<span class="col">null_equals_null | null_not_equals_null | null_is_null</span>
+──────────────────────────────────────────────────────
+<span class="hi">NULL</span>             | <span class="hi">NULL</span>                 | true`,
+      insight:`<strong>IS NULL is the only valid test for NULL.</strong> This isn't a quirk — it's how relational algebra was designed. NULL means "unknown value", so two unknowns can't be declared equal or unequal. A mystery ≠ a mystery.`,
+      warn: null
+    }
+  ],
+  2: [
+    {
+      num:"01", label:"Setup — the dataset", title:"An orders table with some messy data",
+      body:"Real-world orders data: some orders have a coupon code applied, some don't. Some have a salesperson assigned, some don't. Two different NULL patterns in one table.",
+      code:`<span class="kw">CREATE TABLE</span> orders (
+  id          <span class="kw">INT</span>,
+  customer    <span class="kw">TEXT</span>,
+  coupon_code <span class="kw">TEXT</span>,    <span class="cm">-- NULL means no coupon used</span>
+  salesperson <span class="kw">TEXT</span>,    <span class="cm">-- NULL means direct / no rep assigned</span>
+  amount      <span class="kw">NUMERIC</span>
+);
+
+<span class="kw">INSERT INTO</span> orders <span class="kw">VALUES</span>
+  (<span class="num">1</span>, <span class="str">'Alice'</span>,   <span class="str">'SAVE10'</span>, <span class="str">'Bob'</span>,   <span class="num">120.00</span>),
+  (<span class="num">2</span>, <span class="str">'Alice'</span>,   <span class="str">'SAVE10'</span>, <span class="str">'Carol'</span>, <span class="num">85.00</span>),
+  (<span class="num">3</span>, <span class="str">'Bob'</span>,     <span class="kw">NULL</span>,      <span class="str">'Bob'</span>,   <span class="num">200.00</span>),
+  (<span class="num">4</span>, <span class="str">'Carol'</span>,  <span class="str">'FREESHIP'</span>,<span class="kw">NULL</span>,    <span class="num">45.00</span>),
+  (<span class="num">5</span>, <span class="str">'Carol'</span>,  <span class="str">'FREESHIP'</span>,<span class="kw">NULL</span>,    <span class="num">60.00</span>),
+  (<span class="num">6</span>, <span class="str">'Dave'</span>,   <span class="kw">NULL</span>,      <span class="kw">NULL</span>,    <span class="num">310.00</span>),
+  (<span class="num">7</span>, <span class="str">'Eve'</span>,    <span class="str">'SAVE10'</span>, <span class="str">'Carol'</span>, <span class="num">95.00</span>);`,
+      result: null, insight: null, warn: null
+    },
+    {
+      num:"02", label:"Experiment 1", title:"Run all three COUNT variants on the same column",
+      body:"Three expressions, one query. Before you run it, predict each number. Most people get at least one wrong.",
+      code:`<span class="kw">SELECT</span>
+  <span class="fn">COUNT</span>(<span class="op">*</span>)                    <span class="kw">AS</span> count_star,
+  <span class="fn">COUNT</span>(coupon_code)           <span class="kw">AS</span> count_coupon,
+  <span class="fn">COUNT</span>(<span class="kw">DISTINCT</span> coupon_code)  <span class="kw">AS</span> count_distinct_coupon
+<span class="kw">FROM</span> orders;`,
+      result:`<span class="col">count_star | count_coupon | count_distinct_coupon</span>
+──────────────────────────────────────────────────
+<span class="hi">7</span>          | <span class="hi">5</span>           | <span class="hi">2</span>`,
+      insight:`<strong>Three different numbers from the same table.</strong>
+— COUNT(*) = 7: counts every row, no exceptions, NULLs included
+— COUNT(coupon_code) = 5: skips the 2 rows where coupon_code IS NULL
+— COUNT(DISTINCT coupon_code) = 2: skips NULLs AND deduplicates — only 'SAVE10' and 'FREESHIP' remain`,
+      warn: null
+    },
+    {
+      num:"03", label:"Experiment 2", title:"The same pattern across two columns at once",
+      body:"Now watch what happens when you COUNT two different columns in the same query. Each column has different NULL patterns — the counts diverge independently.",
+      code:`<span class="kw">SELECT</span>
+  <span class="fn">COUNT</span>(<span class="op">*</span>)                      <span class="kw">AS</span> total_rows,
+  <span class="fn">COUNT</span>(coupon_code)             <span class="kw">AS</span> orders_with_coupon,
+  <span class="fn">COUNT</span>(salesperson)             <span class="kw">AS</span> orders_with_rep,
+  <span class="fn">COUNT</span>(<span class="op">*</span>) <span class="op">-</span> <span class="fn">COUNT</span>(coupon_code)  <span class="kw">AS</span> orders_no_coupon,
+  <span class="fn">COUNT</span>(<span class="op">*</span>) <span class="op">-</span> <span class="fn">COUNT</span>(salesperson)  <span class="kw">AS</span> orders_no_rep
+<span class="kw">FROM</span> orders;`,
+      result:`<span class="col">total_rows | orders_with_coupon | orders_with_rep | orders_no_coupon | orders_no_rep</span>
+───────────────────────────────────────────────────────────────────────────────────
+<span class="hi">7</span>          | <span class="hi">5</span>                  | <span class="hi">4</span>               | <span class="hi">2</span>                | <span class="hi">3</span>`,
+      insight:`<strong>COUNT(*) - COUNT(col) is a clean way to count NULLs in a column</strong> — no CASE WHEN needed. Each column has its own NULL count, and they're completely independent of each other.`,
+      warn: null
+    },
+    {
+      num:"04", label:"Experiment 3 — the sneaky one", title:"COUNT(DISTINCT) across multiple columns",
+      body:"What if you want distinct combinations of two columns together? COUNT(DISTINCT col_a, col_b) looks obvious. But it doesn't work in PostgreSQL. Here's what does.",
+      code:`<span class="cm">-- This fails in PostgreSQL:</span>
+<span class="cm">-- COUNT(DISTINCT coupon_code, salesperson)</span>
+
+<span class="cm">-- Workaround: count distinct on a composite expression</span>
+<span class="kw">SELECT</span>
+  <span class="fn">COUNT</span>(<span class="kw">DISTINCT</span> coupon_code)                        <span class="kw">AS</span> distinct_coupons,
+  <span class="fn">COUNT</span>(<span class="kw">DISTINCT</span> salesperson)                        <span class="kw">AS</span> distinct_reps,
+  <span class="fn">COUNT</span>(<span class="kw">DISTINCT</span> (coupon_code, salesperson))          <span class="kw">AS</span> distinct_combos,
+  <span class="fn">COUNT</span>(<span class="kw">DISTINCT</span> coupon_code <span class="op">||</span> <span class="str">'|'</span> <span class="op">||</span> salesperson)  <span class="kw">AS</span> distinct_combos_safe
+<span class="kw">FROM</span> orders
+<span class="kw">WHERE</span> coupon_code <span class="kw">IS NOT NULL</span>
+  <span class="kw">AND</span> salesperson <span class="kw">IS NOT NULL</span>;`,
+      result:`<span class="col">distinct_coupons | distinct_reps | distinct_combos | distinct_combos_safe</span>
+──────────────────────────────────────────────────────────────────────
+<span class="hi">1</span>                | <span class="hi">2</span>             | <span class="hi">3</span>               | <span class="hi">3</span>`,
+      insight:`<strong>The row tuple approach COUNT(DISTINCT (a, b)) works but has a subtle bug:</strong> PostgreSQL treats (NULL, 'Bob') and (NULL, 'Carol') as different rows for tuple comparison but collapses them unexpectedly in some edge cases. The string concatenation with a separator <span style="color:var(--accent)">col_a || '|' || col_b</span> is safer — just make sure the separator can't appear in your data.`,
+      warn:`Both approaches silently exclude rows where either column is NULL — because NULL || anything = NULL in SQL string concatenation. Always filter NULLs explicitly or use COALESCE() if you need to include them.`
+    },
+    {
+      num:"05", label:"The real-world trap", title:"GROUP BY + COUNT — where developers get burned",
+      body:"The most common production bug: using COUNT(*) when you meant COUNT(col), inside a GROUP BY. The totals look plausible. The numbers are wrong. Nobody notices until someone audits.",
+      code:`<span class="cm">-- How many orders per coupon, and how many had a salesperson?</span>
+
+<span class="cm">-- ❌ Wrong — counts ALL rows per group, not just those with a rep</span>
+<span class="kw">SELECT</span>
+  coupon_code,
+  <span class="fn">COUNT</span>(<span class="op">*</span>)            <span class="kw">AS</span> total,
+  <span class="fn">COUNT</span>(<span class="op">*</span>)            <span class="kw">AS</span> with_rep   <span class="cm">-- BUG: same as total</span>
+<span class="kw">FROM</span> orders
+<span class="kw">GROUP BY</span> coupon_code;
+
+<span class="cm">-- ✅ Correct</span>
+<span class="kw">SELECT</span>
+  <span class="fn">COALESCE</span>(coupon_code, <span class="str">'(no coupon)'</span>) <span class="kw">AS</span> coupon,
+  <span class="fn">COUNT</span>(<span class="op">*</span>)                              <span class="kw">AS</span> total_orders,
+  <span class="fn">COUNT</span>(salesperson)                     <span class="kw">AS</span> orders_with_rep
+<span class="kw">FROM</span> orders
+<span class="kw">GROUP BY</span> coupon_code;`,
+      result:`<span class="col">coupon       | total_orders | orders_with_rep</span>
+────────────────────────────────────────────────
+(no coupon)  | 2            | <span class="hi">1</span>
+FREESHIP     | 2            | <span class="hi">0</span>
+SAVE10       | 3            | <span class="hi">3</span>`,
+      insight:`<strong>COUNT(salesperson) only counts rows where salesperson is not NULL</strong> — even inside a GROUP BY. This gives you the real "how many had a rep" count per coupon group, which COUNT(*) can never give you.`,
+      warn: null
+    }
+  ]
+};
+// ─── HELPERS ──────────────────────────────────────────────
+function getDiffLabel(d) {
+  if (d==='tricky') return '<span class="difficulty diff-tricky">TRICKY</span>';
+  if (d==='nasty')  return '<span class="difficulty diff-nasty">NASTY</span>';
+  return '<span class="difficulty diff-cursed">CURSED</span>';
+}
+
+function getFormatBadge(f) {
+  const m = { single:'① single query', progressive:'⇡ progressive', mixed:'◈ mixed' };
+  return `<span class="format-badge">${m[f]||f}</span>`;
+}
+
+// ─── RENDER MATRIX ────────────────────────────────────────
+function renderMatrix() {
+  const grid = document.getElementById('matrix-grid');
+  const allTopics = weeks.flatMap(w => w.topics);
+
+  allTopics.forEach(topic => {
+    const cell = document.createElement('div');
+    cell.className = 'matrix-cell';
+
+    if (topic.hasContent) {
+      cell.classList.add('has-content', 'diff-' + topic.difficulty);
+      cell.addEventListener('click', () => openModal(topic.day));
+    } else {
+      cell.classList.add('pending', 'diff-' + topic.difficulty);
+    }
+
+    cell.textContent = String(topic.day).padStart(2, '0');
+    grid.appendChild(cell);
+  });
+
+  // Fill remaining cells (32-35) to complete 7-column grid
+  for (let i = 32; i <= 35; i++) {
+    const empty = document.createElement('div');
+    empty.className = 'matrix-cell empty';
+    grid.appendChild(empty);
+  }
+}
+
+// ─── RENDER ALL ───────────────────────────────────────────
+function renderAll() {
+  const container = document.getElementById('challenge-container');
+  container.innerHTML = '';
+
+  weeks.forEach(week => {
+    const section = document.createElement('div');
+    section.className = 'week-section';
+
+    const start = weeks.slice(0, weeks.indexOf(week)).reduce((a, w) => a + w.topics.length, 0) + 1;
+    const end = start + week.topics.length - 1;
+
+    const header = document.createElement('div');
+    header.className = 'week-header';
+    header.innerHTML = `
+      <span class="week-number">W${week.number}</span>
+      <div><div class="week-title">${week.title}</div></div>
+      <span class="week-count">DAY ${start}–${end}</span>`;
+    section.appendChild(header);
+
+    const grid = document.createElement('div');
+    grid.className = 'topic-grid';
+
+    week.topics.forEach(t => {
+      const card = document.createElement('div');
+      card.className = 'topic-card' + (t.hasContent ? ' has-content' : '');
+      card.dataset.category = t.category;
+      card.dataset.difficulty = t.difficulty;
+
+      if (t.hasContent) {
+        card.addEventListener('click', () => openModal(t.day));
+      }
+
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="day-badge">DAY ${String(t.day).padStart(2, '0')}</span>
+          ${getDiffLabel(t.difficulty)}
+          ${getFormatBadge(t.format)}
+          <span class="card-arrow">↗</span>
+        </div>
+        <div class="topic-name">${t.name}</div>
+        <div class="topic-desc">${t.desc}</div>
+        <div class="topic-tags">
+          ${t.tags.map(g => `<span class="tag">${g}</span>`).join('')}
+          ${t.hasContent ? '<span class="content-pill">► Read breakdown</span>' : ''}
+        </div>`;
+
+      grid.appendChild(card);
+    });
+
+    section.appendChild(grid);
+    container.appendChild(section);
+  });
+}
+
+// ─── OPEN MODAL ───────────────────────────────────────────
+function openModal(day) {
+  const topic = weeks.flatMap(w => w.topics).find(t => t.day === day);
+  const steps = dayContent[day];
+  const modal = document.getElementById('modal');
+
+  document.getElementById('modal-eyebrow').innerHTML =
+    `<span class="day-badge">DAY ${String(day).padStart(2, '0')}</span>${getDiffLabel(topic.difficulty)}`;
+  document.getElementById('modal-title').textContent = topic.name;
+  document.getElementById('modal-desc').textContent = topic.desc;
+
+  const body = document.getElementById('modal-body');
+
+  if (steps) {
+    body.innerHTML = steps.map(s => `
+      <div class="step">
+        <div class="step-header">
+          <span class="step-num">${s.num}</span>
+          <div class="step-meta">
+            <div class="step-label">${s.label}</div>
+            <div class="step-title">${s.title}</div>
+          </div>
+        </div>
+        <p class="step-body">${s.body}</p>
+        ${s.code ? `<div class="code-block">${s.code}</div>` : ''}
+        ${s.result ? `<div class="result-block">${s.result}</div>` : ''}
+        ${s.insight ? `<div class="insight-block">💡 ${s.insight}</div>` : ''}
+        ${s.warn ? `<div class="warn-block">⚠ ${s.warn}</div>` : ''}
+      </div>`).join('');
+  } else {
+    body.innerHTML = `<div style="font-family:monospace;color:rgba(194,198,214,0.5);font-size:13px;padding:20px 0">Content drops on Day ${day}...</div>`;
+  }
+
+  modal.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+// ─── CLOSE MODAL ──────────────────────────────────────────
+function closeModal() {
+  const modal = document.getElementById('modal');
+  modal.classList.remove('open');
+  document.body.style.overflow = '';
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+// ─── FILTER TOPICS ────────────────────────────────────────
+function filterTopics(category) {
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  const activeBtn = document.querySelector(`.filter-btn[data-filter="${category}"]`);
+  if (activeBtn) activeBtn.classList.add('active');
+
+  document.querySelectorAll('.topic-card').forEach(card => {
+    const show =
+      category === 'all' ? true :
+      category === 'cursed' ? card.dataset.difficulty === 'cursed' :
+      card.dataset.category === category;
+    card.classList.toggle('hidden', !show);
+  });
+
+  document.querySelectorAll('.week-section').forEach(s => {
+    const visibleCards = s.querySelectorAll('.topic-card:not(.hidden)').length;
+    s.style.display = visibleCards === 0 ? 'none' : '';
+  });
+}
+
+// ─── EVENT LISTENERS ──────────────────────────────────────
+// Click on modal overlay (outside modal-box) to close
+document.getElementById('modal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+// Click on modal close button
+document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+
+// Escape key to close modal
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeModal();
+});
+
+// Filter button clicks
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', function() {
+    filterTopics(this.dataset.filter);
+  });
+});
+
+// Initialize on DOMContentLoaded
+document.addEventListener('DOMContentLoaded', function() {
+  renderMatrix();
+  renderAll();
+});
+</script>
 </body>
 </html>

@@ -79,18 +79,18 @@ Create a new `index.html` file — a single-page HTML application using Tailwind
     - Separator between steps
     - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6_
 
-- [ ] 5. Add JavaScript data and rendering logic
-  - [ ] 5.1 Port challenge data (weeks array with 31 topics)
+- [x] 5. Add JavaScript data and rendering logic
+  - [x] 5.1 Port challenge data (weeks array with 31 topics)
     - Copy the `weeks` array from `31days-sql.html` with all 31 topics
     - Each topic: day, name, desc, difficulty, format, tags, category, hasContent
     - _Requirements: 5.1, 5.2_
 
-  - [ ] 5.2 Port Day 1 and Day 2 content (dayContent object)
+  - [x] 5.2 Port Day 1 and Day 2 content (dayContent object)
     - Copy `dayContent` object with Step_Block arrays for Day 1 and Day 2
     - Maintain syntax highlighting span classes (kw, fn, str, cm, num, op)
     - _Requirements: 5.3_
 
-  - [ ] 5.3 Implement rendering functions
+  - [x] 5.3 Implement rendering functions
     - `renderMatrix()` — generates challenge matrix cells from data
     - `renderAll()` — generates week sections and topic cards
     - `openModal(day)` / `closeModal()` — modal open/close with content rendering
