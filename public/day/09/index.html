@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 09: Relational Division: Find Who Bought Everything · #31DaysMaySQL</title>
+<meta name="description" content="Finding the customers who bought every product in a set: why JOIN gets it wrong, three correct forms (counting, double NOT EXISTS, EXCEPT), and the duplicate-row and empty-set traps in each.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 09: Relational Division: Find Who Bought Everything">
+<meta property="og:description" content="Finding the customers who bought every product in a set: why JOIN gets it wrong, three correct forms (counting, double NOT EXISTS, EXCEPT), and the duplicate-row and empty-set traps in each.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../08/">← Day 08</a><a href="../10/">Day 10 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 09</p>
+  <h1>Relational Division: Find Who Bought Everything</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>The request: "find all customers who bought every product in the Staples category." A <code>JOIN</code> finds customers who bought some Staples product, and <code>GROUP BY</code> can count what they bought, but "every product in the set" is a different kind of question. It is called relational division, and it appears wherever a requirement says "all of": users holding every permission an action needs, candidates covering every skill in a job posting, articles carrying every tag in a filter. The queries run on PostgreSQL 18 and are standard SQL apart from the <code>FILTER</code> clause (not in MySQL) and the array variant at the end.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> products (</span>
+<span>    product_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name        TEXT,</span>
+<span>    <span class="kw">category</span>    TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> purchases (</span>
+<span>    customer_id  <span class="dt">INT</span>,</span>
+<span>    product_id   <span class="dt">INT</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>), (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>), (<span class="dv">3</span>, <span class="st">&#39;Carol&#39;</span>), (<span class="dv">4</span>, <span class="st">&#39;Dave&#39;</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> products <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Bread&#39;</span>,     <span class="st">&#39;Staples&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Milk&#39;</span>,      <span class="st">&#39;Staples&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Eggs&#39;</span>,      <span class="st">&#39;Staples&#39;</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="st">&#39;Chocolate&#39;</span>, <span class="st">&#39;Snacks&#39;</span>),</span>
+<span>    (<span class="dv">5</span>, <span class="st">&#39;Chips&#39;</span>,     <span class="st">&#39;Snacks&#39;</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> purchases <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="dv">1</span>), (<span class="dv">1</span>, <span class="dv">2</span>), (<span class="dv">1</span>, <span class="dv">3</span>), (<span class="dv">1</span>, <span class="dv">4</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="dv">1</span>), (<span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="dv">1</span>), (<span class="dv">3</span>, <span class="dv">2</span>), (<span class="dv">3</span>, <span class="dv">3</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="dv">4</span>), (<span class="dv">4</span>, <span class="dv">5</span>);</span></code></pre>
+<p>Staples are Bread, Milk and Eggs. Alice bought all three (and Chocolate), Carol bought all three, Bob bought two, Dave bought none. The right answer is Alice and Carol.</p>
+<h2 id="a-join-answers-at-least-one">A join answers "at least one"</h2>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> c.name</span>
+<span><span class="kw">FROM</span> purchases p</span>
+<span><span class="kw">JOIN</span> products  pr <span class="kw">ON</span> pr.product_id  <span class="op">=</span> p.product_id</span>
+<span><span class="kw">JOIN</span> customers c  <span class="kw">ON</span> c.customer_id <span class="op">=</span> p.customer_id</span>
+<span><span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Bob
+ Carol
+(3 rows)</code></pre>
+<p>Bob is in the result with two of three. A join keeps every row that matches, so it can only say "bought at least one Staple".</p>
+<h2 id="counting">Counting</h2>
+<p>Count the distinct Staples each customer bought, and compare with the number of Staples that exist:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> purchases p</span>
+<span><span class="kw">JOIN</span> products  pr <span class="kw">ON</span> pr.product_id  <span class="op">=</span> p.product_id</span>
+<span><span class="kw">JOIN</span> customers c  <span class="kw">ON</span> c.customer_id <span class="op">=</span> p.customer_id</span>
+<span><span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> c.customer_id, c.name</span>
+<span><span class="kw">HAVING</span> <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> p.product_id) <span class="op">=</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> products <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Carol
+(2 rows)</code></pre>
+<p>Taking the total from <code>products</code> instead of writing <code>3</code> means the query stays right when someone adds a fourth Staple.</p>
+<p>The <code>DISTINCT</code> matters when <code>purchases</code> can contain the same pair twice, which is likely with a table that has no primary key. Pretend Bob's first purchase was recorded twice, and count rows instead of distinct products:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> purchases <span class="kw">UNION</span> <span class="kw">ALL</span> <span class="kw">SELECT</span> <span class="dv">2</span>, <span class="dv">1</span>) <span class="kw">AS</span> p</span>
+<span><span class="kw">JOIN</span> products  pr <span class="kw">ON</span> pr.product_id  <span class="op">=</span> p.product_id</span>
+<span><span class="kw">JOIN</span> customers c  <span class="kw">ON</span> c.customer_id <span class="op">=</span> p.customer_id</span>
+<span><span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> c.customer_id, c.name</span>
+<span><span class="kw">HAVING</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="op">=</span> (<span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> products <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Bob
+ Carol
+(3 rows)</code></pre>
+<p>Bob's rows are Bread, Bread, Milk: three rows, so he passes. <code>COUNT(DISTINCT p.product_id)</code> does not have this problem.</p>
+<h2 id="double-not-exists">Double NOT EXISTS</h2>
+<p>Turn the question around. A customer bought every Staple if there is no Staple that the customer has not bought:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> products pr</span>
+<span>    <span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>      <span class="kw">AND</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>          <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>          <span class="kw">FROM</span> purchases p</span>
+<span>          <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id</span>
+<span>            <span class="kw">AND</span> p.product_id  <span class="op">=</span> pr.product_id</span>
+<span>      )</span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Carol
+(2 rows)</code></pre>
+<p>Read it from the outside in: for this customer, there is no product in the required set for which no purchase exists. Duplicates in <code>purchases</code> do not matter because the inner <code>EXISTS</code> only asks whether at least one row is there. SQL has no "for all" quantifier, and this is how "for all x, P(x)" is written as "not exists x such that not P(x)".</p>
+<p>The same logic with a set operator reads closer to the English. <code>EXCEPT</code> removes from the required set everything the customer bought, and what is left is what the customer is missing:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> product_id <span class="kw">FROM</span> products <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>    <span class="kw">EXCEPT</span></span>
+<span>    <span class="kw">SELECT</span> product_id <span class="kw">FROM</span> purchases p <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id</span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Carol
+(2 rows)</code></pre>
+<p>Nothing left over means the customer bought every Staple.</p>
+<h2 id="what-if-the-required-set-is-empty">What if the required set is empty?</h2>
+<p>The two forms disagree when no product has the category. With <code>NOT EXISTS</code>, "there is no missing product" is trivially true for everyone:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> products pr</span>
+<span>    <span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Gadgets&#39;</span></span>
+<span>      <span class="kw">AND</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>          <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> purchases p</span>
+<span>          <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> p.product_id <span class="op">=</span> pr.product_id</span>
+<span>      )</span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Bob
+ Carol
+ Dave
+(4 rows)</code></pre>
+<p>All four customers, Dave included, "bought every Gadget" because there are none. The counting version goes through an inner join to the required products, finds no rows, and returns nobody. Logicians call the first behaviour vacuous truth. Which answer is wanted depends on the question; for permissions, "everyone passes an empty requirement" is usually right. If it is not, add a guard such as <code>AND EXISTS (SELECT 1 FROM products WHERE category = 'Gadgets')</code>.</p>
+<h2 id="with-extras-or-exactly-the-set">With extras or exactly the set?</h2>
+<p>All of the queries so far allow extras: Alice bought Chocolate and is still included. If you need customers whose purchases are exactly the Staples and nothing else, add a second condition: there is no purchase outside the set.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> products pr</span>
+<span>    <span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>      <span class="kw">AND</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>          <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> purchases p</span>
+<span>          <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> p.product_id <span class="op">=</span> pr.product_id</span>
+<span>      )</span>
+<span>)</span>
+<span><span class="kw">AND</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> purchases p</span>
+<span>    <span class="kw">JOIN</span> products pr <span class="kw">ON</span> pr.product_id <span class="op">=</span> p.product_id</span>
+<span>    <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id</span>
+<span>      <span class="kw">AND</span> pr.<span class="kw">category</span> <span class="op">&lt;&gt;</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Carol
+(1 row)</code></pre>
+<p>Only Carol: Alice also bought Chocolate. The counting version of the same rule compares two counts per customer, using <code>FILTER</code> to split them:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> purchases p  <span class="kw">ON</span> p.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">JOIN</span> products  pr <span class="kw">ON</span> pr.product_id <span class="op">=</span> p.product_id</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> c.customer_id, c.name</span>
+<span><span class="kw">HAVING</span> <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> pr.product_id) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span>)</span>
+<span>         <span class="op">=</span> (<span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> products <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span>)</span>
+<span>   <span class="kw">AND</span> <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> pr.product_id) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">&lt;&gt;</span> <span class="st">&#39;Staples&#39;</span>) <span class="op">=</span> <span class="dv">0</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Carol
+(1 row)</code></pre>
+<p>Ask which one is wanted. "Customers who bought all the Staples" almost always means extras are fine.</p>
+<h2 id="how-the-forms-compare">How the forms compare</h2>
+<p>Counting is the form most people read fastest, and it needs <code>COUNT(DISTINCT ...)</code> and a count taken from the data rather than typed. Double <code>NOT EXISTS</code> ignores duplicates and handles the empty set the way logic does, but it takes practice to read, so it deserves a comment. Neither is reliably faster; PostgreSQL plans them very differently, so measure on your own data when the tables are large. For the small tables here, the planner turns the outer <code>NOT EXISTS</code> into an anti-join and runs the inner one as a hashed subplan over <code>purchases</code>:</p>
+<pre class="code"><code><span><span class="kw">ANALYZE</span> customers;</span>
+<span><span class="kw">ANALYZE</span> products;</span>
+<span><span class="kw">ANALYZE</span> purchases;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> products pr</span>
+<span>    <span class="kw">WHERE</span> pr.<span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;Staples&#39;</span></span>
+<span>      <span class="kw">AND</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>          <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> purchases p</span>
+<span>          <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> p.product_id <span class="op">=</span> pr.product_id</span>
+<span>      )</span>
+<span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Nested Loop Anti Join
+   Join Filter: (NOT (ANY ((c.customer_id = (hashed SubPlan 2).col1) AND (pr.product_id = (hashed SubPlan 2).col2))))
+   -&gt;  Seq Scan on customers c
+   -&gt;  Materialize
+         -&gt;  Seq Scan on products pr
+               Filter: (category = &#39;Staples&#39;::text)
+   SubPlan 2
+     -&gt;  Seq Scan on purchases p
+(8 rows)</code></pre>
+<p>On larger tables an index on <code>purchases (customer_id, product_id)</code> gives the planner the option of probing it once per customer and product instead of hashing the whole table.</p>
+<h2 id="a-generic-form-with-a-requirements-table">A generic form with a requirements table</h2>
+<p>When the required set is not a category but data, such as permissions an action needs, put it in a table and divide by it:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> required_products (product_id <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>);</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> required_products <span class="kw">VALUES</span> (<span class="dv">1</span>), (<span class="dv">2</span>), (<span class="dv">3</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> required_products r</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>        <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> purchases p</span>
+<span>        <span class="kw">WHERE</span> p.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> p.product_id <span class="op">=</span> r.product_id</span>
+<span>    )</span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Carol
+(2 rows)</code></pre>
+<p>PostgreSQL also offers a compact variant with arrays: <code>array_agg</code> collects each customer's products, and <code>@&gt;</code> tests whether that array contains all the required ones.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> purchases p <span class="kw">ON</span> p.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> c.customer_id, c.name</span>
+<span><span class="kw">HAVING</span> array_agg(p.product_id) @<span class="op">&gt;</span> (<span class="kw">SELECT</span> array_agg(product_id) <span class="kw">FROM</span> required_products)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name
+-------
+ Alice
+ Carol
+(2 rows)</code></pre>
+<p>It is short, ignores duplicates, and is specific to PostgreSQL. For an empty required set <code>array_agg</code> returns <code>NULL</code>, so nobody matches, the same as the counting form; customers with no purchases at all are dropped by the join.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A join finds "at least one". "Every" needs either a count compared with the size of the required set, or a double negative.</li>
+<li>Counting: use <code>COUNT(DISTINCT ...)</code> and take the target number from the data.</li>
+<li>Double <code>NOT EXISTS</code> (or <code>NOT EXISTS (... EXCEPT ...)</code>): no required item is missing. Immune to duplicates, true for an empty requirement.</li>
+<li>Decide whether extras are allowed and say so in the query.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day09.pdf" download>Download PDF · Day 09</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../08/">← Day 08</a>
+  <a href="../../">All 31 days</a>
+  <a href="../10/">Day 10 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/09/</span>
+</footer>
+
+</body>
+</html>

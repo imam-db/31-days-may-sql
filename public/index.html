@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>#31DaysMaySQL — Imam Hambali</title>
+<title>#31DaysMaySQL · Imam Hambali</title>
 <meta name="description" content="31 SQL problems in 31 days, May 2026: the traps that return wrong answers without an error, the patterns nobody teaches, and why queries get slow. One PDF per day.">
 <meta property="og:title" content="#31DaysMaySQL">
 <meta property="og:description" content="31 SQL problems in 31 days, May 2026. One PDF per day, PostgreSQL examples.">
@@ -52,13 +52,12 @@
 
   ol.days { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
   ol.days li { border-bottom: 1px solid var(--line); }
-  ol.days a { display: grid; grid-template-columns: 56px 1fr auto; gap: 4px 16px; align-items: baseline; padding: 18px 8px; text-decoration: none; border-radius: 6px; transition: background-color .15s ease; }
+  ol.days a { display: grid; grid-template-columns: 56px 1fr; gap: 4px 16px; align-items: baseline; padding: 18px 8px; text-decoration: none; border-radius: 6px; transition: background-color .15s ease; }
   ol.days a:hover, ol.days a:focus-visible { background: var(--surface); outline: none; }
   ol.days a:hover .t, ol.days a:focus-visible .t { color: var(--accent); }
   .d { font-family: var(--mono); font-size: 13px; color: var(--muted); }
   .t { font-weight: 500; font-size: 1.05rem; line-height: 1.4; transition: color .15s ease; }
   .s { grid-column: 2; color: var(--muted); font-size: .95rem; }
-  .k { grid-column: 3; grid-row: 1; font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
 
   footer { margin-top: 64px; padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: .95rem; }
   footer a { color: var(--text); text-underline-offset: 3px; }
@@ -67,7 +66,6 @@
   @media (max-width: 600px) {
     header { padding: 48px 0 36px; }
     ol.days a { grid-template-columns: 40px 1fr; padding: 16px 4px; }
-    .k { grid-column: 2; grid-row: auto; justify-self: start; margin-top: 4px; }
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -78,12 +76,12 @@
   <div class="wrap">
     <p class="eyebrow">May 1 – 31, 2026 · completed</p>
     <h1>#31DaysMaySQL</h1>
-    <p class="lede">One SQL problem a day for the whole of May. Not syntax drills: the queries that return the wrong answer without an error, the patterns that get memorised but not understood, and the reasons a query that was fast yesterday is slow today.</p>
+    <p class="lede">One SQL problem a day through May 2026. Most of them are queries that run fine and return the wrong answer, or run correctly and slowly. Every example has been run on PostgreSQL 18, and every result on these pages is the real output.</p>
     <ul class="facts">
       <li><b>31</b> problems</li>
       <li><b>5</b> themes</li>
       <li>Examples in <b>PostgreSQL</b>, notes for MySQL, SQL Server, BigQuery</li>
-      <li>One <b>PDF</b> per day</li>
+      <li>Read online or as <b>PDF</b></li>
     </ul>
   </div>
 </header>
@@ -107,13 +105,13 @@
     <h2 id="w1-title">The Lies SQL Tells You</h2>
     <p class="week-note">Behaviour traps: the query runs, the result is wrong.</p>
     <ol class="days">
-      <li><a href="days/31DaysMaySQL-Day01.pdf"><span class="d">01</span><span class="t">SQL Has Three Truth Values, Not Two</span><span class="k">behavior</span><span class="s">Why <code>WHERE col != 'x'</code> silently drops the NULL rows.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day02.pdf"><span class="d">02</span><span class="t">COUNT(*) and COUNT(col) Are Not the Same Query</span><span class="k">behavior</span><span class="s">Three COUNTs that look alike and return different numbers on the same data.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day03.pdf"><span class="d">03</span><span class="t">'a' = 'A': Is That TRUE or FALSE?</span><span class="k">behavior</span><span class="s">Collation decides, and it changes WHERE, JOIN, GROUP BY and UNIQUE.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day04.pdf"><span class="d">04</span><span class="t">DISTINCT Inside a Window Function Doesn't Exist</span><span class="k">behavior</span><span class="s">PostgreSQL rejects <code>COUNT(DISTINCT x) OVER</code>; the dense_rank workaround.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day05.pdf"><span class="d">05</span><span class="t">NULL in ORDER BY: Who Goes First?</span><span class="k">behavior</span><span class="s">Each database sorts NULL differently, and pagination pays for it.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day06.pdf"><span class="d">06</span><span class="t">Implicit Type Coercion That Kills Your Index</span><span class="k">performance</span><span class="s">Comparing a varchar to a number: the plan looks fine, the index is unused.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day07.pdf"><span class="d">07</span><span class="t">GROUP BY 1, 2: The Shortcut That Breaks Reports</span><span class="k">behavior</span><span class="s">Ordinal positions break silently the day someone reorders the SELECT.</span></a></li>
+      <li><a href="day/01/"><span class="d">01</span><span class="t">SQL Has Three Truth Values, Not Two</span><span class="s">WHERE col != 'x' drops the NULL rows, because a comparison with NULL is unknown, not false.</span></a></li>
+      <li><a href="day/02/"><span class="d">02</span><span class="t">COUNT(*), COUNT(col) and COUNT(DISTINCT col)</span><span class="s">Three counts over one column, three numbers, and the LEFT JOIN that turns 0 into 1.</span></a></li>
+      <li><a href="day/03/"><span class="d">03</span><span class="t">'a' = 'A': Is That TRUE or FALSE?</span><span class="s">Case and accent rules come from the collation: logins, UNIQUE constraints and sort order.</span></a></li>
+      <li><a href="day/04/"><span class="d">04</span><span class="t">COUNT(DISTINCT) OVER: Counting Unique Values per Window</span><span class="s">PostgreSQL rejects COUNT(DISTINCT x) OVER; four ways to get the number anyway.</span></a></li>
+      <li><a href="day/05/"><span class="d">05</span><span class="t">NULL in ORDER BY: Who Goes First?</span><span class="s">NULLs sort last in PostgreSQL and first in MySQL, and top-N queries pay for it.</span></a></li>
+      <li><a href="day/06/"><span class="d">06</span><span class="t">Implicit Type Coercion That Kills Your Index</span><span class="s">A string column compared to a number: MySQL scans everything, PostgreSQL has its own index-killing casts.</span></a></li>
+      <li><a href="day/07/"><span class="d">07</span><span class="t">GROUP BY 1, 2: The Ordinal Trap</span><span class="s">Column positions in GROUP BY and ORDER BY break, sometimes silently, when the SELECT list changes.</span></a></li>
     </ol>
   </section>
 
@@ -122,13 +120,13 @@
     <h2 id="w2-title">Patterns Nobody Teaches You</h2>
     <p class="week-note">Classic problems that are usually memorised rather than understood.</p>
     <ol class="days">
-      <li><a href="days/31DaysMaySQL-Day08.pdf"><span class="d">08</span><span class="t">The Gaps and Islands Problem</span><span class="k">pattern</span><span class="s">Finding breaks in sequential data, and why the row_number trick works.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day09.pdf"><span class="d">09</span><span class="t">Relational Division: Find Who Bought Everything</span><span class="k">logic</span><span class="s">"Customers who bought every product in a category", done efficiently.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day10.pdf"><span class="d">10</span><span class="t">Build a Premier League Table with SQL</span><span class="k">pattern</span><span class="s">Conditional aggregation and multi-column ranking on real match results.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day11.pdf"><span class="d">11</span><span class="t">Slowly Changing Dimensions in Raw SQL</span><span class="k">pattern</span><span class="s">Reading a value "as of" a date from a history table, without dbt.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day12.pdf"><span class="d">12</span><span class="t">Running Total With a Conditional Reset</span><span class="k">pattern</span><span class="s">A running sum that resets on a condition, where <code>SUM() OVER</code> is not enough.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day13.pdf"><span class="d">13</span><span class="t">Median and Percentile Without Built-in Functions</span><span class="k">pattern</span><span class="s">Ordered statistics from scratch with window functions.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day14.pdf"><span class="d">14</span><span class="t">Bitwise Operations for a Permission Flag System</span><span class="k">pattern</span><span class="s">Many boolean permissions in one integer: query, filter, update.</span></a></li>
+      <li><a href="day/08/"><span class="d">08</span><span class="t">The Gaps and Islands Problem</span><span class="s">Consecutive runs and the holes between them, and the duplicate dates that break the usual trick.</span></a></li>
+      <li><a href="day/09/"><span class="d">09</span><span class="t">Relational Division: Find Who Bought Everything</span><span class="s">Customers who bought every product in a set: counting, double NOT EXISTS, EXCEPT.</span></a></li>
+      <li><a href="day/10/"><span class="d">10</span><span class="t">Build a Football League Table with SQL</span><span class="s">From one row per match to a full table with tie-breakers and a last-five form column.</span></a></li>
+      <li><a href="day/11/"><span class="d">11</span><span class="t">Slowly Changing Dimensions in Raw SQL</span><span class="s">What a customer looked like on a given date, from a history table that only stores start dates.</span></a></li>
+      <li><a href="day/12/"><span class="d">12</span><span class="t">Running Total With a Conditional Reset</span><span class="s">A streak counter that resets to zero, built from two window functions.</span></a></li>
+      <li><a href="day/13/"><span class="d">13</span><span class="t">Median and Percentiles Without Built-in Functions</span><span class="s">Median and any percentile from ROW_NUMBER and COUNT, checked against PERCENTILE_CONT.</span></a></li>
+      <li><a href="day/14/"><span class="d">14</span><span class="t">Bitmasks: Many Flags in One Integer</span><span class="s">Many permission flags in one integer: read, grant, revoke, and the traps in PostgreSQL.</span></a></li>
     </ol>
   </section>
 
@@ -137,13 +135,13 @@
     <h2 id="w3-title">SQL as a Programming Language</h2>
     <p class="week-note">Work people usually push into application code, done in the database.</p>
     <ol class="days">
-      <li><a href="days/31DaysMaySQL-Day15.pdf"><span class="d">15</span><span class="t">Recursive CTE: Graph Traversal in SQL</span><span class="k">logic</span><span class="s">Walking org charts and category trees, with cycle detection.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day16.pdf"><span class="d">16</span><span class="t">Interval Overlaps: Scheduling Conflict Detection</span><span class="k">pattern</span><span class="s">Every overlapping pair, without the naive O(n²) self-join.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day17.pdf"><span class="d">17</span><span class="t">String Parsing in SQL</span><span class="k">pattern</span><span class="s">Pulling paths and query parameters out of URLs without a round trip to Python.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day18.pdf"><span class="d">18</span><span class="t">Fibonacci and Mathematical Sequences via CTE</span><span class="k">logic</span><span class="s">Recursive CTEs can compute any sequence; Fibonacci is the example.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day19.pdf"><span class="d">19</span><span class="t">Window Functions Deep Dive: ROWS vs RANGE vs GROUPS</span><span class="k">behavior</span><span class="s">Three frame modes that disagree as soon as values repeat.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day20.pdf"><span class="d">20</span><span class="t">GROUPING SETS, ROLLUP, and CUBE</span><span class="k">pattern</span><span class="s">Subtotals, cross-tabs and a grand total in one pass over the table.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day21.pdf"><span class="d">21</span><span class="t">Mastering JSONB in PostgreSQL</span><span class="k">pattern</span><span class="s">JSON vs JSONB, GIN indexes, path operators and aggregation pitfalls.</span></a></li>
+      <li><a href="day/15/"><span class="d">15</span><span class="t">Recursive CTE: Graph Traversal in SQL</span><span class="s">Org charts and dependency graphs of unknown depth, including cycles and the CYCLE clause.</span></a></li>
+      <li><a href="day/16/"><span class="d">16</span><span class="t">Interval Overlaps: Scheduling Conflict Detection</span><span class="s">One condition finds every overlap; LEAD misses long bookings; range types can forbid overlaps.</span></a></li>
+      <li><a href="day/17/"><span class="d">17</span><span class="t">String Parsing in SQL</span><span class="s">Domains, query parameters, log fields and versions out of text, and the edge cases.</span></a></li>
+      <li><a href="day/18/"><span class="d">18</span><span class="t">Fibonacci and Mathematical Sequences via Recursive CTEs</span><span class="s">Recursive CTEs as loops: Fibonacci, compound interest, an amortization schedule.</span></a></li>
+      <li><a href="day/19/"><span class="d">19</span><span class="t">Window Functions Deep Dive: ROWS vs RANGE vs GROUPS</span><span class="s">Why a running total jumps on repeated dates, and how ROWS, RANGE and GROUPS differ.</span></a></li>
+      <li><a href="day/20/"><span class="d">20</span><span class="t">GROUPING SETS, ROLLUP and CUBE: Multi-Level Aggregation in One Query</span><span class="s">Subtotals and a grand total in one pass, and how to tell a subtotal from a real NULL.</span></a></li>
+      <li><a href="day/21/"><span class="d">21</span><span class="t">Mastering JSONB in PostgreSQL</span><span class="s">Operators, containment, which index serves which query (with EXPLAIN), and updates.</span></a></li>
     </ol>
   </section>
 
@@ -152,13 +150,13 @@
     <h2 id="w4-title">Why Your Query Is Slow</h2>
     <p class="week-note">Performance traps and how to read the query plan.</p>
     <ol class="days">
-      <li><a href="days/31DaysMaySQL-Day22.pdf"><span class="d">22</span><span class="t">NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL</span><span class="k">performance</span><span class="s">One NULL in the subquery and NOT IN returns zero rows.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day23.pdf"><span class="d">23</span><span class="t">Functions on Indexed Columns: Why Indexes Get Ignored</span><span class="k">performance</span><span class="s"><code>YEAR(created_at) = 2024</code> scans everything; a range seeks.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day24.pdf"><span class="d">24</span><span class="t">The Cost of Correlated Subqueries</span><span class="k">performance</span><span class="s">Runs once per outer row: when that is fine and when to rewrite.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day25.pdf"><span class="d">25</span><span class="t">Outdated Statistics: Why Queries Suddenly Get Slow</span><span class="k">performance</span><span class="s">Nothing changed but the data: ANALYZE and the planner's histograms.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day26.pdf"><span class="d">26</span><span class="t">LATERAL JOIN: The Context-Aware Subquery</span><span class="k">pattern</span><span class="s">Top-N per group without the window-function workaround.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day27.pdf"><span class="d">27</span><span class="t">Partial Index: Smaller, Faster, Smarter</span><span class="k">performance</span><span class="s">Indexing only the rows you query, for heavily skewed tables.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day28.pdf"><span class="d">28</span><span class="t">VACUUM, Table Bloat, and Dead Tuples in PostgreSQL</span><span class="k">performance</span><span class="s">Why DELETE does not give disk space back, and what autovacuum does.</span></a></li>
+      <li><a href="day/22/"><span class="d">22</span><span class="t">NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL</span><span class="s">One NULL in the subquery and NOT IN returns zero rows. What the planner does with each form.</span></a></li>
+      <li><a href="day/23/"><span class="d">23</span><span class="t">Functions on Indexed Columns: Why Indexes Get Ignored</span><span class="s">A function or cast on an indexed column hides it from the planner; range rewrites and expression indexes.</span></a></li>
+      <li><a href="day/24/"><span class="d">24</span><span class="t">The Cost of Correlated Subqueries</span><span class="s">A correlated subquery runs once per outer row; PostgreSQL keeps it that way. When to rewrite.</span></a></li>
+      <li><a href="day/25/"><span class="d">25</span><span class="t">Outdated Statistics: Why Queries Suddenly Get Slow</span><span class="s">Plans come from statistics, not data: stale estimates, ANALYZE and extended statistics.</span></a></li>
+      <li><a href="day/26/"><span class="d">26</span><span class="t">LATERAL JOIN: The Context-Aware Subquery</span><span class="s">Top-N per group and several aggregates from one lookup, compared with window functions.</span></a></li>
+      <li><a href="day/27/"><span class="d">27</span><span class="t">Partial Indexes: Index Only the Rows You Query</span><span class="s">Index only the rows you query: sizes, when the planner can use it, partial unique indexes.</span></a></li>
+      <li><a href="day/28/"><span class="d">28</span><span class="t">Why DELETE Does Not Shrink a PostgreSQL Table: MVCC, VACUUM and Bloat</span><span class="s">Dead row versions, what VACUUM and VACUUM FULL do with them, and long transactions.</span></a></li>
     </ol>
   </section>
 
@@ -167,9 +165,9 @@
     <h2 id="w5-title">The Deep End</h2>
     <p class="week-note">Security, concurrency, and what the optimizer does with your query.</p>
     <ol class="days">
-      <li><a href="days/31DaysMaySQL-Day29.pdf"><span class="d">29</span><span class="t">SQL Injection via Second-Order Attack</span><span class="k">logic</span><span class="s">Data that is safe when stored and dangerous when reused in another query.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day30.pdf"><span class="d">30</span><span class="t">Write-Skew and Phantom Reads: Isolation Levels You're Getting Wrong</span><span class="k">behavior</span><span class="s">Where REPEATABLE READ is not enough and SERIALIZABLE is.</span></a></li>
-      <li><a href="days/31DaysMaySQL-Day31.pdf"><span class="d">31</span><span class="t">SQL Is Declarative: And That Has Consequences</span><span class="k">logic</span><span class="s">Predicate pushdown, join reordering, and queries that are secretly equal.</span></a></li>
+      <li><a href="day/29/"><span class="d">29</span><span class="t">Second-Order SQL Injection: When the Payload Comes From Your Own Database</span><span class="s">A safely stored value injects SQL months later in dynamic SQL. Demonstration and fixes.</span></a></li>
+      <li><a href="day/30/"><span class="d">30</span><span class="t">Write Skew and Phantom Reads: Isolation Levels You're Getting Wrong</span><span class="s">Two doctors go off call at once. Write skew reproduced with two real sessions.</span></a></li>
+      <li><a href="day/31/"><span class="d">31</span><span class="t">SQL Is Declarative, and That Has Consequences</span><span class="s">What the PostgreSQL planner rewrites, what it leaves alone, and where it guesses wrong.</span></a></li>
     </ol>
   </section>
 

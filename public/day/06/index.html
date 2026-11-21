@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 06: Implicit Type Coercion That Kills Your Index · #31DaysMaySQL</title>
+<meta name="description" content="Comparing a string column to a number makes MySQL convert every row and skip the index, while PostgreSQL refuses to run the query; PostgreSQL has its own index-killing casts, shown here with real plans.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 06: Implicit Type Coercion That Kills Your Index">
+<meta property="og:description" content="Comparing a string column to a number makes MySQL convert every row and skip the index, while PostgreSQL refuses to run the query; PostgreSQL has its own index-killing casts, shown here with real plans.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../05/">← Day 05</a><a href="../07/">Day 07 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 06</p>
+  <h1>Implicit Type Coercion That Kills Your Index</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A <code>customers</code> table has an index on <code>phone_number</code>, a <code>VARCHAR</code> column, and someone writes this lookup without the quotes:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="dv">08123456789</span>;</span></code></pre>
+<p>PostgreSQL rejects it with an error. MySQL runs it and returns rows, but it cannot use the index on <code>phone_number</code>, so it reads the whole table. On a few thousand rows nobody notices. On a table of a few million rows the same lookup goes from a millisecond to seconds.</p>
+<p>The PostgreSQL examples below were run on PostgreSQL 18. The MySQL examples follow documented MySQL 8.0 behaviour; I did not run them for this article, so treat the plan output as representative and check it on your own server.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    <span class="kw">id</span>            <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name          TEXT,</span>
+<span>    phone_number  <span class="dt">VARCHAR</span>(<span class="dv">20</span>),</span>
+<span>    created_at    <span class="dt">TIMESTAMP</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers (name, phone_number, created_at)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;Customer &#39;</span> <span class="op">||</span> i,</span>
+<span>       <span class="st">&#39;08&#39;</span> <span class="op">||</span> <span class="fu">LPAD</span>(i:<span class="ch">:TEXT</span>, <span class="dv">10</span>, <span class="st">&#39;0&#39;</span>),</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2025-01-01&#39;</span> <span class="op">+</span> (i % <span class="dv">365</span>) <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">&#39;1 day&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) <span class="kw">AS</span> i;</span>
+<span></span>
+<span><span class="co">-- the same subscriber, typed in three different ways</span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers (name, phone_number)</span>
+<span><span class="kw">VALUES</span> (<span class="st">&#39;Extra A&#39;</span>, <span class="st">&#39;8123456789&#39;</span>),</span>
+<span>       (<span class="st">&#39;Extra B&#39;</span>, <span class="st">&#39;08123456789&#39;</span>),</span>
+<span>       (<span class="st">&#39;Extra C&#39;</span>, <span class="st">&#39;0008123456789&#39;</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_customers_phone <span class="kw">ON</span> customers (phone_number);</span>
+<span><span class="kw">ANALYZE</span> customers;</span>
+<span></span>
+<span><span class="co">-- keep plans deterministic: no parallel workers</span></span>
+<span><span class="kw">SET</span> max_parallel_workers_per_gather <span class="op">=</span> <span class="dv">0</span>;</span></code></pre>
+<p>The first generated number is <code>080000000001</code> (twelve characters). The three extra rows hold the same number with and without leading zeros, which matters in a moment.</p>
+<h2 id="postgresql-matching-types-use-the-index">PostgreSQL: matching types use the index</h2>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="st">&#39;080000000001&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+-------------------------------------------------------------
+ Index Scan using idx_customers_phone on customers
+   Index Cond: ((phone_number)::text = &#39;080000000001&#39;::text)
+(2 rows)</code></pre>
+<p>The <code>(phone_number)::text</code> in the condition is only a relabel: <code>VARCHAR</code> and <code>TEXT</code> share the same comparison operator, so the index is still used.</p>
+<h2 id="postgresql-a-number-against-a-string-column-is-an-error">PostgreSQL: a number against a string column is an error</h2>
+<p>PostgreSQL has no operator for <code>character varying = integer</code> and does not invent one:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="dv">123</span>;</span></code></pre>
+<pre class="text"><code>ERROR:  operator does not exist: character varying = integer
+LINE 1: SELECT * FROM customers WHERE phone_number = 123;
+                                                   ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.</code></pre>
+<p>This is the safe behaviour: the mistake shows up the first time the query runs, not in production after the table has grown.</p>
+<h2 id="mysql-the-same-query-runs-and-the-column-is-converted">MySQL: the same query runs, and the column is converted</h2>
+<p>In MySQL, comparing a string column with a number is allowed. The manual's rule for this case is that the operands are compared as floating-point numbers, so for every row MySQL converts <code>phone_number</code> to a number and compares that with your literal. An index on <code>phone_number</code> is sorted by string, not by that converted value, so it cannot be used to find matching rows.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers_mysql (</span>
+<span>    <span class="kw">id</span>            <span class="dt">INT</span> AUTO_INCREMENT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    phone_number  <span class="dt">VARCHAR</span>(<span class="dv">20</span>),</span>
+<span>    <span class="kw">INDEX</span> idx_phone (phone_number)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers_mysql (phone_number)</span>
+<span><span class="kw">WITH</span> RECURSIVE cte <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n <span class="kw">UNION</span> <span class="kw">ALL</span> <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span> <span class="kw">FROM</span> cte <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">1000</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">CONCAT</span>(<span class="st">&#39;08&#39;</span>, <span class="fu">LPAD</span>(n, <span class="dv">10</span>, <span class="st">&#39;0&#39;</span>)) <span class="kw">FROM</span> cte;</span>
+<span></span>
+<span><span class="co">-- A: string literal, uses the index</span></span>
+<span><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers_mysql <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="st">&#39;080000000001&#39;</span>;</span>
+<span></span>
+<span><span class="co">-- B: numeric literal, full table scan</span></span>
+<span><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers_mysql <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="dv">80000000001</span>;</span>
+<span>SHOW WARNINGS;</span></code></pre>
+<p>On MySQL 8.0 the plan for B shows <code>type = ALL</code> and <code>key = NULL</code> even though <code>idx_phone</code> is listed under <code>possible_keys</code>, and <code>SHOW WARNINGS</code> after the <code>EXPLAIN</code> reports warning 1739:</p>
+<pre class="text"><code>Level    Code  Message
+Warning  1739  Cannot use ref access on index &#39;idx_phone&#39; due to type or collation
+               conversion on field &#39;phone_number&#39;</code></pre>
+<p><code>EXPLAIN FORMAT=TREE</code> (8.0.16 and later) prints a <code>Table scan</code> under a <code>Filter</code> node for the same query. Warning 1739 is the quickest way to confirm the diagnosis, because it names the column whose conversion blocked the index.</p>
+<h2 id="what-the-conversion-does-to-the-results">What the conversion does to the results</h2>
+<p>The slowness is the smaller problem. Converting to numbers also changes which rows match. PostgreSQL will do the same conversion if you ask for it explicitly, which lets us see the effect on the three extra rows:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="kw">id</span>, phone_number</span>
+<span><span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> phone_number:<span class="ch">:NUMERIC</span> <span class="op">=</span> <span class="dv">8123456789</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">id</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   id   | phone_number  
+--------+---------------
+ 100001 | 8123456789
+ 100002 | 08123456789
+ 100003 | 0008123456789
+(3 rows)</code></pre>
+<p>The literal <code>08123456789</code> is the number 8123456789, because an integer has no leading zeros. Every string that parses to that number matches, so the query returns three different phone numbers where the string comparison <code>phone_number = '08123456789'</code> would return one. In MySQL you get this result without asking for it.</p>
+<p>MySQL has a second effect for strings that are not numbers. A string with no leading digits converts to 0, so this comparison is true for every such row:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="dv">0</span>;</span>
+<span><span class="co">-- &#39;alice&#39; converts to 0, so this returns alice, bob, and every other</span></span>
+<span><span class="co">-- username that does not start with a digit 1-9 (with a truncation warning per row)</span></span></code></pre>
+<p>Very long digit strings have a third problem: doubles hold about 15 to 17 significant digits, so two different long IDs stored as strings can compare equal to the same numeric literal.</p>
+<h2 id="postgresql-has-its-own-version-of-this-problem">PostgreSQL has its own version of this problem</h2>
+<p>PostgreSQL refuses <code>varchar = integer</code>, but it will cast a column when the types differ and a cast is the only way to make the comparison work. Two ways to get there.</p>
+<p><strong>You write the cast on the column.</strong> The phone query above, with the cast written out, can no longer use the index:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> phone_number:<span class="ch">:NUMERIC</span> <span class="op">=</span> <span class="dv">8123456789</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+-------------------------------------------------------------
+ Seq Scan on customers
+   Filter: ((phone_number)::numeric = &#39;8123456789&#39;::numeric)
+(2 rows)</code></pre>
+<p>An index on <code>phone_number</code> is ordered by the text value. It says nothing about the order of <code>phone_number::NUMERIC</code>, so the planner has to evaluate the cast on every row.</p>
+<p><strong>You compare an integer column with a numeric literal.</strong> There is no <code>integer = numeric</code> operator, so PostgreSQL converts the column to <code>numeric</code>:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="fl">42.0</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>            QUERY PLAN
+----------------------------------
+ Seq Scan on customers
+   Filter: ((id)::numeric = 42.0)
+(2 rows)</code></pre>
+<p><code>id</code> has a primary key index, and it is not used. The same happens with a <code>NUMERIC</code> parameter from a driver or ORM, or <code>id = 42::NUMERIC</code>. The plain integer version and the quoted version use the index:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>;</span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="st">&#39;42&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Index Scan using customers_pkey on customers
+   Index Cond: (id = 42)
+(2 rows)</code></pre>
+<p>The quoted <code>'42'</code> is an untyped literal, so PostgreSQL resolves it as <code>integer</code> to match the column. The rule behind all of this: an untyped literal adapts to the column, but a column of a fixed type is converted when no operator exists for the pair, and then the cast lands on the column.</p>
+<h2 id="the-same-thing-with-a-function">The same thing with a function</h2>
+<p>Any expression around the column, not just a cast, has the same effect. A common case is a date filter:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_customers_created <span class="kw">ON</span> customers (created_at);</span>
+<span><span class="kw">ANALYZE</span> customers;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> created_at:<span class="ch">:DATE</span> <span class="op">&gt;=</span> <span class="st">&#39;2025-12-31&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+------------------------------------------------------
+ Seq Scan on customers
+   Filter: ((created_at)::date &gt;= &#39;2025-12-31&#39;::date)
+(2 rows)</code></pre>
+<p>Keep the column bare and compare it with a timestamp instead:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> created_at <span class="op">&gt;=</span> <span class="st">&#39;2025-12-31&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                       QUERY PLAN
+----------------------------------------------------------------------------------------
+ Bitmap Heap Scan on customers
+   Recheck Cond: (created_at &gt;= &#39;2025-12-31 00:00:00&#39;::timestamp without time zone)
+   -&gt;  Bitmap Index Scan on idx_customers_created
+         Index Cond: (created_at &gt;= &#39;2025-12-31 00:00:00&#39;::timestamp without time zone)
+(4 rows)</code></pre>
+<h2 id="finding-it-in-real-systems">Finding it in real systems</h2>
+<ul>
+<li><strong>PostgreSQL:</strong> <code>EXPLAIN</code> on the slow query. The giveaway is a <code>Filter:</code> line that contains <code>::</code> on the column side, such as <code>(id)::numeric = 42.0</code>. With <code>pg_stat_statements</code> you can sort by total time and look at the heaviest statements for that pattern.</li>
+<li><strong>MySQL:</strong> <code>EXPLAIN</code> showing <code>type = ALL</code> with a non-empty <code>possible_keys</code>, and warning 1739 in <code>SHOW WARNINGS</code>.</li>
+<li><strong>Application side:</strong> look at the SQL your driver actually sends. ORMs and drivers decide the parameter type from the language type, so a phone number held in an <code>int</code> variable or a JSON number becomes a numeric literal.</li>
+</ul>
+<h2 id="the-fix">The fix</h2>
+<p>Make the literal or parameter the same type as the column, and leave the column bare:</p>
+<pre class="code"><code><span><span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="st">&#39;08123456789&#39;</span>     <span class="co">-- string column, string value</span></span>
+<span><span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>                          <span class="co">-- integer column, integer value</span></span>
+<span><span class="kw">WHERE</span> created_at <span class="op">&gt;=</span> <span class="st">&#39;2025-03-01&#39;</span> <span class="kw">AND</span> created_at <span class="op">&lt;</span> <span class="st">&#39;2025-03-02&#39;</span></span></code></pre>
+<p>If the value arrives with the wrong type, cast the value, not the column: <code>phone_number = (:phone)::TEXT</code> in PostgreSQL, <code>phone_number = CAST(? AS CHAR)</code> in MySQL. Phone numbers, postal codes and account numbers are identifiers, not quantities: store and compare them as strings, which is also the only way to keep their leading zeros.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>MySQL compares a string column with a number as floating-point numbers, converts every row, cannot use the index, and can match rows you did not intend to match.</li>
+<li>PostgreSQL rejects <code>varchar = integer</code>. It still skips the index when the column ends up inside a cast, for example <code>integer_col = 42.0</code> or <code>text_col::numeric = ...</code>.</li>
+<li>Look for <code>::</code> or a function on the column side of the plan's <code>Filter:</code> line, or warning 1739 in MySQL.</li>
+<li>Match the parameter's type to the column, and never wrap the column.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day06.pdf" download>Download PDF · Day 06</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../05/">← Day 05</a>
+  <a href="../../">All 31 days</a>
+  <a href="../07/">Day 07 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/06/</span>
+</footer>
+
+</body>
+</html>

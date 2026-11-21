@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 26: LATERAL JOIN: The Context-Aware Subquery · #31DaysMaySQL</title>
+<meta name="description" content="LATERAL lets a subquery in FROM refer to the tables before it. Top-N per group, several aggregates from one lookup, row-expanding functions, and how it compares with window functions in PostgreSQL 18.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 26: LATERAL JOIN: The Context-Aware Subquery">
+<meta property="og:description" content="LATERAL lets a subquery in FROM refer to the tables before it. Top-N per group, several aggregates from one lookup, row-expanding functions, and how it compares with window functions in PostgreSQL 18.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../25/">← Day 25</a><a href="../27/">Day 27 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 26</p>
+  <h1>LATERAL JOIN: The Context-Aware Subquery</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>"Show the three most recent orders for each customer" is awkward with the tools a plain <code>JOIN</code> gives you. A scalar subquery returns one value, so it cannot return three rows. A window function can do it, but it ranks every order first. A subquery in <code>FROM</code> would be the natural fit, except that it cannot see the customer it is supposed to belong to:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> customers c,</span>
+<span>     (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id) o;</span>
+<span><span class="co">-- ERROR:  invalid reference to FROM-clause entry for table &quot;c&quot;</span></span>
+<span><span class="co">-- HINT:  To reference that table, you must mark this subquery with LATERAL.</span></span></code></pre>
+<p><code>LATERAL</code> lifts that restriction. A <code>LATERAL</code> subquery is evaluated for each row of the tables listed before it and may use their columns. The outer row acts as the parameter of a small inner query that can return any number of rows and columns.</p>
+<p>The examples run on PostgreSQL 18. <code>LATERAL</code> is part of standard SQL; the last section lists what other databases call it.</p>
+<h2 id="the-data">The data</h2>
+<p>Four customers and eight orders. Diana has none, and Charlie's newest order is still pending:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    signup_date  <span class="dt">DATE</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers (customer_id),</span>
+<span>    total        <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    status       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    created_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_customer_created <span class="kw">ON</span> orders (customer_id, created_at <span class="kw">DESC</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>,   <span class="st">&#39;2023-05-15&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>,     <span class="st">&#39;2024-01-20&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Charlie&#39;</span>, <span class="st">&#39;2023-11-10&#39;</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="st">&#39;Diana&#39;</span>,   <span class="st">&#39;2024-03-05&#39;</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">101</span>, <span class="dv">1</span>,  <span class="fl">99.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-05-01&#39;</span>),</span>
+<span>    (<span class="dv">102</span>, <span class="dv">1</span>, <span class="fl">149.50</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-05-15&#39;</span>),</span>
+<span>    (<span class="dv">103</span>, <span class="dv">1</span>,  <span class="fl">79.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-06-02&#39;</span>),</span>
+<span>    (<span class="dv">104</span>, <span class="dv">1</span>, <span class="fl">220.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-06-20&#39;</span>),</span>
+<span>    (<span class="dv">105</span>, <span class="dv">2</span>,  <span class="fl">50.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-04-10&#39;</span>),</span>
+<span>    (<span class="dv">106</span>, <span class="dv">2</span>,  <span class="fl">75.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-05-20&#39;</span>),</span>
+<span>    (<span class="dv">107</span>, <span class="dv">3</span>, <span class="fl">999.00</span>, <span class="st">&#39;completed&#39;</span>, <span class="st">&#39;2024-06-01&#39;</span>),</span>
+<span>    (<span class="dv">108</span>, <span class="dv">3</span>,  <span class="fl">50.00</span>, <span class="st">&#39;pending&#39;</span>,   <span class="st">&#39;2024-06-10&#39;</span>);</span></code></pre>
+<h2 id="top-n-per-group">Top-N per group</h2>
+<p>With a window function, rank each customer's orders and keep the first three:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, order_id, total, created_at</span>
+<span><span class="kw">FROM</span> (</span>
+<span>    <span class="kw">SELECT</span> o.<span class="op">*</span>,</span>
+<span>           <span class="fu">row_number</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span>) <span class="kw">AS</span> rn</span>
+<span>    <span class="kw">FROM</span> orders o</span>
+<span>) ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="op">&lt;=</span> <span class="dv">3</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id, created_at <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | order_id | total  |     created_at
+-------------+----------+--------+---------------------
+           1 |      104 | 220.00 | 2024-06-20 00:00:00
+           1 |      103 |  79.00 | 2024-06-02 00:00:00
+           1 |      102 | 149.50 | 2024-05-15 00:00:00
+           2 |      106 |  75.00 | 2024-05-20 00:00:00
+           2 |      105 |  50.00 | 2024-04-10 00:00:00
+           3 |      108 |  50.00 | 2024-06-10 00:00:00
+           3 |      107 | 999.00 | 2024-06-01 00:00:00
+(7 rows)</code></pre>
+<p>The <code>LATERAL</code> version asks the question the way you would say it: for each customer, take that customer's orders, newest first, and stop after three.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.customer_id, c.name, o.order_id, o.total, o.created_at</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id, total, created_at</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">3</span></span>
+<span>) o</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id, o.created_at <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id |  name   | order_id | total  |     created_at
+-------------+---------+----------+--------+---------------------
+           1 | Alice   |      104 | 220.00 | 2024-06-20 00:00:00
+           1 | Alice   |      103 |  79.00 | 2024-06-02 00:00:00
+           1 | Alice   |      102 | 149.50 | 2024-05-15 00:00:00
+           2 | Bob     |      106 |  75.00 | 2024-05-20 00:00:00
+           2 | Bob     |      105 |  50.00 | 2024-04-10 00:00:00
+           3 | Charlie |      108 |  50.00 | 2024-06-10 00:00:00
+           3 | Charlie |      107 | 999.00 | 2024-06-01 00:00:00
+(7 rows)</code></pre>
+<p>Diana is missing: <code>CROSS JOIN LATERAL</code> drops an outer row when the subquery returns nothing. <code>LEFT JOIN LATERAL ... ON TRUE</code> keeps her, with <code>NULL</code>s in the order columns:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.customer_id, c.name, o.order_id, o.total, o.created_at</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id, total, created_at</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">3</span></span>
+<span>) o <span class="kw">ON</span> <span class="kw">TRUE</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id, o.created_at <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id |  name   | order_id | total  |     created_at
+-------------+---------+----------+--------+---------------------
+           1 | Alice   |      104 | 220.00 | 2024-06-20 00:00:00
+           1 | Alice   |      103 |  79.00 | 2024-06-02 00:00:00
+           1 | Alice   |      102 | 149.50 | 2024-05-15 00:00:00
+           2 | Bob     |      106 |  75.00 | 2024-05-20 00:00:00
+           2 | Bob     |      105 |  50.00 | 2024-04-10 00:00:00
+           3 | Charlie |      108 |  50.00 | 2024-06-10 00:00:00
+           3 | Charlie |      107 | 999.00 | 2024-06-01 00:00:00
+           4 | Diana   |          |        |
+(8 rows)</code></pre>
+<p>A <code>LEFT JOIN</code> always needs an <code>ON</code> clause (leave it out and PostgreSQL reports a syntax error). With <code>LATERAL</code>, the matching already happens inside the subquery, so <code>ON TRUE</code> is the usual way to satisfy the grammar. You can put a real condition there too, but it filters the subquery's output and does not change which rows the subquery produces.</p>
+<p>Two details about the top-N query. If two orders of a customer share a <code>created_at</code>, <code>ORDER BY created_at DESC LIMIT 3</code> can return either, and which one may change between runs. Add a unique column as a tie-breaker (<code>ORDER BY created_at DESC, order_id DESC</code>). And the same pattern with <code>LIMIT 1</code> gives you "latest row per group".</p>
+<h2 id="which-is-faster-window-or-lateral">Which is faster, window or LATERAL?</h2>
+<p>On four customers, neither. To compare plans, a bigger table: 10,000 customers with 100 orders each.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_customers (customer_id <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>);</span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> big_customers (customer_id),</span>
+<span>    created_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_customers <span class="kw">SELECT</span> g <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_orders</span>
+<span><span class="kw">SELECT</span> g,</span>
+<span>       <span class="dv">1</span> <span class="op">+</span> (g:<span class="ch">:bigint</span> <span class="op">*</span> <span class="dv">7919</span>) % <span class="dv">10000</span>,</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2023-01-01&#39;</span> <span class="op">+</span> (g % <span class="dv">700</span>) <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">&#39;1 hour&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> big_orders (customer_id, created_at <span class="kw">DESC</span>);</span>
+<span>VACUUM <span class="kw">ANALYZE</span> big_customers;</span>
+<span>VACUUM <span class="kw">ANALYZE</span> big_orders;</span></code></pre>
+<p>The window version walks through the whole index and numbers every one of the million rows:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> customer_id, order_id</span>
+<span><span class="kw">FROM</span> (</span>
+<span>    <span class="kw">SELECT</span> o.<span class="op">*</span>,</span>
+<span>           <span class="fu">row_number</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span>) <span class="kw">AS</span> rn</span>
+<span>    <span class="kw">FROM</span> big_orders o</span>
+<span>) ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="op">&lt;=</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                            QUERY PLAN
+---------------------------------------------------------------------------------------------------
+ Subquery Scan on ranked
+   -&gt;  WindowAgg
+         Window: w1 AS (PARTITION BY o.customer_id ORDER BY o.created_at ROWS UNBOUNDED PRECEDING)
+         Run Condition: (row_number() OVER w1 &lt;= 3)
+         -&gt;  Index Scan using big_orders_customer_id_created_at_idx on big_orders o
+(5 rows)</code></pre>
+<p><code>Run Condition</code> is a PostgreSQL optimization (version 15 and later) that stops the window function from producing rows once <code>rn</code> passes 3. The scan underneath still reads every row. The <code>LATERAL</code> version does one short index probe per customer:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id, o.order_id</span>
+<span><span class="kw">FROM</span> big_customers c</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id</span>
+<span>    <span class="kw">FROM</span> big_orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">3</span></span>
+<span>) o;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Nested Loop
+   -&gt;  Seq Scan on big_customers c
+   -&gt;  Limit
+         -&gt;  Index Scan using big_orders_customer_id_created_at_idx on big_orders
+               Index Cond: (customer_id = c.customer_id)
+(5 rows)</code></pre>
+<p>Under the <code>Limit</code> the index already delivers each customer's rows in <code>created_at DESC</code> order, so the scan stops after three rows. In a single run on my laptop the window version needed a few times longer than the <code>LATERAL</code> version for this data; treat that as a direction, not a benchmark. Both return 30,000 rows.</p>
+<p>The balance shifts with the shape of the data. <code>LATERAL</code> costs one probe per outer row, so it wins when the groups are deep (many orders per customer, few wanted) and an index matches the <code>WHERE</code> and <code>ORDER BY</code>. With millions of customers and one or two orders each, the probes buy nothing and one pass with a window function is simpler and often faster. Without a matching index each probe has to read and sort all of that customer's orders, so redo the comparison with <code>EXPLAIN (ANALYZE)</code> on your own data and indexes.</p>
+<p>When the outer side is restricted, <code>LATERAL</code> is also easy to keep cheap, because only the surviving outer rows run a probe:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id, o.order_id</span>
+<span><span class="kw">FROM</span> big_customers c</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id</span>
+<span>    <span class="kw">FROM</span> big_orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">3</span></span>
+<span>) o</span>
+<span><span class="kw">WHERE</span> c.customer_id <span class="op">&lt;=</span> <span class="dv">20</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Nested Loop
+   -&gt;  Index Only Scan using big_customers_pkey on big_customers c
+         Index Cond: (customer_id &lt;= 20)
+   -&gt;  Limit
+         -&gt;  Index Scan using big_orders_customer_id_created_at_idx on big_orders
+               Index Cond: (customer_id = c.customer_id)
+(6 rows)</code></pre>
+<h2 id="filters-outside-the-subquery">Filters outside the subquery</h2>
+<p>Where a condition goes matters once the subquery has a <code>LIMIT</code>. Take "each customer's latest completed order". Charlie's newest order (108) is pending.</p>
+<p>Filtering inside the subquery picks the newest completed order:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name, o.order_id, o.status</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id, status</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>      <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;completed&#39;</span></span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">1</span></span>
+<span>) o <span class="kw">ON</span> <span class="kw">TRUE</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  name   | order_id |  status
+---------+----------+-----------
+ Alice   |      104 | completed
+ Bob     |      106 | completed
+ Charlie |      107 | completed
+(3 rows)</code></pre>
+<p>Filtering outside takes the newest order first, whatever its status, and then drops it if it is not completed:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name, o.order_id, o.status</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> order_id, status</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>    <span class="kw">LIMIT</span> <span class="dv">1</span></span>
+<span>) o <span class="kw">ON</span> <span class="kw">TRUE</span></span>
+<span><span class="kw">WHERE</span> o.status <span class="op">=</span> <span class="st">&#39;completed&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name  | order_id |  status
+-------+----------+-----------
+ Alice |      104 | completed
+ Bob   |      106 | completed
+(2 rows)</code></pre>
+<p>Charlie vanishes, because his latest order is the pending one. Without a <code>LIMIT</code> the two placements give the same rows and PostgreSQL plans them the same way, since it flattens such a subquery into an ordinary join. With <code>LIMIT</code> they are different questions.</p>
+<h2 id="several-aggregates-from-one-lookup">Several aggregates from one lookup</h2>
+<p>Day 24 covered the cost of writing one correlated scalar subquery per column. A <code>LATERAL</code> subquery computes all of them from a single probe:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.customer_id,</span>
+<span>       c.name,</span>
+<span>       s.order_count,</span>
+<span>       s.last_order,</span>
+<span>       s.revenue</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)        <span class="kw">AS</span> order_count,</span>
+<span>           <span class="fu">max</span>(created_at) <span class="kw">AS</span> last_order,</span>
+<span>           <span class="fu">sum</span>(total)      <span class="kw">AS</span> revenue</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>) s <span class="kw">ON</span> <span class="kw">TRUE</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id |  name   | order_count |     last_order      | revenue
+-------------+---------+-------------+---------------------+---------
+           1 | Alice   |           4 | 2024-06-20 00:00:00 |  547.50
+           2 | Bob     |           2 | 2024-05-20 00:00:00 |  125.00
+           3 | Charlie |           2 | 2024-06-10 00:00:00 | 1049.00
+           4 | Diana   |           0 |                     |
+(4 rows)</code></pre>
+<p>An aggregate without <code>GROUP BY</code> always returns one row, so Diana appears with a count of 0 and <code>NULL</code> for the others. This is also the place to compute derived values once per customer. A "churn risk" label needs a reference date, so this one is fixed at 2024-07-01 to make the output repeatable (in a report you would use <code>CURRENT_DATE</code>):</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name,</span>
+<span>       b.completed,</span>
+<span>       b.pending,</span>
+<span>       <span class="cf">CASE</span></span>
+<span>           <span class="cf">WHEN</span> b.last_order <span class="kw">IS</span> <span class="kw">NULL</span>                      <span class="cf">THEN</span> <span class="st">&#39;never ordered&#39;</span></span>
+<span>           <span class="cf">WHEN</span> b.last_order <span class="op">&lt;</span> <span class="dt">DATE</span> <span class="st">&#39;2024-07-01&#39;</span> <span class="op">-</span> <span class="dv">60</span>     <span class="cf">THEN</span> <span class="st">&#39;high&#39;</span></span>
+<span>           <span class="cf">WHEN</span> b.last_order <span class="op">&lt;</span> <span class="dt">DATE</span> <span class="st">&#39;2024-07-01&#39;</span> <span class="op">-</span> <span class="dv">30</span>     <span class="cf">THEN</span> <span class="st">&#39;medium&#39;</span></span>
+<span>           <span class="cf">ELSE</span> <span class="st">&#39;low&#39;</span></span>
+<span>       <span class="cf">END</span> <span class="kw">AS</span> churn_risk</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;completed&#39;</span>) <span class="kw">AS</span> completed,</span>
+<span>           <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;pending&#39;</span>)   <span class="kw">AS</span> pending,</span>
+<span>           <span class="fu">max</span>(created_at)                              <span class="kw">AS</span> last_order</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>) b <span class="kw">ON</span> <span class="kw">TRUE</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  name   | completed | pending |  churn_risk
+---------+-----------+---------+---------------
+ Alice   |         4 |       0 | low
+ Bob     |         2 |       0 | medium
+ Charlie |         1 |       1 | low
+ Diana   |         0 |       0 | never ordered
+(4 rows)</code></pre>
+<p>Without the <code>'never ordered'</code> branch Diana would be labeled <code>low</code>, because <code>NULL &lt; date</code> is unknown and a <code>CASE</code> falls through to <code>ELSE</code>. The mistake looks like a good customer.</p>
+<h2 id="functions-that-return-rows">Functions that return rows</h2>
+<p>A set-returning function in <code>FROM</code> is implicitly <code>LATERAL</code>, so it can refer to earlier tables without the keyword. Here each customer is expanded into the twelve months of their signup year:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name, m.month_start:<span class="ch">:date</span> <span class="kw">AS</span> month_start</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> generate_series(</span>
+<span>        date_trunc(<span class="st">&#39;year&#39;</span>, c.signup_date:<span class="ch">:timestamp</span>),</span>
+<span>        date_trunc(<span class="st">&#39;year&#39;</span>, c.signup_date:<span class="ch">:timestamp</span>) <span class="op">+</span> <span class="dt">INTERVAL</span> <span class="st">&#39;11 months&#39;</span>,</span>
+<span>        <span class="dt">INTERVAL</span> <span class="st">&#39;1 month&#39;</span></span>
+<span>     ) <span class="kw">AS</span> m(month_start)</span>
+<span><span class="kw">WHERE</span> c.customer_id <span class="op">=</span> <span class="dv">1</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> m.month_start;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name  | month_start
+-------+-------------
+ Alice | 2023-01-01
+ Alice | 2023-02-01
+ Alice | 2023-03-01
+ Alice | 2023-04-01
+ Alice | 2023-05-01
+ Alice | 2023-06-01
+ Alice | 2023-07-01
+ Alice | 2023-08-01
+ Alice | 2023-09-01
+ Alice | 2023-10-01
+ Alice | 2023-11-01
+ Alice | 2023-12-01
+(12 rows)</code></pre>
+<p>The <code>::timestamp</code> casts matter. <code>generate_series</code> with date arguments returns <code>timestamptz</code>, which is shown in the session's time zone. The same trick with <code>unnest(array_column)</code> or <code>jsonb_array_elements(json_column)</code> expands arrays and JSON arrays into rows, one outer row at a time.</p>
+<h2 id="what-other-databases-call-it">What other databases call it</h2>
+<ul>
+<li><strong>PostgreSQL</strong>: <code>LATERAL</code> since 9.3, with <code>CROSS JOIN LATERAL</code> and <code>LEFT JOIN LATERAL ... ON TRUE</code>.</li>
+<li><strong>MySQL</strong>: <code>LATERAL</code> derived tables since 8.0.14, same syntax as PostgreSQL.</li>
+<li><strong>SQL Server</strong>: no <code>LATERAL</code> keyword. <code>CROSS APPLY</code> and <code>OUTER APPLY</code> do the same job, and <code>TOP</code> replaces <code>LIMIT</code>.</li>
+<li><strong>Oracle</strong>: <code>LATERAL</code> and <code>CROSS APPLY</code> / <code>OUTER APPLY</code> since 12c.</li>
+<li><strong>BigQuery</strong>: no <code>LATERAL</code>. A comma join against <code>UNNEST(array_column)</code> covers the array case, and correlated subqueries cover some of the rest.</li>
+<li><strong>SQLite</strong>: no <code>LATERAL</code>; a window function or a correlated subquery has to do the work.</li>
+</ul>
+<p>The SQL Server form of the top-three query:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.name, o.order_id, o.total, o.created_at</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">CROSS</span> APPLY (</span>
+<span>    <span class="kw">SELECT</span> TOP <span class="dv">3</span> order_id, total, created_at</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span>) o;</span>
+<span><span class="co">-- OUTER APPLY keeps customers without orders, like LEFT JOIN LATERAL.</span></span></code></pre>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>LATERAL</code> makes a <code>FROM</code> subquery run once per outer row and lets it use the outer row's columns.</li>
+<li>Top-N per group is the main use: with an index on <code>(group_column, sort_column)</code>, each group costs a short index probe. With very small groups, a window function is the better tool.</li>
+<li><code>CROSS JOIN LATERAL</code> drops outer rows with no result, <code>LEFT JOIN LATERAL ... ON TRUE</code> keeps them.</li>
+<li>With a <code>LIMIT</code> inside, a condition inside the subquery and the same condition outside return different rows.</li>
+<li>Several aggregates over the same table belong in one <code>LATERAL</code> subquery instead of one scalar subquery each.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day26.pdf" download>Download PDF · Day 26</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../25/">← Day 25</a>
+  <a href="../../">All 31 days</a>
+  <a href="../27/">Day 27 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/26/</span>
+</footer>
+
+</body>
+</html>

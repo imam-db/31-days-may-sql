@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 10: Build a Football League Table with SQL · #31DaysMaySQL</title>
+<meta name="description" content="Turn one row per match into a league table with points, goal difference, ranking with tie-breakers and a last-five form string, using a two-rows-per-match view, conditional aggregation and window functions.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 10: Build a Football League Table with SQL">
+<meta property="og:description" content="Turn one row per match into a league table with points, goal difference, ranking with tie-breakers and a last-five form string, using a two-rows-per-match view, conditional aggregation and window functions.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../09/">← Day 09</a><a href="../11/">Day 11 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 10</p>
+  <h1>Build a Football League Table with SQL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A league table looks like something an application has to maintain, but it can be computed from a single table of results, one row per match. The pieces are a view that gives every match two rows (one per team), conditional aggregation for wins, draws and losses, a window function for the ranking with tie-breakers, and a window function again for the last-five form string. The queries run on PostgreSQL 18. The MySQL differences are noted where they matter.</p>
+<p>The same queries work on decades of real Premier League results. The data here is a small invented league instead, so that every query can be run as printed and the ties are visible: six clubs, ten gameweeks, one postponed match.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> matches (</span>
+<span>    match_id    <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    season      TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    gameweek    <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    match_date  <span class="dt">DATE</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    home_team   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    away_team   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    home_score  <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    away_score  <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> matches (season, gameweek, match_date, home_team, away_team, home_score, away_score) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2023-08-12&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">1</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2023-08-12&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">0</span>, <span class="dv">3</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2023-08-12&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">2</span>, <span class="st">&#39;2023-08-19&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">2</span>, <span class="st">&#39;2023-08-19&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">2</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">2</span>, <span class="st">&#39;2023-08-19&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">0</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">3</span>, <span class="st">&#39;2023-08-26&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">1</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">3</span>, <span class="st">&#39;2023-08-26&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="dv">3</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">3</span>, <span class="st">&#39;2023-08-26&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">3</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">4</span>, <span class="st">&#39;2023-09-02&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">4</span>, <span class="st">&#39;2023-09-02&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">4</span>, <span class="st">&#39;2023-09-02&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="dv">2</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">5</span>, <span class="st">&#39;2023-09-09&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">2</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">5</span>, <span class="st">&#39;2023-10-18&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="dv">3</span>, <span class="dv">1</span>),   <span class="co">-- postponed, played later</span></span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">5</span>, <span class="st">&#39;2023-09-09&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="dv">0</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">6</span>, <span class="st">&#39;2023-09-16&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">6</span>, <span class="st">&#39;2023-09-16&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">6</span>, <span class="st">&#39;2023-09-16&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="dv">0</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">7</span>, <span class="st">&#39;2023-09-23&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">7</span>, <span class="st">&#39;2023-09-23&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">1</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">7</span>, <span class="st">&#39;2023-09-23&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">8</span>, <span class="st">&#39;2023-09-30&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="dv">0</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">8</span>, <span class="st">&#39;2023-09-30&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">8</span>, <span class="st">&#39;2023-09-30&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">1</span>, <span class="dv">3</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">9</span>, <span class="st">&#39;2023-10-07&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">9</span>, <span class="st">&#39;2023-10-07&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>,  <span class="dv">9</span>, <span class="st">&#39;2023-10-07&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">0</span>, <span class="dv">3</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>, <span class="dv">10</span>, <span class="st">&#39;2023-10-14&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="dv">1</span>, <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>, <span class="dv">10</span>, <span class="st">&#39;2023-10-14&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;2023/24&#39;</span>, <span class="dv">10</span>, <span class="st">&#39;2023-10-14&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span>    <span class="co">-- first gameweek of another season, used later to show tied teams</span></span>
+<span>    (<span class="st">&#39;2022/23&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2022-08-13&#39;</span>, <span class="st">&#39;Ashford&#39;</span>, <span class="st">&#39;Brightwater&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2022/23&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2022-08-13&#39;</span>, <span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Dunmore&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>),</span>
+<span>    (<span class="st">&#39;2022/23&#39;</span>,  <span class="dv">1</span>, <span class="st">&#39;2022-08-13&#39;</span>, <span class="st">&#39;Eastleigh&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="dv">1</span>, <span class="dv">1</span>);</span></code></pre>
+<p>Two details of the design come from mistakes that are easy to make. The match date is a real <code>DATE</code>, not text: text dates sort alphabetically, so <code>'10/12/2023'</code> comes before <code>'9/1/2023'</code>. And the gameweek is stored separately from the date, because a postponed match keeps its gameweek and moves to another day. Fenwick v Carrow, gameweek 5, was played on 18 October, after gameweek 10. That match matters for the form string later.</p>
+<h2 id="two-rows-per-match">Two rows per match</h2>
+<p>A match row says two things: for the home club it is goals for and against, for the away club the same numbers reversed. A league table is about clubs, so the first step is a view that returns one row per club per match:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">VIEW</span> team_matches <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span> season, gameweek, match_date,</span>
+<span>       home_team <span class="kw">AS</span> club, away_team <span class="kw">AS</span> opponent, <span class="st">&#39;home&#39;</span> <span class="kw">AS</span> venue,</span>
+<span>       home_score <span class="kw">AS</span> goals_for, away_score <span class="kw">AS</span> goals_against,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> home_score <span class="op">&gt;</span> away_score <span class="cf">THEN</span> <span class="st">&#39;W&#39;</span></span>
+<span>            <span class="cf">WHEN</span> home_score <span class="op">=</span> away_score <span class="cf">THEN</span> <span class="st">&#39;D&#39;</span></span>
+<span>            <span class="cf">ELSE</span> <span class="st">&#39;L&#39;</span> <span class="cf">END</span> <span class="kw">AS</span> result</span>
+<span><span class="kw">FROM</span> matches</span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> season, gameweek, match_date,</span>
+<span>       away_team, home_team, <span class="st">&#39;away&#39;</span>,</span>
+<span>       away_score, home_score,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> away_score <span class="op">&gt;</span> home_score <span class="cf">THEN</span> <span class="st">&#39;W&#39;</span></span>
+<span>            <span class="cf">WHEN</span> away_score <span class="op">=</span> home_score <span class="cf">THEN</span> <span class="st">&#39;D&#39;</span></span>
+<span>            <span class="cf">ELSE</span> <span class="st">&#39;L&#39;</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> matches;</span></code></pre>
+<p><code>UNION ALL</code>, not <code>UNION</code>: <code>UNION</code> would add a de-duplication step and could silently drop a genuine repeat, and no duplicates are expected here. Thirty matches become sixty rows. Fenwick's season looks like this:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> gameweek, match_date, venue, opponent, goals_for, goals_against, result</span>
+<span><span class="kw">FROM</span> team_matches</span>
+<span><span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span> <span class="kw">AND</span> club <span class="op">=</span> <span class="st">&#39;Fenwick&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> match_date;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> gameweek | match_date | venue |  opponent   | goals_for | goals_against | result
+----------+------------+-------+-------------+-----------+---------------+--------
+        1 | 2023-08-12 | away  | Ashford     |         1 |             1 | D
+        2 | 2023-08-19 | home  | Dunmore     |         2 |             1 | W
+        3 | 2023-08-26 | home  | Brightwater |         3 |             1 | W
+        4 | 2023-09-02 | home  | Eastleigh   |         2 |             1 | W
+        6 | 2023-09-16 | home  | Ashford     |         1 |             0 | W
+        7 | 2023-09-23 | away  | Dunmore     |         1 |             1 | D
+        8 | 2023-09-30 | away  | Brightwater |         3 |             1 | W
+        9 | 2023-10-07 | away  | Eastleigh   |         3 |             0 | W
+       10 | 2023-10-14 | away  | Carrow      |         2 |             1 | W
+        5 | 2023-10-18 | home  | Carrow      |         3 |             1 | W
+(10 rows)</code></pre>
+<p>The same unpivot idea applies whenever a row holds two parties: sender and receiver, buyer and seller, payer and payee.</p>
+<h2 id="counting-results">Counting results</h2>
+<p>Once each row is one club's experience of one match, the table is a <code>GROUP BY club</code>. Wins, draws and losses are conditional counts, and points follow from them:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> club,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>)                                  <span class="kw">AS</span> p,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)      <span class="kw">AS</span> w,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;D&#39;</span>)      <span class="kw">AS</span> d,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;L&#39;</span>)      <span class="kw">AS</span> l,</span>
+<span>       <span class="fu">SUM</span>(goals_for)                            <span class="kw">AS</span> gf,</span>
+<span>       <span class="fu">SUM</span>(goals_against)                        <span class="kw">AS</span> ga,</span>
+<span>       <span class="fu">SUM</span>(goals_for <span class="op">-</span> goals_against)            <span class="kw">AS</span> gd,</span>
+<span>       <span class="dv">3</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)</span>
+<span>         <span class="op">+</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;D&#39;</span>)  <span class="kw">AS</span> pts</span>
+<span><span class="kw">FROM</span> team_matches</span>
+<span><span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> club</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> pts <span class="kw">DESC</span>, gd <span class="kw">DESC</span>, gf <span class="kw">DESC</span>, club;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    club     | p  | w | d | l | gf | ga | gd | pts
+-------------+----+---+---+---+----+----+----+-----
+ Fenwick     | 10 | 8 | 2 | 0 | 21 |  8 | 13 |  26
+ Carrow      | 10 | 4 | 3 | 3 | 12 | 12 |  0 |  15
+ Brightwater | 10 | 4 | 3 | 3 | 11 | 11 |  0 |  15
+ Dunmore     | 10 | 0 | 8 | 2 |  9 | 11 | -2 |   8
+ Eastleigh   | 10 | 2 | 2 | 6 |  9 | 17 | -8 |   8
+ Ashford     | 10 | 1 | 4 | 5 |  7 | 10 | -3 |   7
+(6 rows)</code></pre>
+<p><code>COUNT(*) FILTER (WHERE ...)</code> is PostgreSQL and SQLite syntax (and standard SQL). The portable spelling, which also works in MySQL and SQL Server, is <code>SUM(CASE WHEN result = 'W' THEN 1 ELSE 0 END)</code>. One pass over the data replaces a separate query for each of wins, draws and losses.</p>
+<p>Carrow and Brightwater have the same 15 points, and Dunmore and Eastleigh both have 8. The order within those pairs comes from tie-breakers.</p>
+<h2 id="positions-and-tie-breakers">Positions and tie-breakers</h2>
+<p>The Premier League orders clubs by points, then goal difference, then goals scored. Head-to-head results come into play only for ties that survive those three, and this article does not model them. Other leagues order differently (La Liga looks at head-to-head first), so the tie-breakers are rules to be read from the competition, not something to hard-code from memory.</p>
+<p>The ordering goes into the window function that numbers the rows:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> totals <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> club,</span>
+<span>           <span class="fu">SUM</span>(goals_for)                         <span class="kw">AS</span> gf,</span>
+<span>           <span class="fu">SUM</span>(goals_for <span class="op">-</span> goals_against)         <span class="kw">AS</span> gd,</span>
+<span>           <span class="dv">3</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)</span>
+<span>             <span class="op">+</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;D&#39;</span>) <span class="kw">AS</span> pts</span>
+<span>    <span class="kw">FROM</span> team_matches</span>
+<span>    <span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span></span>
+<span>    <span class="kw">GROUP</span> <span class="kw">BY</span> club</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">RANK</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> pts <span class="kw">DESC</span>, gd <span class="kw">DESC</span>, gf <span class="kw">DESC</span>) <span class="kw">AS</span> pos,</span>
+<span>       club, pts, gd, gf</span>
+<span><span class="kw">FROM</span> totals</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> pos, club;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> pos |    club     | pts | gd | gf
+-----+-------------+-----+----+----
+   1 | Fenwick     |  26 | 13 | 21
+   2 | Carrow      |  15 |  0 | 12
+   3 | Brightwater |  15 |  0 | 11
+   4 | Dunmore     |   8 | -2 |  9
+   5 | Eastleigh   |   8 | -8 |  9
+   6 | Ashford     |   7 | -3 |  7
+(6 rows)</code></pre>
+<p>Carrow ranks above Brightwater: equal on points and goal difference (both 0), 12 goals scored against 11. Dunmore ranks above Eastleigh on goal difference alone, -2 against -8.</p>
+<p><code>RANK()</code> and <code>ROW_NUMBER()</code> differ when two clubs are equal on every criterion. The first season in the table (the 2022/23 rows, one gameweek) has two such pairs:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> pos <span class="kw">AS</span> rank_pos,</span>
+<span>       <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> pts <span class="kw">DESC</span>, gd <span class="kw">DESC</span>, gf <span class="kw">DESC</span>, club) <span class="kw">AS</span> row_no,</span>
+<span>       club, pts, gd, gf</span>
+<span><span class="kw">FROM</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">RANK</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> pts <span class="kw">DESC</span>, gd <span class="kw">DESC</span>, gf <span class="kw">DESC</span>) <span class="kw">AS</span> pos,</span>
+<span>           club, pts, gd, gf</span>
+<span>    <span class="kw">FROM</span> (</span>
+<span>        <span class="kw">SELECT</span> club,</span>
+<span>               <span class="fu">SUM</span>(goals_for)                         <span class="kw">AS</span> gf,</span>
+<span>               <span class="fu">SUM</span>(goals_for <span class="op">-</span> goals_against)         <span class="kw">AS</span> gd,</span>
+<span>               <span class="dv">3</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)</span>
+<span>                 <span class="op">+</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> result <span class="op">=</span> <span class="st">&#39;D&#39;</span>) <span class="kw">AS</span> pts</span>
+<span>        <span class="kw">FROM</span> team_matches</span>
+<span>        <span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2022/23&#39;</span></span>
+<span>        <span class="kw">GROUP</span> <span class="kw">BY</span> club</span>
+<span>    ) <span class="kw">AS</span> t</span>
+<span>) <span class="kw">AS</span> r</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> row_no;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> rank_pos | row_no |    club     | pts | gd | gf
+----------+--------+-------------+-----+----+----
+        1 |      1 | Ashford     |   3 |  1 |  1
+        1 |      2 | Carrow      |   3 |  1 |  1
+        3 |      3 | Eastleigh   |   1 |  0 |  1
+        3 |      4 | Fenwick     |   1 |  0 |  1
+        5 |      5 | Brightwater |   0 | -1 |  0
+        5 |      6 | Dunmore     |   0 | -1 |  0
+(6 rows)</code></pre>
+<p>Ashford and Carrow both have 3 points, +1 and 1 goal scored. <code>RANK()</code> gives them the same position 1 and skips to 3 for the next club, which is how real tables show clubs level on everything. <code>ROW_NUMBER()</code> has to separate them, and it can only do that by an arbitrary rule (here the club name). Without such a final column in the <code>ORDER BY</code>, the order of fully tied rows is whatever the executor happens to produce, so the position would be unstable between runs. Use <code>RANK()</code> unless the table must give each club a unique number.</p>
+<h2 id="the-form-column">The form column</h2>
+<p>Form is the results of a club's last five matches, written like <code>WWDLW</code>. Number each club's matches from the most recent, keep the first five, and join their result letters in date order, oldest on the left and the latest on the right:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> club, result, match_date,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> club <span class="kw">ORDER</span> <span class="kw">BY</span> match_date <span class="kw">DESC</span>) <span class="kw">AS</span> rn</span>
+<span>    <span class="kw">FROM</span> team_matches</span>
+<span>    <span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> club,</span>
+<span>       STRING_AGG(result, <span class="st">&#39;&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> match_date) <span class="kw">AS</span> form</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="op">&lt;=</span> <span class="dv">5</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> club</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> club;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    club     | form
+-------------+-------
+ Ashford     | LLDLD
+ Brightwater | WWLWD
+ Carrow      | LWWLL
+ Dunmore     | DDDLD
+ Eastleigh   | LWLLD
+ Fenwick     | DWWWW
+(6 rows)</code></pre>
+<p>A plain <code>LIMIT 5</code> limits the whole result, not each club, so the window function does the per-club cut. (PostgreSQL has another way, <code>CROSS JOIN LATERAL (... ORDER BY ... LIMIT 5)</code>, which runs the limited subquery once per club.) In MySQL the aggregate is <code>GROUP_CONCAT(result ORDER BY match_date SEPARATOR '')</code>, and SQL Server 2017 and later has <code>STRING_AGG(result, '') WITHIN GROUP (ORDER BY match_date)</code>.</p>
+<h3 id="order-by-date-not-by-gameweek">Order by date, not by gameweek</h3>
+<p>A gameweek number looks like a clock but is not one. Compare the form computed from dates with the form computed from gameweeks for the two clubs that played the postponed match:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> club, result, gameweek, match_date,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> club <span class="kw">ORDER</span> <span class="kw">BY</span> match_date <span class="kw">DESC</span>) <span class="kw">AS</span> rn_date,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> club <span class="kw">ORDER</span> <span class="kw">BY</span> gameweek <span class="kw">DESC</span>, match_date <span class="kw">DESC</span>) <span class="kw">AS</span> rn_gw</span>
+<span>    <span class="kw">FROM</span> team_matches</span>
+<span>    <span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> club,</span>
+<span>       STRING_AGG(result, <span class="st">&#39;&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> match_date) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> rn_date <span class="op">&lt;=</span> <span class="dv">5</span>) <span class="kw">AS</span> form_by_date,</span>
+<span>       STRING_AGG(result, <span class="st">&#39;&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> gameweek)   <span class="kw">FILTER</span> (<span class="kw">WHERE</span> rn_gw   <span class="op">&lt;=</span> <span class="dv">5</span>) <span class="kw">AS</span> form_by_gameweek</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> club</span>
+<span><span class="kw">HAVING</span> club <span class="kw">IN</span> (<span class="st">&#39;Carrow&#39;</span>, <span class="st">&#39;Fenwick&#39;</span>, <span class="st">&#39;Ashford&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> club;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  club   | form_by_date | form_by_gameweek
+---------+--------------+------------------
+ Ashford | LLDLD        | LLDLD
+ Carrow  | LWWLL        | DLWWL
+ Fenwick | DWWWW        | WDWWW
+(3 rows)</code></pre>
+<p>For Ashford both columns agree. For Carrow and Fenwick they do not, because the gameweek 5 match played on 18 October is the latest result by date but sits in the middle by gameweek. The form string shows what happened most recently, so it must follow the calendar.</p>
+<h2 id="assembling-it-into-a-function">Assembling it into a function</h2>
+<p>Season, a cut-off date and a home/away filter are the three things a table page usually offers. In PostgreSQL a SQL function with default parameters covers them, and MySQL would use a stored procedure for the same job. The cut-off is a date, not a gameweek, so that a postponed match counts only once it has been played.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> standings(</span>
+<span>    p_season TEXT,</span>
+<span>    p_as_of  <span class="dt">DATE</span> <span class="kw">DEFAULT</span> <span class="kw">NULL</span>,    <span class="co">-- NULL: the whole season</span></span>
+<span>    p_venue  TEXT <span class="kw">DEFAULT</span> <span class="kw">NULL</span>     <span class="co">-- NULL: all matches, or &#39;home&#39; / &#39;away&#39;</span></span>
+<span>)</span>
+<span>RETURNS <span class="kw">TABLE</span> (pos BIGINT, club TEXT, p BIGINT, w BIGINT, d BIGINT, l BIGINT,</span>
+<span>               gf BIGINT, ga BIGINT, gd BIGINT, pts BIGINT, form TEXT)</span>
+<span>LANGUAGE sql STABLE <span class="kw">AS</span> $$</span>
+<span>    <span class="kw">WITH</span> tm <span class="kw">AS</span> (</span>
+<span>        <span class="kw">SELECT</span> t.<span class="op">*</span></span>
+<span>        <span class="kw">FROM</span> team_matches t</span>
+<span>        <span class="kw">WHERE</span> t.season <span class="op">=</span> p_season</span>
+<span>          <span class="kw">AND</span> (p_as_of <span class="kw">IS</span> <span class="kw">NULL</span> <span class="kw">OR</span> t.match_date <span class="op">&lt;=</span> p_as_of)</span>
+<span>          <span class="kw">AND</span> (p_venue <span class="kw">IS</span> <span class="kw">NULL</span> <span class="kw">OR</span> t.venue <span class="op">=</span> p_venue)</span>
+<span>    ),</span>
+<span>    totals <span class="kw">AS</span> (</span>
+<span>        <span class="kw">SELECT</span> tm.club,</span>
+<span>               <span class="fu">COUNT</span>(<span class="op">*</span>)                                  <span class="kw">AS</span> p,</span>
+<span>               <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> tm.result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)   <span class="kw">AS</span> w,</span>
+<span>               <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> tm.result <span class="op">=</span> <span class="st">&#39;D&#39;</span>)   <span class="kw">AS</span> d,</span>
+<span>               <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> tm.result <span class="op">=</span> <span class="st">&#39;L&#39;</span>)   <span class="kw">AS</span> l,</span>
+<span>               <span class="fu">SUM</span>(tm.goals_for)                         <span class="kw">AS</span> gf,</span>
+<span>               <span class="fu">SUM</span>(tm.goals_against)                     <span class="kw">AS</span> ga,</span>
+<span>               <span class="fu">SUM</span>(tm.goals_for <span class="op">-</span> tm.goals_against)      <span class="kw">AS</span> gd,</span>
+<span>               <span class="dv">3</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> tm.result <span class="op">=</span> <span class="st">&#39;W&#39;</span>)</span>
+<span>                 <span class="op">+</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> tm.result <span class="op">=</span> <span class="st">&#39;D&#39;</span>) <span class="kw">AS</span> pts</span>
+<span>        <span class="kw">FROM</span> tm</span>
+<span>        <span class="kw">GROUP</span> <span class="kw">BY</span> tm.club</span>
+<span>    ),</span>
+<span>    ranked <span class="kw">AS</span> (</span>
+<span>        <span class="kw">SELECT</span> tm.club, tm.result, tm.match_date,</span>
+<span>               <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> tm.club <span class="kw">ORDER</span> <span class="kw">BY</span> tm.match_date <span class="kw">DESC</span>) <span class="kw">AS</span> rn</span>
+<span>        <span class="kw">FROM</span> tm</span>
+<span>    ),</span>
+<span>    recent <span class="kw">AS</span> (</span>
+<span>        <span class="kw">SELECT</span> r.club, STRING_AGG(r.result, <span class="st">&#39;&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> r.match_date) <span class="kw">AS</span> form</span>
+<span>        <span class="kw">FROM</span> ranked r</span>
+<span>        <span class="kw">WHERE</span> r.rn <span class="op">&lt;=</span> <span class="dv">5</span></span>
+<span>        <span class="kw">GROUP</span> <span class="kw">BY</span> r.club</span>
+<span>    )</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">RANK</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> t.pts <span class="kw">DESC</span>, t.gd <span class="kw">DESC</span>, t.gf <span class="kw">DESC</span>),</span>
+<span>           t.club, t.p, t.w, t.d, t.l, t.gf, t.ga, t.gd, t.pts, r.form</span>
+<span>    <span class="kw">FROM</span> totals t</span>
+<span>    <span class="kw">JOIN</span> recent r <span class="kw">ON</span> r.club <span class="op">=</span> t.club</span>
+<span>    <span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span>, t.club</span>
+<span>$$;</span></code></pre>
+<p>The full 2023/24 table:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> standings(<span class="st">&#39;2023/24&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> pos |    club     | p  | w | d | l | gf | ga | gd | pts | form
+-----+-------------+----+---+---+---+----+----+----+-----+-------
+   1 | Fenwick     | 10 | 8 | 2 | 0 | 21 |  8 | 13 |  26 | DWWWW
+   2 | Carrow      | 10 | 4 | 3 | 3 | 12 | 12 |  0 |  15 | LWWLL
+   3 | Brightwater | 10 | 4 | 3 | 3 | 11 | 11 |  0 |  15 | WWLWD
+   4 | Dunmore     | 10 | 0 | 8 | 2 |  9 | 11 | -2 |   8 | DDDLD
+   5 | Eastleigh   | 10 | 2 | 2 | 6 |  9 | 17 | -8 |   8 | LWLLD
+   6 | Ashford     | 10 | 1 | 4 | 5 |  7 | 10 | -3 |   7 | LLDLD
+(6 rows)</code></pre>
+<p>The table as it stood after gameweek 10 was played, on 14 October. Fenwick and Carrow have played one match fewer than the others because the postponed match is still to come:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> pos, club, p, pts, gd, form <span class="kw">FROM</span> standings(<span class="st">&#39;2023/24&#39;</span>, <span class="dt">DATE</span> <span class="st">&#39;2023-10-14&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> pos |    club     | p  | pts | gd | form
+-----+-------------+----+-----+----+-------
+   1 | Fenwick     |  9 |  23 | 11 | WDWWW
+   2 | Carrow      |  9 |  15 |  2 | DLWWL
+   3 | Brightwater | 10 |  15 |  0 | WWLWD
+   4 | Dunmore     | 10 |   8 | -2 | DDDLD
+   5 | Eastleigh   | 10 |   8 | -8 | LWLLD
+   6 | Ashford     | 10 |   7 | -3 | LLDLD
+(6 rows)</code></pre>
+<p>Home and away tables use the venue filter:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> pos, club, p, w, d, l, pts, form <span class="kw">FROM</span> standings(<span class="st">&#39;2023/24&#39;</span>, <span class="kw">NULL</span>, <span class="st">&#39;home&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> pos |    club     | p | w | d | l | pts | form
+-----+-------------+---+---+---+---+-----+-------
+   1 | Fenwick     | 5 | 5 | 0 | 0 |  15 | WWWWW
+   2 | Brightwater | 5 | 3 | 1 | 1 |  10 | WWLWD
+   3 | Carrow      | 5 | 2 | 2 | 1 |   8 | DDWWL
+   4 | Ashford     | 5 | 1 | 2 | 2 |   5 | DDWLL
+   5 | Dunmore     | 5 | 0 | 5 | 0 |   5 | DDDDD
+   6 | Eastleigh   | 5 | 1 | 1 | 3 |   4 | LWLLD
+(6 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> pos, club, p, w, d, l, pts, form <span class="kw">FROM</span> standings(<span class="st">&#39;2023/24&#39;</span>, <span class="kw">NULL</span>, <span class="st">&#39;away&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> pos |    club     | p | w | d | l | pts | form
+-----+-------------+---+---+---+---+-----+-------
+   1 | Fenwick     | 5 | 3 | 2 | 0 |  11 | DDWWW
+   2 | Carrow      | 5 | 2 | 1 | 2 |   7 | DLWWL
+   3 | Brightwater | 5 | 1 | 2 | 2 |   5 | WDLDL
+   4 | Eastleigh   | 5 | 1 | 1 | 3 |   4 | LLDLW
+   5 | Dunmore     | 5 | 0 | 3 | 2 |   3 | DLDLD
+   6 | Ashford     | 5 | 0 | 2 | 3 |   2 | LLLDD
+(6 rows)</code></pre>
+<p>The form column of a filtered table covers the last five matches inside the filter, so the home table's form is the last five home matches. That matches what sites show for home and away tables.</p>
+<h2 id="checking-the-table">Checking the table</h2>
+<p>A table built by aggregation can be audited against invariants that must hold. Goals scored equal goals conceded across the league, wins equal losses, and total points equal three per decided match plus two per draw:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">SUM</span>(gf) <span class="op">=</span> <span class="fu">SUM</span>(ga) <span class="kw">AS</span> goals_balance,</span>
+<span>       <span class="fu">SUM</span>(w) <span class="op">=</span> <span class="fu">SUM</span>(l)   <span class="kw">AS</span> results_balance,</span>
+<span>       <span class="fu">SUM</span>(pts) <span class="op">=</span> (<span class="kw">SELECT</span> <span class="dv">3</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> home_score <span class="op">&lt;&gt;</span> away_score)</span>
+<span>                        <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> home_score <span class="op">=</span>  away_score)</span>
+<span>                   <span class="kw">FROM</span> matches <span class="kw">WHERE</span> season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span>) <span class="kw">AS</span> points_balance</span>
+<span><span class="kw">FROM</span> standings(<span class="st">&#39;2023/24&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> goals_balance | results_balance | points_balance
+---------------+-----------------+----------------
+ t             | t               | t
+(1 row)</code></pre>
+<p>These checks catch a lot but not everything: a match loaded twice still balances. The quickest extra check on real data is games played: at the end of a season <code>SELECT DISTINCT p FROM standings('2023/24')</code> should return a single row, and a misspelled club name shows up as an extra row in the table.</p>
+<h2 id="one-pass-over-the-table">One pass over the table</h2>
+<p>The <code>UNION ALL</code> view reads <code>matches</code> twice. When that matters, a <code>LATERAL</code> join to a <code>VALUES</code> list produces both rows of each match in a single read:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> t.club, <span class="fu">SUM</span>(t.goals_for) <span class="kw">AS</span> gf, <span class="fu">SUM</span>(t.goals_against) <span class="kw">AS</span> ga</span>
+<span><span class="kw">FROM</span> matches m</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">VALUES</span> (m.home_team, m.home_score, m.away_score),</span>
+<span>                           (m.away_team, m.away_score, m.home_score)) <span class="kw">AS</span> t(club, goals_for, goals_against)</span>
+<span><span class="kw">WHERE</span> m.season <span class="op">=</span> <span class="st">&#39;2023/24&#39;</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> t.club</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> t.club;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    club     | gf | ga
+-------------+----+----
+ Ashford     |  7 | 10
+ Brightwater | 11 | 11
+ Carrow      | 12 | 12
+ Dunmore     |  9 | 11
+ Eastleigh   |  9 | 17
+ Fenwick     | 21 |  8
+(6 rows)</code></pre>
+<p>These are the same goal totals as in the table above. On 30 rows it makes no difference; on a large table it reads <code>matches</code> once instead of twice. In MySQL the usual form is the <code>UNION ALL</code>.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Give each match two rows, one per team, with goals for and against reversed. Everything else is then a plain <code>GROUP BY club</code>.</li>
+<li>Count outcomes with <code>COUNT(*) FILTER (WHERE ...)</code> or <code>SUM(CASE ...)</code>; derive points from the counts.</li>
+<li>Position is a window function over the tie-breaker columns; use <code>RANK()</code> so that clubs level on every criterion share a position.</li>
+<li>Form needs "last five per club": number rows per club in descending date order, filter, then <code>STRING_AGG</code> in ascending order. Order by date, not gameweek.</li>
+<li>Check the result against invariants such as goals for equal goals against, and equal games played at the end of the season.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day10.pdf" download>Download PDF · Day 10</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../09/">← Day 09</a>
+  <a href="../../">All 31 days</a>
+  <a href="../11/">Day 11 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/10/</span>
+</footer>
+
+</body>
+</html>

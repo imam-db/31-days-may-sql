@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 07: GROUP BY 1, 2: The Ordinal Trap · #31DaysMaySQL</title>
+<meta name="description" content="GROUP BY and ORDER BY accept column positions instead of names. That saves typing and breaks when someone edits the SELECT list; where it fails loudly, where it fails silently, and what to write instead.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 07: GROUP BY 1, 2: The Ordinal Trap">
+<meta property="og:description" content="GROUP BY and ORDER BY accept column positions instead of names. That saves typing and breaks when someone edits the SELECT list; where it fails loudly, where it fails silently, and what to write instead.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../06/">← Day 06</a><a href="../08/">Day 08 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 07</p>
+  <h1>GROUP BY 1, 2: The Ordinal Trap</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>This query is valid in PostgreSQL, MySQL, SQLite and BigQuery:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> department, job_title, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> headcount</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>;</span></code></pre>
+<p><code>GROUP BY 1, 2</code> means "group by the first and second expressions of the <code>SELECT</code> list". It is shorter than repeating the names, and it ties the <code>GROUP BY</code> to the order of the <code>SELECT</code> list. The examples run on PostgreSQL 18.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> employees (</span>
+<span>    <span class="kw">id</span>          <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name        TEXT,</span>
+<span>    department  TEXT,</span>
+<span>    job_title   TEXT,</span>
+<span>    salary      <span class="dt">NUMERIC</span>,</span>
+<span>    hired_at    <span class="dt">DATE</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> employees (name, department, job_title, salary, hired_at) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Backend Developer&#39;</span>,  <span class="dv">95000</span>,  <span class="st">&#39;2021-03-15&#39;</span>),</span>
+<span>    (<span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Backend Developer&#39;</span>,  <span class="dv">92000</span>,  <span class="st">&#39;2022-01-10&#39;</span>),</span>
+<span>    (<span class="st">&#39;Carol&#39;</span>, <span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Frontend Developer&#39;</span>, <span class="dv">88000</span>,  <span class="st">&#39;2021-07-20&#39;</span>),</span>
+<span>    (<span class="st">&#39;Dave&#39;</span>,  <span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Account Executive&#39;</span>,  <span class="dv">75000</span>,  <span class="st">&#39;2020-11-01&#39;</span>),</span>
+<span>    (<span class="st">&#39;Eve&#39;</span>,   <span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Account Executive&#39;</span>,  <span class="dv">78000</span>,  <span class="st">&#39;2022-06-15&#39;</span>),</span>
+<span>    (<span class="st">&#39;Frank&#39;</span>, <span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Sales Manager&#39;</span>,      <span class="dv">110000</span>, <span class="st">&#39;2019-04-01&#39;</span>),</span>
+<span>    (<span class="st">&#39;Grace&#39;</span>, <span class="st">&#39;Marketing&#39;</span>,   <span class="st">&#39;Content Writer&#39;</span>,     <span class="dv">65000</span>,  <span class="st">&#39;2023-01-10&#39;</span>),</span>
+<span>    (<span class="st">&#39;Hank&#39;</span>,  <span class="st">&#39;Marketing&#39;</span>,   <span class="st">&#39;Content Writer&#39;</span>,     <span class="dv">63000</span>,  <span class="st">&#39;2023-05-20&#39;</span>),</span>
+<span>    (<span class="st">&#39;Ivy&#39;</span>,   <span class="st">&#39;Marketing&#39;</span>,   <span class="st">&#39;Marketing Manager&#39;</span>,  <span class="dv">105000</span>, <span class="st">&#39;2020-08-15&#39;</span>);</span></code></pre>
+<p>The headcount report:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> department, job_title, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> headcount</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  |     job_title      | headcount
+-------------+--------------------+-----------
+ Engineering | Backend Developer  |         2
+ Engineering | Frontend Developer |         1
+ Marketing   | Content Writer     |         2
+ Marketing   | Marketing Manager  |         1
+ Sales       | Account Executive  |         2
+ Sales       | Sales Manager      |         1
+(6 rows)</code></pre>
+<h2 id="editing-the-select-list-breaks-it">Editing the SELECT list breaks it</h2>
+<p>A manager asks for the employee's name in the report, and you add <code>name</code> as the first column:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, department, job_title, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> headcount</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>;</span></code></pre>
+<p><code>GROUP BY 1, 2</code> now means <code>name, department</code>, and <code>job_title</code> is neither grouped nor aggregated. PostgreSQL stops with:</p>
+<pre class="text"><code>ERROR:  column &quot;employees.job_title&quot; must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT name, department, job_title, COUNT(*) AS headcount
+                                 ^</code></pre>
+<p>The error points at <code>job_title</code>, which is not the column you just added, so it takes a moment to see that the real cause is the <code>1, 2</code> at the bottom of the query. In a 50-line monthly report the <code>GROUP BY</code> can be far from the <code>SELECT</code> you are editing.</p>
+<p>Written with names, the same edit gives an error that points at the new column:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, department, job_title, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> headcount</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> department, job_title;</span></code></pre>
+<pre class="text"><code>ERROR:  column &quot;employees.name&quot; must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT name, department, job_title, COUNT(*) AS headcount
+               ^</code></pre>
+<p>That is the error you want: it names the column you added and what to decide about it (group by it, or aggregate it).</p>
+<h2 id="engines-that-do-not-complain">Engines that do not complain</h2>
+<p>PostgreSQL rejects every non-aggregated column that is not grouped. Not every engine does. MySQL does the same since 5.7.5 because <code>ONLY_FULL_GROUP_BY</code> is on by default, but it can be switched off, and then MySQL picks a value for the ungrouped column from an arbitrary row of each group. SQLite always allows it. In such an engine the broken query above runs, groups by <code>name</code> and <code>department</code>, and prints some <code>job_title</code> per group. The report looks plausible and is wrong.</p>
+<h2 id="order-by-is-silent-everywhere">ORDER BY is silent everywhere</h2>
+<p>Grouping errors are loud in PostgreSQL because every selected column has to be grouped. Sorting has no such check, so a shifted <code>ORDER BY</code> position changes the result and nothing complains.</p>
+<p>The original report sorted by salary, the second column:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, salary</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">2</span> <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name  | salary
+-------+--------
+ Frank | 110000
+ Ivy   | 105000
+ Alice |  95000
+ Bob   |  92000
+ Carol |  88000
+ Eve   |  78000
+ Dave  |  75000
+ Grace |  65000
+ Hank  |  63000
+(9 rows)</code></pre>
+<p>Someone adds <code>department</code> between the two columns. Position 2 is now <code>department</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, department, salary</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">2</span> <span class="kw">DESC</span>, <span class="dv">1</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> name  | department  | salary
+-------+-------------+--------
+ Dave  | Sales       |  75000
+ Eve   | Sales       |  78000
+ Frank | Sales       | 110000
+ Grace | Marketing   |  65000
+ Hank  | Marketing   |  63000
+ Ivy   | Marketing   | 105000
+ Alice | Engineering |  95000
+ Bob   | Engineering |  92000
+ Carol | Engineering |  88000
+(9 rows)</code></pre>
+<p>It is a valid query that returns every row, now sorted by department name descending. If this feeds a "top earners" list, the list is wrong and no one gets an error. Ordinals also fail in a quieter way when the position no longer exists: with only <code>department</code> and <code>COUNT(*)</code> selected, <code>ORDER BY 3</code> gives <code>ORDER BY position 3 is not in select list</code>.</p>
+<h2 id="naming-a-column-also-has-a-trap">Naming a column also has a trap</h2>
+<p>The usual advice is to group by name or alias. In PostgreSQL there is a catch: in <code>GROUP BY</code>, a bare name is resolved as an input column first and only then as an output alias. In <code>ORDER BY</code> it is the other way round. If an alias has the same name as a table column, the two clauses can refer to different things.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">EXTRACT</span>(<span class="dt">year</span> <span class="kw">FROM</span> hired_at) <span class="kw">AS</span> hired_at, <span class="fu">COUNT</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> hired_at</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> hired_at;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> hired_at | count
+----------+-------
+     2019 |     1
+     2020 |     1
+     2020 |     1
+     2021 |     1
+     2021 |     1
+     2022 |     1
+     2022 |     1
+     2023 |     1
+     2023 |     1
+(9 rows)</code></pre>
+<p>The <code>hired_at</code> in <code>GROUP BY</code> is the date column, so the query groups by each exact date and each year shows up twice instead of being counted once per year. Use an alias that does not collide with a column, and the intent is clear:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">EXTRACT</span>(<span class="dt">year</span> <span class="kw">FROM</span> hired_at):<span class="ch">:INT</span> <span class="kw">AS</span> hired_year, <span class="fu">COUNT</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> hired_year</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> hired_year;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> hired_year | count
+------------+-------
+       2019 |     1
+       2020 |     2
+       2021 |     2
+       2022 |     2
+       2023 |     2
+(5 rows)</code></pre>
+<h2 id="when-ordinals-are-fine">When ordinals are fine</h2>
+<p><strong>Ad hoc queries.</strong> When you are poking at data in psql, <code>GROUP BY 1</code> is fast and nobody will maintain it:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> department, <span class="fu">COUNT</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | count
+-------------+-------
+ Engineering |     3
+ Marketing   |     3
+ Sales       |     3
+(3 rows)</code></pre>
+<p><strong>Long expressions.</strong> If the grouping expression is a long <code>CASE</code> or a <code>DATE_TRUNC</code>, an alias avoids repeating it:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> DATE_TRUNC(<span class="st">&#39;month&#39;</span>, hired_at):<span class="ch">:DATE</span> <span class="kw">AS</span> hire_month,</span>
+<span>       department,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> hires</span>
+<span><span class="kw">FROM</span> employees</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> hire_month, department</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> hire_month, department</span>
+<span><span class="kw">LIMIT</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> hire_month | department | hires
+------------+------------+-------
+ 2019-04-01 | Sales      |     1
+ 2020-08-01 | Marketing  |     1
+ 2020-11-01 | Sales      |     1
+(3 rows)</code></pre>
+<p>The alias works in PostgreSQL, MySQL, BigQuery and SQLite, but not in SQL Server, which only accepts column expressions in <code>GROUP BY</code>. For code that has to run on SQL Server, put the expression in a subquery or CTE and group by its output columns:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> hires <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> DATE_TRUNC(<span class="st">&#39;month&#39;</span>, hired_at):<span class="ch">:DATE</span> <span class="kw">AS</span> hire_month, department</span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> hire_month, department, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> hires</span>
+<span><span class="kw">FROM</span> hires</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> hire_month, department</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> hire_month, department</span>
+<span><span class="kw">LIMIT</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> hire_month | department | hires
+------------+------------+-------
+ 2019-04-01 | Sales      |     1
+ 2020-08-01 | Marketing  |     1
+ 2020-11-01 | Sales      |     1
+(3 rows)</code></pre>
+<p><strong>UNION.</strong> <code>ORDER BY</code> on a combined query may only refer to output columns by name or position, not to expressions. If the column names differ between the branches, the position is the plain way to say it:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name <span class="kw">AS</span> <span class="kw">label</span> <span class="kw">FROM</span> employees <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">&lt;</span> <span class="dv">3</span></span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> department <span class="kw">FROM</span> employees <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">9</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span> <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   label
+-----------
+ Marketing
+ Bob
+ Alice
+(3 rows)</code></pre>
+<p><strong>Generated SQL.</strong> Some analytics teams write ordinals on purpose in dbt models and BigQuery queries, and some style guides recommend it. That is a team convention with a cost: every edit to the select list needs a matching edit to the <code>GROUP BY</code>. If you adopt it, review for it.</p>
+<h2 id="support-across-databases">Support across databases</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Database</th>
+<th><code>GROUP BY</code> position</th>
+<th><code>ORDER BY</code> position</th>
+<th><code>GROUP BY</code> alias</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>PostgreSQL</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="even">
+<td>MySQL</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="odd">
+<td>SQLite</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="even">
+<td>BigQuery</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="odd">
+<td>SQL Server</td>
+<td>no</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p>SQL Server rejects <code>GROUP BY 1</code>, so the trap is not there for grouping, but it applies to <code>ORDER BY 2</code> just the same.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Ordinals in <code>GROUP BY</code> and <code>ORDER BY</code> point at the position in the <code>SELECT</code> list, so editing the list silently changes what they mean.</li>
+<li>In PostgreSQL a shifted <code>GROUP BY</code> usually produces an error, though one that points at a different column than the one you edited. A shifted <code>ORDER BY</code> produces a wrong result with no error.</li>
+<li>Group and sort by column names, or by an alias that does not collide with a column name; beware that <code>GROUP BY</code> prefers the table column over an alias of the same name.</li>
+<li>Positions are fine in ad hoc queries and in <code>ORDER BY</code> after a <code>UNION</code>.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day07.pdf" download>Download PDF · Day 07</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../06/">← Day 06</a>
+  <a href="../../">All 31 days</a>
+  <a href="../08/">Day 08 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/07/</span>
+</footer>
+
+</body>
+</html>

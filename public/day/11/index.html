@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 11: Slowly Changing Dimensions in Raw SQL · #31DaysMaySQL</title>
+<meta name="description" content="Answer &#x27;what did this customer look like on that date?&#x27; from a history table that only stores start dates: LEAD for the end date, the right boundary operators, range types, and what bitemporal adds.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 11: Slowly Changing Dimensions in Raw SQL">
+<meta property="og:description" content="Answer &#x27;what did this customer look like on that date?&#x27; from a history table that only stores start dates: LEAD for the end date, the right boundary operators, range types, and what bitemporal adds.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../10/">← Day 10</a><a href="../12/">Day 12 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 11</p>
+  <h1>Slowly Changing Dimensions in Raw SQL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A support ticket arrives: "I was charged the wrong amount during the 11.11 sale. I was on the Pro plan back then, but your system says Free." You open the <code>customers</code> database and find one row per customer with the current tier. The customer downgraded last week, and nothing in that table remembers they were ever on Pro.</p>
+<p>Questions about the past need a table that stores the past. The usual design is a history table with one row per change, and the query that reads it is called an AS OF query: what did this customer look like on a given date? The examples below run on PostgreSQL 18 and use only SQL.</p>
+<h2 id="the-data">The data</h2>
+<p>Each row says "from this moment on, the customer is on this tier". It does not say when the row stops being true.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customer_tier_history (</span>
+<span>    history_id      BIGINT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers,</span>
+<span>    tier            TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    price_monthly   <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    effective_from  <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;Rina&#39;</span>), (<span class="dv">43</span>, <span class="st">&#39;Dewi&#39;</span>), (<span class="dv">44</span>, <span class="st">&#39;Budi&#39;</span>), (<span class="dv">45</span>, <span class="st">&#39;Sari&#39;</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customer_tier_history (customer_id, tier, price_monthly, effective_from) <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;free&#39;</span>,  <span class="fl">0.00</span>, <span class="st">&#39;2024-01-15 10:00&#39;</span>),</span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;pro&#39;</span>,  <span class="fl">19.00</span>, <span class="st">&#39;2024-09-03 14:22&#39;</span>),</span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;free&#39;</span>,  <span class="fl">0.00</span>, <span class="st">&#39;2025-04-30 08:10&#39;</span>),</span>
+<span>    (<span class="dv">43</span>, <span class="st">&#39;free&#39;</span>,  <span class="fl">0.00</span>, <span class="st">&#39;2024-02-01 09:00&#39;</span>),</span>
+<span>    (<span class="dv">43</span>, <span class="st">&#39;pro&#39;</span>,  <span class="fl">19.00</span>, <span class="st">&#39;2024-11-11 00:00&#39;</span>),</span>
+<span>    (<span class="dv">44</span>, <span class="st">&#39;pro&#39;</span>,  <span class="fl">19.00</span>, <span class="st">&#39;2024-06-10 12:00&#39;</span>),</span>
+<span>    (<span class="dv">45</span>, <span class="st">&#39;free&#39;</span>,  <span class="fl">0.00</span>, <span class="st">&#39;2024-12-01 16:30&#39;</span>);</span></code></pre>
+<p>Customer 42 is the one from the ticket. The other three are there for edge cases: Dewi (43) upgraded at exactly midnight on 11 November, Budi (44) has a single row, and Sari (45) signed up after the sale.</p>
+<p>There is no row for 11 November in Rina's history, and there should not be. She went Pro on 3 September and stayed there until 30 April, so the September row was still the true one during the sale. The query has to work that out.</p>
+<h2 id="the-naive-join">The naive join</h2>
+<p>The first attempt is a join with a date filter:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.customer_id, h.tier, h.price_monthly, h.effective_from</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> customer_tier_history h <span class="kw">ON</span> h.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> c.customer_id <span class="op">=</span> <span class="dv">42</span></span>
+<span>  <span class="kw">AND</span> h.effective_from <span class="op">&lt;=</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> h.effective_from;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier | price_monthly |   effective_from
+-------------+------+---------------+---------------------
+          42 | free |          0.00 | 2024-01-15 10:00:00
+          42 | pro  |         19.00 | 2024-09-03 14:22:00
+(2 rows)</code></pre>
+<p>Both rows started before the sale, so both match. The right one is the latest of them. For a single customer you could add <code>ORDER BY effective_from DESC LIMIT 1</code>, but <code>LIMIT</code> cannot pick one row per customer when you want the answer for everyone at once.</p>
+<h2 id="each-row-is-a-time-range">Each row is a time range</h2>
+<p>A history row is valid from its <code>effective_from</code> until the next row of the same customer starts. The end date is not stored, but it is the next row's start date, and <code>LEAD()</code> reads the next row within a partition:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, tier, effective_from,</span>
+<span>       <span class="fu">LEAD</span>(effective_from) <span class="kw">OVER</span> (</span>
+<span>           <span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id</span>
+<span>           <span class="kw">ORDER</span> <span class="kw">BY</span> effective_from</span>
+<span>       ) <span class="kw">AS</span> effective_to</span>
+<span><span class="kw">FROM</span> customer_tier_history</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> effective_from;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier |   effective_from    |    effective_to
+-------------+------+---------------------+---------------------
+          42 | free | 2024-01-15 10:00:00 | 2024-09-03 14:22:00
+          42 | pro  | 2024-09-03 14:22:00 | 2025-04-30 08:10:00
+          42 | free | 2025-04-30 08:10:00 |
+(3 rows)</code></pre>
+<p>The last row has no successor, so <code>effective_to</code> is <code>NULL</code>. It means "no end yet", which is what the current row is.</p>
+<h2 id="the-as-of-query">The AS OF query</h2>
+<p>With ranges, the question "which row was active on date X" becomes a filter: the range started on or before X and either ends after X or has not ended.</p>
+<pre class="code"><code><span><span class="kw">WITH</span> tier_ranges <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id, tier, price_monthly, effective_from,</span>
+<span>           <span class="fu">LEAD</span>(effective_from) <span class="kw">OVER</span> (</span>
+<span>               <span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id</span>
+<span>               <span class="kw">ORDER</span> <span class="kw">BY</span> effective_from</span>
+<span>           ) <span class="kw">AS</span> effective_to</span>
+<span>    <span class="kw">FROM</span> customer_tier_history</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> customer_id, tier, price_monthly</span>
+<span><span class="kw">FROM</span> tier_ranges</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span></span>
+<span>  <span class="kw">AND</span> effective_from <span class="op">&lt;=</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span>  <span class="kw">AND</span> (effective_to <span class="op">&gt;</span> <span class="st">&#39;2024-11-11&#39;</span> <span class="kw">OR</span> effective_to <span class="kw">IS</span> <span class="kw">NULL</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier | price_monthly
+-------------+------+---------------
+          42 | pro  |         19.00
+(1 row)</code></pre>
+<p>Rina was on Pro at $19.00, so the ticket is valid. The filter has to sit outside the CTE, after <code>LEAD()</code> has seen all the rows. If you put <code>effective_from &lt;= '2024-11-11'</code> inside the window query instead, the Free row from 2025 disappears before <code>LEAD()</code> runs, and the Pro row would look like it never ends.</p>
+<p>The same query without <code>customer_id = 42</code> gives everyone's tier on that date:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> tier_ranges <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id, tier, price_monthly, effective_from,</span>
+<span>           <span class="fu">LEAD</span>(effective_from) <span class="kw">OVER</span> (</span>
+<span>               <span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id</span>
+<span>               <span class="kw">ORDER</span> <span class="kw">BY</span> effective_from</span>
+<span>           ) <span class="kw">AS</span> effective_to</span>
+<span>    <span class="kw">FROM</span> customer_tier_history</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> customer_id, tier, price_monthly</span>
+<span><span class="kw">FROM</span> tier_ranges</span>
+<span><span class="kw">WHERE</span> effective_from <span class="op">&lt;=</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span>  <span class="kw">AND</span> (effective_to <span class="op">&gt;</span> <span class="st">&#39;2024-11-11&#39;</span> <span class="kw">OR</span> effective_to <span class="kw">IS</span> <span class="kw">NULL</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier | price_monthly
+-------------+------+---------------
+          42 | pro  |         19.00
+          43 | pro  |         19.00
+          44 | pro  |         19.00
+(3 rows)</code></pre>
+<p>Sari (45) is absent because she did not exist yet on that date, which is the right answer. Dewi's Pro row started at exactly <code>2024-11-11 00:00</code>, and it counts for that instant.</p>
+<h2 id="boundaries-one-side-inclusive-one-exclusive">Boundaries: one side inclusive, one exclusive</h2>
+<p>A range includes its start and excludes its end. At the moment a change happens, the new row is in effect and the old one is not. Dewi's tier change sits exactly on the boundary, so she shows what happens when both sides are inclusive:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> tier_ranges <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id, tier, effective_from,</span>
+<span>           <span class="fu">LEAD</span>(effective_from) <span class="kw">OVER</span> (</span>
+<span>               <span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id</span>
+<span>               <span class="kw">ORDER</span> <span class="kw">BY</span> effective_from</span>
+<span>           ) <span class="kw">AS</span> effective_to</span>
+<span>    <span class="kw">FROM</span> customer_tier_history</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> customer_id, tier</span>
+<span><span class="kw">FROM</span> tier_ranges</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">43</span></span>
+<span>  <span class="kw">AND</span> effective_from <span class="op">&lt;=</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span>  <span class="kw">AND</span> (effective_to <span class="op">&gt;=</span> <span class="st">&#39;2024-11-11&#39;</span> <span class="kw">OR</span> effective_to <span class="kw">IS</span> <span class="kw">NULL</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> effective_from;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier
+-------------+------
+          43 | free
+          43 | pro
+(2 rows)</code></pre>
+<p>With <code>&gt;=</code>, the instant of the change belongs to both the Free and the Pro range, and Dewi comes back twice. With <code>&gt;</code> she comes back once, as Pro. A duplicate like this only appears for timestamps that match a change exactly, so it tends to slip through testing and show up in a month-end report.</p>
+<h2 id="the-same-thing-without-lead">The same thing without LEAD</h2>
+<p>If you only ever need the latest row at or before X, <code>DISTINCT ON</code> does it without computing ranges:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> <span class="kw">ON</span> (customer_id) customer_id, tier, price_monthly</span>
+<span><span class="kw">FROM</span> customer_tier_history</span>
+<span><span class="kw">WHERE</span> effective_from <span class="op">&lt;=</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id, effective_from <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier | price_monthly
+-------------+------+---------------
+          42 | pro  |         19.00
+          43 | pro  |         19.00
+          44 | pro  |         19.00
+(3 rows)</code></pre>
+<p>This returns the same three rows. The range version is still worth having, because once every row has a start and an end you can join it to other tables. Here is what each order paid for, according to the tier at the time it was placed:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers,</span>
+<span>    ordered_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="dv">42</span>, <span class="st">&#39;2024-11-11 09:15&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="dv">42</span>, <span class="st">&#39;2025-05-02 18:40&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="dv">43</span>, <span class="st">&#39;2024-11-10 23:59&#39;</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="dv">43</span>, <span class="st">&#39;2024-11-11 00:00&#39;</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">VIEW</span> customer_tier_ranges <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span> customer_id, tier, price_monthly, effective_from,</span>
+<span>       <span class="fu">COALESCE</span>(</span>
+<span>           <span class="fu">LEAD</span>(effective_from) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id <span class="kw">ORDER</span> <span class="kw">BY</span> effective_from),</span>
+<span>           <span class="st">&#39;infinity&#39;</span></span>
+<span>       ) <span class="kw">AS</span> effective_to</span>
+<span><span class="kw">FROM</span> customer_tier_history;</span>
+<span></span>
+<span><span class="kw">SELECT</span> o.order_id, o.customer_id, o.ordered_at, r.tier, r.price_monthly</span>
+<span><span class="kw">FROM</span> orders o</span>
+<span><span class="kw">JOIN</span> customer_tier_ranges r</span>
+<span>  <span class="kw">ON</span> r.customer_id <span class="op">=</span> o.customer_id</span>
+<span> <span class="kw">AND</span> o.ordered_at <span class="op">&gt;=</span> r.effective_from</span>
+<span> <span class="kw">AND</span> o.ordered_at <span class="op">&lt;</span>  r.effective_to</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> o.order_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> order_id | customer_id |     ordered_at      | tier | price_monthly
+----------+-------------+---------------------+------+---------------
+        1 |          42 | 2024-11-11 09:15:00 | pro  |         19.00
+        2 |          42 | 2025-05-02 18:40:00 | free |          0.00
+        3 |          43 | 2024-11-10 23:59:00 | free |          0.00
+        4 |          43 | 2024-11-11 00:00:00 | pro  |         19.00
+(4 rows)</code></pre>
+<p>The view replaces the <code>NULL</code> end date with <code>'infinity'</code>, a value PostgreSQL's <code>timestamp</code> type supports. That turns the open-ended range into a plain <code>&gt;= start AND &lt; end</code> test and removes the <code>OR ... IS NULL</code> branch from every query that uses the view. Orders 3 and 4 are one minute apart and land on different tiers, which is the boundary rule at work.</p>
+<h2 id="a-reusable-function">A reusable function</h2>
+<p>For the "everyone on date X" case, a function saves copying the query around:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> customer_tier_as_of(as_of <span class="dt">TIMESTAMP</span>)</span>
+<span>RETURNS <span class="kw">TABLE</span> (customer_id <span class="dt">INT</span>, tier TEXT, price_monthly <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>))</span>
+<span>LANGUAGE sql STABLE</span>
+<span><span class="kw">AS</span> $$</span>
+<span>    <span class="kw">SELECT</span> r.customer_id, r.tier, r.price_monthly</span>
+<span>    <span class="kw">FROM</span> customer_tier_ranges r</span>
+<span>    <span class="kw">WHERE</span> r.effective_from <span class="op">&lt;=</span> as_of <span class="kw">AND</span> as_of <span class="op">&lt;</span> r.effective_to</span>
+<span>$$;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customer_tier_as_of(<span class="st">&#39;2024-11-11&#39;</span>) <span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier | price_monthly
+-------------+------+---------------
+          42 | pro  |         19.00
+          43 | pro  |         19.00
+          44 | pro  |         19.00
+(3 rows)</code></pre>
+<p>Because it returns a table, you can aggregate over it. Monthly recurring revenue at the end of September 2024:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">SUM</span>(price_monthly) <span class="kw">AS</span> mrr</span>
+<span><span class="kw">FROM</span> customer_tier_as_of(<span class="st">&#39;2024-09-30&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  mrr
+-------
+ 38.00
+(1 row)</code></pre>
+<p>On 30 September, Rina (42) and Budi (44) were on Pro. Dewi was still free and Sari had not signed up.</p>
+<p>The window runs over the whole history table even when you want one customer, unless the planner can push your filter below it. For a filter on the partition column it can:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customer_tier_ranges <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                           QUERY PLAN
+-----------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY customer_tier_history.effective_from)
+   -&gt;  Sort
+         Sort Key: customer_tier_history.effective_from
+         -&gt;  Seq Scan on customer_tier_history
+               Filter: (customer_id = 42)
+(6 rows)</code></pre>
+<p>The <code>Filter: (customer_id = 42)</code> is on the scan below the <code>WindowAgg</code>, so only that customer's rows are windowed. A filter on <code>effective_from</code> does not get this treatment, which is why the date conditions in the queries above belong outside the view.</p>
+<h2 id="letting-postgresql-enforce-the-ranges">Letting PostgreSQL enforce the ranges</h2>
+<p>The history table above relies on your application never inserting two rows with the same start, and never leaving a gap or an overlap by hand-editing. If you store the validity as a range value instead, PostgreSQL can reject overlaps. PostgreSQL 18 adds <code>WITHOUT OVERLAPS</code> to primary keys and unique constraints for exactly this. It needs the <code>btree_gist</code> extension so that the plain <code>customer_id</code> column can take part in the underlying index:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> EXTENSION btree_gist;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tier_period (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    tier         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    valid        TSRANGE <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (customer_id, valid <span class="kw">WITHOUT</span> <span class="kw">OVERLAPS</span>)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tier_period <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;free&#39;</span>, <span class="st">&#39;[2024-01-15 10:00, 2024-09-03 14:22)&#39;</span>),</span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;pro&#39;</span>,  <span class="st">&#39;[2024-09-03 14:22, 2025-04-30 08:10)&#39;</span>),</span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;free&#39;</span>, <span class="st">&#39;[2025-04-30 08:10, infinity)&#39;</span>);</span></code></pre>
+<p>An overlapping row is refused:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> tier_period <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">42</span>, <span class="st">&#39;pro&#39;</span>, <span class="st">&#39;[2024-11-01, 2024-12-01)&#39;</span>);</span></code></pre>
+<pre class="text"><code>ERROR:  conflicting key value violates exclusion constraint &quot;tier_period_pkey&quot;
+DETAIL:  Key (customer_id, valid)=(42, [&quot;2024-11-01 00:00:00&quot;,&quot;2024-12-01 00:00:00&quot;)) conflicts with existing key (customer_id, valid)=(42, [&quot;2024-09-03 14:22:00&quot;,&quot;2025-04-30 08:10:00&quot;)).</code></pre>
+<p>The AS OF query then becomes a containment test, with no <code>LEAD()</code> and no boundary operators to get right, because the range type already knows its start is inclusive and its end is exclusive:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, tier</span>
+<span><span class="kw">FROM</span> tier_period</span>
+<span><span class="kw">WHERE</span> valid @<span class="op">&gt;</span> <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-11-11&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | tier
+-------------+------
+          42 | pro
+(1 row)</code></pre>
+<p>The constraint stops overlaps but not gaps. Nothing prevents a customer from having no row between two dates, so closing the old row and opening the new one in the same transaction is still your job. The price is a different write path: you now update <code>valid</code> on the old row when a change happens instead of only inserting.</p>
+<h2 id="built-in-versioned-tables-in-other-databases">Built-in versioned tables in other databases</h2>
+<p>The SQL:2011 standard defines system-versioned tables, where the database keeps old row versions itself and lets you query them with <code>FOR SYSTEM_TIME AS OF</code>. SQL Server (temporal tables, since 2016) and MariaDB (since 10.3) implement it with that syntax. BigQuery has <code>FOR SYSTEM_TIME AS OF</code> as well, as time travel limited to a recent window (seven days by default). Oracle has its own Flashback Query (<code>AS OF TIMESTAMP</code>). PostgreSQL and MySQL have no built-in equivalent, which is why a history table like the one above is the usual approach there.</p>
+<p>One difference to keep in mind: system versioning records when the database learned something, not when it became true in the real world. That is the bitemporal problem, covered next.</p>
+<h2 id="two-timelines-bitemporal-tables">Two timelines: bitemporal tables</h2>
+<p>Suppose Rina actually upgraded to Pro on 15 August 2024, but the integration that writes upgrades was down, and the row was only inserted on 3 September. For a while the database was wrong. An AS OF query for 20 August, run on 25 August, said Free. The same query run on 10 September says Pro. Both answers were correct for what the database knew at the time.</p>
+<p>If you need to reproduce reports exactly as they were printed, or audit what was known when, you keep two pairs of dates: when the fact was true (<code>valid_*</code>) and when the database held it (<code>recorded_*</code>). A correction never overwrites a row. It closes the old row by setting <code>recorded_to</code> and inserts the new truth:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tier_bitemporal (</span>
+<span>    row_id         <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id    <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    tier           TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    valid_from     <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    valid_to       <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    recorded_from  <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    recorded_to    <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="co">-- 15 Jan: Rina signs up on Free, open-ended</span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tier_bitemporal <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="dv">42</span>, <span class="st">&#39;free&#39;</span>, <span class="st">&#39;2024-01-15&#39;</span>, <span class="st">&#39;infinity&#39;</span>, <span class="st">&#39;2024-01-15&#39;</span>, <span class="st">&#39;infinity&#39;</span>);</span>
+<span></span>
+<span><span class="co">-- 3 Sep: the missed upgrade (effective 15 Aug) is recorded.</span></span>
+<span><span class="co">-- Row 1 is superseded, not changed in place.</span></span>
+<span><span class="kw">UPDATE</span> tier_bitemporal <span class="kw">SET</span> recorded_to <span class="op">=</span> <span class="st">&#39;2024-09-03 14:22&#39;</span> <span class="kw">WHERE</span> row_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tier_bitemporal <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">2</span>, <span class="dv">42</span>, <span class="st">&#39;free&#39;</span>, <span class="st">&#39;2024-01-15&#39;</span>, <span class="st">&#39;2024-08-15&#39;</span>, <span class="st">&#39;2024-09-03 14:22&#39;</span>, <span class="st">&#39;infinity&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="dv">42</span>, <span class="st">&#39;pro&#39;</span>,  <span class="st">&#39;2024-08-15&#39;</span>, <span class="st">&#39;infinity&#39;</span>,   <span class="st">&#39;2024-09-03 14:22&#39;</span>, <span class="st">&#39;infinity&#39;</span>);</span></code></pre>
+<p>Now an AS OF query has two dates: the date you are asking about, and the date as of which you want the database's knowledge. What did we think Rina's tier was on 20 August, as of 25 August?</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> tier</span>
+<span><span class="kw">FROM</span> tier_bitemporal</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span></span>
+<span>  <span class="kw">AND</span> valid_from    <span class="op">&lt;=</span> <span class="st">&#39;2024-08-20&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2024-08-20&#39;</span> <span class="op">&lt;</span> valid_to</span>
+<span>  <span class="kw">AND</span> recorded_from <span class="op">&lt;=</span> <span class="st">&#39;2024-08-25&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2024-08-25&#39;</span> <span class="op">&lt;</span> recorded_to;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> tier
+------
+ free
+(1 row)</code></pre>
+<p>And the same question asked as of 10 September:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> tier</span>
+<span><span class="kw">FROM</span> tier_bitemporal</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">42</span></span>
+<span>  <span class="kw">AND</span> valid_from    <span class="op">&lt;=</span> <span class="st">&#39;2024-08-20&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2024-08-20&#39;</span> <span class="op">&lt;</span> valid_to</span>
+<span>  <span class="kw">AND</span> recorded_from <span class="op">&lt;=</span> <span class="st">&#39;2024-09-10&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2024-09-10&#39;</span> <span class="op">&lt;</span> recorded_to;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> tier
+------
+ pro
+(1 row)</code></pre>
+<p>Financial, insurance and audit systems need this. Most applications do not, and a single-timeline history table is enough when late corrections are rare and nobody needs to reproduce an old report.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A history table that stores only start dates holds time ranges. <code>LEAD()</code> over the customer's partition gives each row its end date, and the last row has none.</li>
+<li>The AS OF filter is <code>effective_from &lt;= X AND X &lt; effective_to</code>: start inclusive, end exclusive. Using <code>&gt;=</code> on the end gives duplicates exactly at change timestamps.</li>
+<li>Apply the date filter after <code>LEAD()</code>, never inside the query that computes it.</li>
+<li>A range column with <code>WITHOUT OVERLAPS</code> (PostgreSQL 18) lets the database refuse overlapping rows and reduces AS OF to <code>valid @&gt; X</code>.</li>
+<li>When late corrections matter, a second pair of dates records when each fact was known, and corrections close old rows instead of overwriting them.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day11.pdf" download>Download PDF · Day 11</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../10/">← Day 10</a>
+  <a href="../../">All 31 days</a>
+  <a href="../12/">Day 12 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/11/</span>
+</footer>
+
+</body>
+</html>

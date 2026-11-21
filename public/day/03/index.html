@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 03: 'a' = 'A': Is That TRUE or FALSE? · #31DaysMaySQL</title>
+<meta name="description" content="Whether two strings that differ only in case or accents are equal depends on the collation. How PostgreSQL and MySQL defaults differ, where it shows up in logins, UNIQUE constraints and sorting, and how to choose the behaviour explicitly.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 03: 'a' = 'A': Is That TRUE or FALSE?">
+<meta property="og:description" content="Whether two strings that differ only in case or accents are equal depends on the collation. How PostgreSQL and MySQL defaults differ, where it shows up in logins, UNIQUE constraints and sorting, and how to choose the behaviour explicitly.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../02/">← Day 02</a><a href="../04/">Day 04 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 03</p>
+  <h1>'a' = 'A': Is That TRUE or FALSE?</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>Is the letter <code>'a'</code> equal to <code>'A'</code>? In PostgreSQL:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;a&#39;</span> <span class="op">=</span> <span class="st">&#39;A&#39;</span> <span class="kw">AS</span> is_equal;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> is_equal
+----------
+ f
+(1 row)</code></pre>
+<p>The same query on MySQL with default settings returns <code>1</code>, meaning true, and on a default SQL Server install it also returns true. Neither side reports an error. The difference comes from the collation: the set of rules a database uses to compare and sort strings.</p>
+<h2 id="defaults-differ">Defaults differ</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Database</th>
+<th>Default collation</th>
+<th><code>'a' = 'A'</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>PostgreSQL</td>
+<td>taken from the locale the cluster was created with, for example <code>C</code> or <code>en_US.UTF-8</code></td>
+<td>false</td>
+</tr>
+<tr class="even">
+<td>MySQL 8.0</td>
+<td><code>utf8mb4_0900_ai_ci</code></td>
+<td>true</td>
+</tr>
+<tr class="odd">
+<td>SQL Server</td>
+<td>depends on the install language; <code>SQL_Latin1_General_CP1_CI_AS</code> is common</td>
+<td>true</td>
+</tr>
+<tr class="even">
+<td>SQLite</td>
+<td><code>BINARY</code></td>
+<td>false</td>
+</tr>
+</tbody>
+</table>
+<p>In MySQL's name, <code>ci</code> means case-insensitive and <code>ai</code> means accent-insensitive, so <code>'é' = 'e'</code> is true there as well. PostgreSQL's default collations are all deterministic: two strings are equal only if they are byte for byte the same, so case and accents always matter. That is the behaviour of the PostgreSQL examples below, and they would give the same results on any PostgreSQL server.</p>
+<p>Nobody picks these defaults deliberately. An application written against a local MySQL and later deployed on PostgreSQL, or the other way round, changes behaviour without a single line of SQL changing.</p>
+<h2 id="where-it-shows-up">Where it shows up</h2>
+<h3 id="searching-and-logging-in">Searching and logging in</h3>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span>    <span class="kw">id</span>        <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    username  TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;admin&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;Admin&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> id | username
+----+----------
+(0 rows)</code></pre>
+<p>A user who types <code>Admin</code> finds nothing in PostgreSQL. On MySQL with its default collation the same query returns the <code>admin</code> row. If the app was developed against one and deployed on the other, login breaks without an error.</p>
+<h3 id="unique-constraints">UNIQUE constraints</h3>
+<p>A unique constraint uses the same equality, so <code>SQL</code> and <code>sql</code> are different values in PostgreSQL:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tags (tag_name TEXT <span class="kw">UNIQUE</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tags <span class="kw">VALUES</span> (<span class="st">&#39;SQL&#39;</span>);</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tags <span class="kw">VALUES</span> (<span class="st">&#39;sql&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> tag_name <span class="kw">FROM</span> tags <span class="kw">ORDER</span> <span class="kw">BY</span> tag_name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> tag_name
+----------
+ SQL
+ sql
+(2 rows)</code></pre>
+<p>Both inserts succeed. On MySQL with a <code>_ci</code> collation the second insert fails with a duplicate key error. A schema that relied on that to keep tags unique has no protection in PostgreSQL.</p>
+<h3 id="group-by-and-distinct">GROUP BY and DISTINCT</h3>
+<p>Grouping uses equality too, so <code>Electronics</code> and <code>electronics</code> become two groups:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> items (name TEXT, <span class="kw">category</span> TEXT);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> items <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Keyboard&#39;</span>,  <span class="st">&#39;Electronics&#39;</span>),</span>
+<span>    (<span class="st">&#39;Mouse&#39;</span>,     <span class="st">&#39;electronics&#39;</span>),</span>
+<span>    (<span class="st">&#39;Monitor&#39;</span>,   <span class="st">&#39;Electronics&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="kw">category</span>, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> items</span>
+<span><span class="kw">FROM</span> items</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="kw">category</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">category</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  category   | items
+-------------+-------
+ Electronics |     2
+ electronics |     1
+(2 rows)</code></pre>
+<p>On MySQL with a case-insensitive collation this is one group of three.</p>
+<h3 id="order-by">ORDER BY</h3>
+<p>The collation also decides sort order. The same words sorted with two collations, chosen explicitly so the result does not depend on the server's locale. The <code>"C"</code> collation sorts by byte value, so every uppercase letter comes before every lowercase one:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name</span>
+<span><span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="st">&#39;banana&#39;</span>), (<span class="st">&#39;Apple&#39;</span>), (<span class="st">&#39;cherry&#39;</span>), (<span class="st">&#39;apple&#39;</span>), (<span class="st">&#39;Banana&#39;</span>)) <span class="kw">AS</span> t(name)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> name COLLATE <span class="ot">&quot;C&quot;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  name
+--------
+ Apple
+ Banana
+ apple
+ banana
+ cherry
+(5 rows)</code></pre>
+<p>An ICU dictionary collation puts the lowercase form of a letter before the uppercase one and keeps <code>apple</code> and <code>Apple</code> next to each other:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name</span>
+<span><span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="st">&#39;banana&#39;</span>), (<span class="st">&#39;Apple&#39;</span>), (<span class="st">&#39;cherry&#39;</span>), (<span class="st">&#39;apple&#39;</span>), (<span class="st">&#39;Banana&#39;</span>)) <span class="kw">AS</span> t(name)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> name COLLATE <span class="ot">&quot;en-US-x-icu&quot;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  name
+--------
+ apple
+ Apple
+ banana
+ Banana
+ cherry
+(5 rows)</code></pre>
+<p>Keyset or page-based pagination over a column sorted this way can return different pages on servers whose default collations differ, and a sort that is correct under one collation may violate an assumption in code (for example, a binary search over the sorted list in the application).</p>
+<p>Collations from the operating system's libc, such as <code>en_US.UTF-8</code>, can also change between OS versions. PostgreSQL's documentation warns that when this happens, existing indexes on text columns can become inconsistent with the new sort order and need to be rebuilt. ICU collations such as <code>en-US-x-icu</code> are versioned by PostgreSQL, which records the version and warns when it differs.</p>
+<h2 id="checking-what-you-have">Checking what you have</h2>
+<p>The database's default is chosen at creation time. In PostgreSQL you can ask which collation a column or expression uses:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> pg_collation_for(username) <span class="kw">AS</span> collation <span class="kw">FROM</span> users <span class="kw">LIMIT</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> collation
+-----------
+ &quot;default&quot;
+(1 row)</code></pre>
+<p><code>"default"</code> means the database's default collation. To see what that is, query <code>pg_database</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> datname, datlocprovider, datcollate</span>
+<span><span class="kw">FROM</span> pg_database</span>
+<span><span class="kw">WHERE</span> datname <span class="op">=</span> current_database();</span></code></pre>
+<p>On MySQL the equivalents are <code>SELECT @@collation_database;</code> for the database, and <code>SHOW FULL COLUMNS FROM users;</code> for the column-level collation.</p>
+<h2 id="choosing-case-insensitive-comparison-in-postgresql">Choosing case-insensitive comparison in PostgreSQL</h2>
+<h3 id="lower-and-a-matching-index">lower() and a matching index</h3>
+<p>The simplest option is to compare lowercased values, and to put a unique index on the same expression if the column must be unique ignoring case:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> <span class="fu">lower</span>(username) <span class="op">=</span> <span class="fu">lower</span>(<span class="st">&#39;Admin&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> id | username
+----+----------
+  1 | admin
+(1 row)</code></pre>
+<p>The index must be created before duplicates exist. On a fresh table it rejects the second spelling:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> labels (<span class="kw">label</span> TEXT);</span>
+<span><span class="kw">CREATE</span> <span class="kw">UNIQUE</span> <span class="kw">INDEX</span> labels_lower_key <span class="kw">ON</span> labels (<span class="fu">lower</span>(<span class="kw">label</span>));</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> labels <span class="kw">VALUES</span> (<span class="st">&#39;Python&#39;</span>);</span></code></pre>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> labels <span class="kw">VALUES</span> (<span class="st">&#39;python&#39;</span>);</span></code></pre>
+<pre class="text"><code>ERROR:  duplicate key value violates unique constraint &quot;labels_lower_key&quot;
+DETAIL:  Key (lower(label))=(python) already exists.</code></pre>
+<p>Building the same index on <code>tags</code> would fail, because <code>SQL</code> and <code>sql</code> are already both there.</p>
+<p>The queries must use <code>lower(username)</code> exactly as written in the index. A plain index on <code>username</code> cannot serve <code>WHERE lower(username) = ...</code>.</p>
+<h3 id="ilike">ILIKE</h3>
+<p><code>ILIKE</code> is PostgreSQL's case-insensitive <code>LIKE</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> username ILIKE <span class="st">&#39;admin&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> id | username
+----+----------
+  1 | admin
+(1 row)</code></pre>
+<p>It is fine for searching, but it is a pattern match: <code>%</code> and <code>_</code> in the input are wildcards, so user input would need escaping, and it does not give you a uniqueness guarantee.</p>
+<h3 id="citext">citext</h3>
+<p>The <code>citext</code> extension adds a text type that compares case-insensitively, including in <code>UNIQUE</code> constraints and <code>GROUP BY</code>:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> EXTENSION <span class="cf">IF</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> citext;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> accounts (username CITEXT <span class="kw">UNIQUE</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="st">&#39;Admin&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> username <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;ADMIN&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username
+----------
+ Admin
+(1 row)</code></pre>
+<p>A second insert of <code>admin</code> fails with a duplicate key error. The stored value keeps its original case. <code>citext</code> folds case the way <code>lower()</code> does for the database's locale, and does nothing about accents.</p>
+<h3 id="a-nondeterministic-icu-collation">A nondeterministic ICU collation</h3>
+<p>Since PostgreSQL 12 you can define a collation that does not require strings to be byte-identical. Here is one that ignores case and one that also ignores accents:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> COLLATION case_insensitive (provider <span class="op">=</span> icu, locale <span class="op">=</span> <span class="st">&#39;und-u-ks-level2&#39;</span>, deterministic <span class="op">=</span> <span class="kw">false</span>);</span>
+<span><span class="kw">CREATE</span> COLLATION ignore_accents   (provider <span class="op">=</span> icu, locale <span class="op">=</span> <span class="st">&#39;und-u-ks-level1&#39;</span>, deterministic <span class="op">=</span> <span class="kw">false</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;a&#39;</span> <span class="op">=</span> <span class="st">&#39;A&#39;</span>    COLLATE case_insensitive <span class="kw">AS</span> case_ci,</span>
+<span>       <span class="st">&#39;café&#39;</span> <span class="op">=</span> <span class="st">&#39;cafe&#39;</span> COLLATE case_insensitive <span class="kw">AS</span> accent_ci,</span>
+<span>       <span class="st">&#39;café&#39;</span> <span class="op">=</span> <span class="st">&#39;cafe&#39;</span> COLLATE ignore_accents   <span class="kw">AS</span> accents_ignored;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> case_ci | accent_ci | accents_ignored
+---------+-----------+-----------------
+ t       | f         | t
+(1 row)</code></pre>
+<p>Used on a column, this fixes search, <code>UNIQUE</code> and <code>GROUP BY</code> without changing any query:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> members (username TEXT COLLATE case_insensitive <span class="kw">UNIQUE</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> members <span class="kw">VALUES</span> (<span class="st">&#39;admin&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> username <span class="kw">FROM</span> members <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;ADMIN&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username
+----------
+ admin
+(1 row)</code></pre>
+<p>Grouping treats different spellings as one value too. This is the <code>items</code> example again, with the column declared with the new collation:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> items_ci (name TEXT, <span class="kw">category</span> TEXT COLLATE case_insensitive);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> items_ci <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Keyboard&#39;</span>, <span class="st">&#39;Electronics&#39;</span>),</span>
+<span>    (<span class="st">&#39;Mouse&#39;</span>,    <span class="st">&#39;electronics&#39;</span>),</span>
+<span>    (<span class="st">&#39;Monitor&#39;</span>,  <span class="st">&#39;Electronics&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> <span class="kw">groups</span></span>
+<span><span class="kw">FROM</span> (<span class="kw">SELECT</span> <span class="kw">category</span> <span class="kw">FROM</span> items_ci <span class="kw">GROUP</span> <span class="kw">BY</span> <span class="kw">category</span>) <span class="kw">AS</span> g;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> groups
+--------
+      1
+(1 row)</code></pre>
+<p>Inserting <code>ADMIN</code> into <code>members</code> would now fail with a duplicate key error. In PostgreSQL 18, <code>LIKE</code> works against such a column:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username <span class="kw">FROM</span> members <span class="kw">WHERE</span> username <span class="kw">LIKE</span> <span class="st">&#39;AD%&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username
+----------
+ admin
+(1 row)</code></pre>
+<p>Nondeterministic collations have limits. <code>ILIKE</code> raises <code>ERROR: nondeterministic collations are not supported for ILIKE</code>, and before PostgreSQL 18 <code>LIKE</code> raised a similar error. Comparisons can be slower than with a deterministic collation, because the database cannot just compare bytes.</p>
+<h2 id="choosing-case-sensitive-comparison-in-mysql">Choosing case-sensitive comparison in MySQL</h2>
+<p>The other direction, for a MySQL column that should be case-sensitive:</p>
+<pre class="code"><code><span><span class="co">-- compare as bytes for one query</span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> BINARY username <span class="op">=</span> <span class="st">&#39;Admin&#39;</span>;</span>
+<span></span>
+<span><span class="co">-- or use a case-sensitive collation on the column</span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users_cs (</span>
+<span>    username <span class="dt">VARCHAR</span>(<span class="dv">255</span>) COLLATE utf8mb4_bin</span>
+<span>);</span></code></pre>
+<h2 id="accents">Accents</h2>
+<p><code>'café' = 'cafe'</code> is false in PostgreSQL with any default collation, and true in MySQL under <code>utf8mb4_0900_ai_ci</code>. A search for <code>cafe</code> finds <code>café</code> on one and not the other:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;café&#39;</span> <span class="op">=</span> <span class="st">&#39;cafe&#39;</span> <span class="kw">AS</span> postgres_default;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> postgres_default
+------------------
+ f
+(1 row)</code></pre>
+<p>For accent-insensitive search in PostgreSQL, use the <code>ignore_accents</code> collation above, or the <code>unaccent</code> extension, which strips accents from both sides of a comparison.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Equality, <code>UNIQUE</code>, <code>GROUP BY</code>, <code>DISTINCT</code> and <code>ORDER BY</code> all follow the collation. PostgreSQL's defaults are case- and accent-sensitive. MySQL 8.0's and SQL Server's usual defaults are case-insensitive.</li>
+<li>Decide per column. In PostgreSQL use <code>lower()</code> with a unique index, <code>citext</code>, or a nondeterministic ICU collation. In MySQL pick a <code>_cs</code> or <code>_bin</code> collation where case matters.</li>
+<li>Moving an application between databases, or between machines with different locales, can change what its queries return without a single change in SQL.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day03.pdf" download>Download PDF · Day 03</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../02/">← Day 02</a>
+  <a href="../../">All 31 days</a>
+  <a href="../04/">Day 04 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/03/</span>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 18: Fibonacci and Mathematical Sequences via Recursive CTEs · #31DaysMaySQL</title>
+<meta name="description" content="A recursive CTE is a loop with state: Fibonacci, factorials, compound interest, Collatz, calendars and an amortization schedule, plus how to stop runaway recursion and when generate_series is the better tool.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 18: Fibonacci and Mathematical Sequences via Recursive CTEs">
+<meta property="og:description" content="A recursive CTE is a loop with state: Fibonacci, factorials, compound interest, Collatz, calendars and an amortization schedule, plus how to stop runaway recursion and when generate_series is the better tool.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../17/">← Day 17</a><a href="../19/">Day 19 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 18</p>
+  <h1>Fibonacci and Mathematical Sequences via Recursive CTEs</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>Recursive CTEs are usually taught with org charts and bill-of-materials trees. Underneath, a recursive CTE is a loop: it starts from some state, computes the next state from the current one, and stops when a condition fails. Nothing in that needs a table. The examples here use it to generate data from scratch: sequences, a loan schedule, a calendar.</p>
+<p>All queries run on PostgreSQL 18 and need no tables unless stated. Recursive CTEs are standard SQL and exist in MySQL 8, SQLite and SQL Server too; the syntax differences are listed near the end.</p>
+<h2 id="the-shape-of-a-recursive-cte">The shape of a recursive CTE</h2>
+<p>Every example below follows the same template:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE name <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> initial_state          <span class="co">-- anchor: runs once</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> next_state(name)       <span class="co">-- recursive step: runs on the previous iteration&#39;s rows</span></span>
+<span>    <span class="kw">FROM</span> name</span>
+<span>    <span class="kw">WHERE</span> keep_going              <span class="co">-- the only thing that stops it</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> name;</span></code></pre>
+<p>The anchor produces the first row. The recursive step reads the rows produced by the previous iteration and produces the next ones. When an iteration returns no rows, the recursion ends. A Python loop that updates variables maps directly onto it: the variables become columns.</p>
+<h2 id="fibonacci">Fibonacci</h2>
+<p>Each number is the sum of the two before it: 0, 1, 1, 2, 3, 5, 8. In Python:</p>
+<pre class="text"><code>a, b = 0, 1
+for i in range(20):
+    print(a)
+    a, b = b, a + b</code></pre>
+<p>The SQL version carries <code>a</code> and <code>b</code> as two columns and shifts them on every iteration:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE fib <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> n, <span class="dv">0</span>:<span class="ch">:BIGINT</span> <span class="kw">AS</span> fib_n, <span class="dv">1</span>:<span class="ch">:BIGINT</span> <span class="kw">AS</span> fib_next</span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span>, fib_next, fib_n <span class="op">+</span> fib_next</span>
+<span>    <span class="kw">FROM</span> fib</span>
+<span>    <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">19</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n, fib_n <span class="kw">AS</span> fibonacci</span>
+<span><span class="kw">FROM</span> fib</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n  | fibonacci
+----+-----------
+  0 |         0
+  1 |         1
+  2 |         1
+  3 |         2
+  4 |         3
+  5 |         5
+  6 |         8
+  7 |        13
+  8 |        21
+  9 |        34
+ 10 |        55
+ 11 |        89
+ 12 |       144
+ 13 |       233
+ 14 |       377
+ 15 |       610
+ 16 |       987
+ 17 |      1597
+ 18 |      2584
+ 19 |      4181
+(20 rows)</code></pre>
+<p><code>fib_next</code> is the number one step ahead of <code>fib_n</code>, which is what <code>a, b = b, a + b</code> does. The <code>WHERE n &lt; 19</code> stops the loop after the row with <code>n = 19</code>, which gives 20 rows.</p>
+<p>The two columns are typed <code>BIGINT</code> on purpose. In a recursive CTE the column types are fixed by the anchor, and a plain <code>0</code> would make them <code>integer</code>, which overflow at the 47th number. With <code>BIGINT</code> the limit is the 93rd number, which no longer fits in 64 bits. The CTE does not widen types for you:</p>
+<pre class="code"><code><span><span class="co">-- same query with WHERE n &lt; 93</span></span>
+<span>ERROR:  bigint <span class="kw">out</span> <span class="kw">of</span> <span class="kw">range</span></span></code></pre>
+<p>For larger values, start from <code>NUMERIC</code> and the same query runs as far as you need:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE fib <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> n, <span class="dv">0</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> fib_n, <span class="dv">1</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> fib_next</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span>, fib_next, fib_n <span class="op">+</span> fib_next</span>
+<span>    <span class="kw">FROM</span> fib</span>
+<span>    <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">100</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n, fib_n</span>
+<span><span class="kw">FROM</span> fib</span>
+<span><span class="kw">WHERE</span> n <span class="kw">IN</span> (<span class="dv">50</span>, <span class="dv">92</span>, <span class="dv">93</span>, <span class="dv">100</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  n  |         fib_n
+-----+-----------------------
+  50 |           12586269025
+  92 |   7540113804746346429
+  93 |  12200160415121876738
+ 100 | 354224848179261915075
+(4 rows)</code></pre>
+<h2 id="numeric-sequences">Numeric sequences</h2>
+<p>Numbers from 1 to 10, then only the even ones, by changing the start and the step:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE numbers <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span> <span class="kw">FROM</span> numbers <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">10</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n <span class="kw">FROM</span> numbers <span class="kw">ORDER</span> <span class="kw">BY</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)</code></pre>
+<p>Powers of 2 show exponential growth, and why the data type matters: <code>value * 2</code> would overflow <code>integer</code> at 2^31, so the anchor is <code>BIGINT</code>.</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE powers <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> exponent, <span class="dv">1</span>:<span class="ch">:BIGINT</span> <span class="kw">AS</span> <span class="fu">value</span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> exponent <span class="op">+</span> <span class="dv">1</span>, <span class="fu">value</span> <span class="op">*</span> <span class="dv">2</span></span>
+<span>    <span class="kw">FROM</span> powers</span>
+<span>    <span class="kw">WHERE</span> exponent <span class="op">&lt;</span> <span class="dv">40</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> exponent, <span class="fu">value</span></span>
+<span><span class="kw">FROM</span> powers</span>
+<span><span class="kw">WHERE</span> exponent <span class="kw">IN</span> (<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>, <span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>, <span class="dv">40</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> exponent;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> exponent |     value
+----------+---------------
+        0 |             1
+        1 |             2
+        2 |             4
+        3 |             8
+       10 |          1024
+       20 |       1048576
+       30 |    1073741824
+       40 | 1099511627776
+(8 rows)</code></pre>
+<h2 id="factorials">Factorials</h2>
+<p><code>n! = n × (n-1) × ... × 1</code>. The running product is the state:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE factorial <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n, <span class="dv">1</span>:<span class="ch">:BIGINT</span> <span class="kw">AS</span> fact</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span>, fact <span class="op">*</span> (n <span class="op">+</span> <span class="dv">1</span>)</span>
+<span>    <span class="kw">FROM</span> factorial</span>
+<span>    <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">20</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n, fact</span>
+<span><span class="kw">FROM</span> factorial</span>
+<span><span class="kw">WHERE</span> n <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>, <span class="dv">4</span>, <span class="dv">5</span>, <span class="dv">10</span>, <span class="dv">15</span>, <span class="dv">20</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n  |        fact
+----+---------------------
+  1 |                   1
+  2 |                   2
+  3 |                   6
+  4 |                  24
+  5 |                 120
+ 10 |             3628800
+ 15 |       1307674368000
+ 20 | 2432902008176640000
+(8 rows)</code></pre>
+<p>20! is the largest factorial that fits in a <code>BIGINT</code>. Change the limit to 21 and the query fails with <code>bigint out of range</code>. Use <code>NUMERIC</code> as the anchor type for bigger values.</p>
+<h2 id="compound-interest">Compound interest</h2>
+<p>If you invest 10,000 at 7% a year, what is the balance after 30 years? Rounding to cents each year, as a bank statement would:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE investment <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> <span class="dt">year</span>, <span class="fl">10000.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> balance</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> <span class="dt">year</span> <span class="op">+</span> <span class="dv">1</span>, <span class="fu">ROUND</span>(balance <span class="op">*</span> <span class="fl">1.07</span>, <span class="dv">2</span>)</span>
+<span>    <span class="kw">FROM</span> investment</span>
+<span>    <span class="kw">WHERE</span> <span class="dt">year</span> <span class="op">&lt;</span> <span class="dv">30</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="dt">year</span>, balance</span>
+<span><span class="kw">FROM</span> investment</span>
+<span><span class="kw">WHERE</span> <span class="dt">year</span> <span class="kw">IN</span> (<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">5</span>, <span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dt">year</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> year | balance
+------+----------
+    0 | 10000.00
+    1 | 10700.00
+    2 | 11449.00
+    5 | 14025.52
+   10 | 19671.52
+   20 | 38696.87
+   30 | 76122.60
+(7 rows)</code></pre>
+<p>The closed form <code>10000 * 1.07^30</code> gives 76122.55. The loop's 76122.60 is 5 cents higher because the balance is rounded to cents every year, which is also what a real statement does. The loop earns its place when the closed form does not exist: a contribution every year, a rate that changes, a withdrawal. Adding 500 at the end of each year is one more term in the recursive step:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE investment <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> <span class="dt">year</span>, <span class="fl">10000.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> balance</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> <span class="dt">year</span> <span class="op">+</span> <span class="dv">1</span>, <span class="fu">ROUND</span>(balance <span class="op">*</span> <span class="fl">1.07</span> <span class="op">+</span> <span class="dv">500</span>, <span class="dv">2</span>)</span>
+<span>    <span class="kw">FROM</span> investment</span>
+<span>    <span class="kw">WHERE</span> <span class="dt">year</span> <span class="op">&lt;</span> <span class="dv">30</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> balance <span class="kw">AS</span> balance_after_30_years_with_contributions</span>
+<span><span class="kw">FROM</span> investment</span>
+<span><span class="kw">WHERE</span> <span class="dt">year</span> <span class="op">=</span> <span class="dv">30</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> balance_after_30_years_with_contributions
+-------------------------------------------
+                                 123352.94
+(1 row)</code></pre>
+<h2 id="collatz-a-loop-with-no-known-end">Collatz: a loop with no known end</h2>
+<p>Start with any positive integer. If it is even, halve it; if it is odd, triple it and add 1. The Collatz conjecture says every start eventually reaches 1, and nobody has proved that. For 27:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE collatz <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">27</span>:<span class="ch">:BIGINT</span> <span class="kw">AS</span> n, <span class="dv">0</span> <span class="kw">AS</span> step</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> n % <span class="dv">2</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> n <span class="op">/</span> <span class="dv">2</span> <span class="cf">ELSE</span> n <span class="op">*</span> <span class="dv">3</span> <span class="op">+</span> <span class="dv">1</span> <span class="cf">END</span>, step <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> collatz</span>
+<span>    <span class="kw">WHERE</span> n <span class="op">&lt;&gt;</span> <span class="dv">1</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">max</span>(step) <span class="kw">AS</span> steps_to_reach_1, <span class="fu">max</span>(n) <span class="kw">AS</span> highest_value</span>
+<span><span class="kw">FROM</span> collatz;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> steps_to_reach_1 | highest_value
+------------------+---------------
+              111 |          9232
+(1 row)</code></pre>
+<p>It takes 111 steps and climbs as high as 9,232 before falling to 1. The stopping condition <code>n &lt;&gt; 1</code> is only safe because every start tried so far does reach 1. For a sequence where termination is not guaranteed, add a second guard such as <code>AND step &lt; 1000</code>.</p>
+<h2 id="calendars-and-filling-gaps">Calendars and filling gaps</h2>
+<p>A recursive CTE can produce a run of dates. Here is June 2024 with the daily sales that exist, where the days without sales still show up with zero:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> daily_sales (sale_date <span class="dt">DATE</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, amount <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> daily_sales <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;2024-06-01&#39;</span>, <span class="fl">120.00</span>),</span>
+<span>    (<span class="st">&#39;2024-06-02&#39;</span>,  <span class="fl">80.50</span>),</span>
+<span>    (<span class="st">&#39;2024-06-05&#39;</span>, <span class="fl">200.00</span>),</span>
+<span>    (<span class="st">&#39;2024-06-06&#39;</span>,  <span class="fl">45.25</span>);</span>
+<span></span>
+<span><span class="kw">WITH</span> RECURSIVE calendar <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dt">DATE</span> <span class="st">&#39;2024-06-01&#39;</span> <span class="kw">AS</span> dt</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> dt <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> calendar</span>
+<span>    <span class="kw">WHERE</span> dt <span class="op">&lt;</span> <span class="dt">DATE</span> <span class="st">&#39;2024-06-07&#39;</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> c.dt,</span>
+<span>       <span class="fu">to_char</span>(c.dt, <span class="st">&#39;FMDay&#39;</span>) <span class="kw">AS</span> weekday,</span>
+<span>       <span class="fu">COALESCE</span>(s.amount, <span class="dv">0</span>) <span class="kw">AS</span> amount</span>
+<span><span class="kw">FROM</span> calendar c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> daily_sales s <span class="kw">ON</span> s.sale_date <span class="op">=</span> c.dt</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.dt;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     dt     |  weekday  | amount
+------------+-----------+--------
+ 2024-06-01 | Saturday  | 120.00
+ 2024-06-02 | Sunday    |  80.50
+ 2024-06-03 | Monday    |      0
+ 2024-06-04 | Tuesday   |      0
+ 2024-06-05 | Wednesday | 200.00
+ 2024-06-06 | Thursday  |  45.25
+ 2024-06-07 | Friday    |      0
+(7 rows)</code></pre>
+<p>Adding 1 to a <code>DATE</code> adds one day in PostgreSQL. In MySQL you would write <code>dt + INTERVAL 1 DAY</code>, and in SQL Server <code>DATEADD(day, 1, dt)</code>.</p>
+<p>In PostgreSQL there is a built-in for this, and it is the better choice for plain runs of numbers or dates:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> d:<span class="ch">:DATE</span> <span class="kw">AS</span> dt</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dt">DATE</span> <span class="st">&#39;2024-06-01&#39;</span>, <span class="dt">DATE</span> <span class="st">&#39;2024-06-07&#39;</span>, <span class="dt">INTERVAL</span> <span class="st">&#39;1 day&#39;</span>) <span class="kw">AS</span> d</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> dt;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     dt
+------------
+ 2024-06-01
+ 2024-06-02
+ 2024-06-03
+ 2024-06-04
+ 2024-06-05
+ 2024-06-06
+ 2024-06-07
+(7 rows)</code></pre>
+<p>The recursive version matters when the database has no such function, or when the next value depends on the previous one in a way <code>generate_series</code> cannot express. The plans show why the built-in is cheaper: it is one function call, while the CTE runs its recursive step once per row.</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> RECURSIVE numbers <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span> <span class="kw">FROM</span> numbers <span class="kw">WHERE</span> n <span class="op">&lt;</span> <span class="dv">1000000</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n <span class="kw">FROM</span> numbers;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                    QUERY PLAN
+---------------------------------------------------
+ CTE Scan on numbers
+   CTE numbers
+     -&gt;  Recursive Union
+           -&gt;  Result
+           -&gt;  WorkTable Scan on numbers numbers_1
+                 Filter: (n &lt; 1000000)
+(6 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> n <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) <span class="kw">AS</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>             QUERY PLAN
+------------------------------------
+ Function Scan on generate_series n
+(1 row)</code></pre>
+<h2 id="splitting-a-string-without-a-split-function">Splitting a string without a split function</h2>
+<p>In PostgreSQL you would use <code>string_to_table</code>, but the recursive version works anywhere that has <code>POSITION</code> and <code>SUBSTRING</code>, and it shows state being passed along. Each iteration peels the first item off <code>remaining</code>:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE <span class="kw">split</span> <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> position,</span>
+<span>           <span class="kw">NULL</span>:<span class="ch">:TEXT</span> <span class="kw">AS</span> item,</span>
+<span>           <span class="st">&#39;apple,banana,cherry,date,elderberry&#39;</span>:<span class="ch">:TEXT</span> <span class="kw">AS</span> remaining</span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> position <span class="op">+</span> <span class="dv">1</span>,</span>
+<span>           <span class="cf">CASE</span> <span class="cf">WHEN</span> POSITION(<span class="st">&#39;,&#39;</span> <span class="kw">IN</span> remaining) <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span>                <span class="cf">THEN</span> SUBSTRING(remaining <span class="kw">FROM</span> <span class="dv">1</span> <span class="cf">FOR</span> POSITION(<span class="st">&#39;,&#39;</span> <span class="kw">IN</span> remaining) <span class="op">-</span> <span class="dv">1</span>)</span>
+<span>                <span class="cf">ELSE</span> remaining <span class="cf">END</span>,</span>
+<span>           <span class="cf">CASE</span> <span class="cf">WHEN</span> POSITION(<span class="st">&#39;,&#39;</span> <span class="kw">IN</span> remaining) <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span>                <span class="cf">THEN</span> SUBSTRING(remaining <span class="kw">FROM</span> POSITION(<span class="st">&#39;,&#39;</span> <span class="kw">IN</span> remaining) <span class="op">+</span> <span class="dv">1</span>)</span>
+<span>                <span class="cf">ELSE</span> <span class="st">&#39;&#39;</span> <span class="cf">END</span></span>
+<span>    <span class="kw">FROM</span> <span class="kw">split</span></span>
+<span>    <span class="kw">WHERE</span> remaining <span class="op">&lt;&gt;</span> <span class="st">&#39;&#39;</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> position, item</span>
+<span><span class="kw">FROM</span> <span class="kw">split</span></span>
+<span><span class="kw">WHERE</span> position <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> position;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> position |    item
+----------+------------
+        1 | apple
+        2 | banana
+        3 | cherry
+        4 | date
+        5 | elderberry
+(5 rows)</code></pre>
+<p>The loop ends when <code>remaining</code> is empty. That also means a trailing delimiter is lost: for <code>'a,b,'</code> the last, empty item never appears, because the loop stops as soon as nothing is left. If empty items matter, you need a different stopping rule, for example a flag column.</p>
+<h2 id="loan-amortization">Loan amortization</h2>
+<p>A fixed-rate loan is a good fit because each month's interest depends on the balance left by the previous month. A 300,000 loan at 6.5% a year over 360 months has a payment of 1,896.20, rounded to cents. Interest is also rounded each month, as a lender would do, and that leaves a few cents of drift, so the last payment is adjusted to clear the balance exactly:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE terms <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="fl">300000.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> principal,</span>
+<span>           <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>         <span class="kw">AS</span> monthly_rate,</span>
+<span>           <span class="dv">360</span>                <span class="kw">AS</span> months,</span>
+<span>           <span class="fu">ROUND</span>(<span class="fl">300000.00</span> <span class="op">*</span> (<span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>) <span class="op">*</span> <span class="fu">POWER</span>(<span class="dv">1</span> <span class="op">+</span> <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>, <span class="dv">360</span>)</span>
+<span>                 <span class="op">/</span> (<span class="fu">POWER</span>(<span class="dv">1</span> <span class="op">+</span> <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>, <span class="dv">360</span>) <span class="op">-</span> <span class="dv">1</span>), <span class="dv">2</span>) <span class="kw">AS</span> payment</span>
+<span>),</span>
+<span>schedule <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> <span class="dt">month</span>, principal <span class="kw">AS</span> balance,</span>
+<span>           <span class="fl">0.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> paid, <span class="fl">0.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> interest, <span class="fl">0.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> principal_paid</span>
+<span>    <span class="kw">FROM</span> terms</span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> s.<span class="dt">month</span> <span class="op">+</span> <span class="dv">1</span>,</span>
+<span>           s.balance <span class="op">-</span> (p.paid <span class="op">-</span> i.interest),</span>
+<span>           p.paid,</span>
+<span>           i.interest,</span>
+<span>           p.paid <span class="op">-</span> i.interest</span>
+<span>    <span class="kw">FROM</span> schedule s</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> terms t</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">SELECT</span> <span class="fu">ROUND</span>(s.balance <span class="op">*</span> t.monthly_rate, <span class="dv">2</span>) <span class="kw">AS</span> interest) i</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">SELECT</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> s.<span class="dt">month</span> <span class="op">+</span> <span class="dv">1</span> <span class="op">=</span> t.months</span>
+<span>                                    <span class="cf">THEN</span> s.balance <span class="op">+</span> i.interest   <span class="co">-- last payment clears the balance</span></span>
+<span>                                    <span class="cf">ELSE</span> t.payment <span class="cf">END</span> <span class="kw">AS</span> paid) p</span>
+<span>    <span class="kw">WHERE</span> s.<span class="dt">month</span> <span class="op">&lt;</span> t.months</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="dt">month</span>, balance, paid, principal_paid, interest</span>
+<span><span class="kw">FROM</span> schedule</span>
+<span><span class="kw">WHERE</span> <span class="dt">month</span> % <span class="dv">60</span> <span class="op">=</span> <span class="dv">0</span> <span class="kw">OR</span> <span class="dt">month</span> <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">359</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dt">month</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> month |  balance  |  paid   | principal_paid | interest
+-------+-----------+---------+----------------+----------
+     0 | 300000.00 |    0.00 |           0.00 |     0.00
+     1 | 299728.80 | 1896.20 |         271.20 |  1625.00
+    60 | 280833.26 | 1896.20 |         373.00 |  1523.20
+   120 | 254329.14 | 1896.20 |         515.79 |  1380.41
+   180 | 217678.77 | 1896.20 |         713.24 |  1182.96
+   240 | 166997.98 | 1896.20 |         986.29 |   909.91
+   300 |  96915.68 | 1896.20 |        1363.85 |   532.35
+   359 |   1890.67 | 1896.20 |        1875.80 |    20.40
+   360 |      0.00 | 1900.91 |        1890.67 |    10.24
+(9 rows)</code></pre>
+<p>The loan is repaid after exactly 360 rows. The regular payment is 1,896.20 and the final one is 1,900.91, because the unrounded payment is 1,896.2041 and 360 small roundings add up to a few cents. The first month shows the usual shape of an annuity loan: 1,625.00 of the first payment is interest and only 271.20 reduces the principal. The totals from the whole schedule:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE terms <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="fl">300000.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> principal,</span>
+<span>           <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>         <span class="kw">AS</span> monthly_rate,</span>
+<span>           <span class="dv">360</span>                <span class="kw">AS</span> months,</span>
+<span>           <span class="fu">ROUND</span>(<span class="fl">300000.00</span> <span class="op">*</span> (<span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>) <span class="op">*</span> <span class="fu">POWER</span>(<span class="dv">1</span> <span class="op">+</span> <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>, <span class="dv">360</span>)</span>
+<span>                 <span class="op">/</span> (<span class="fu">POWER</span>(<span class="dv">1</span> <span class="op">+</span> <span class="fl">0.065</span> <span class="op">/</span> <span class="dv">12</span>, <span class="dv">360</span>) <span class="op">-</span> <span class="dv">1</span>), <span class="dv">2</span>) <span class="kw">AS</span> payment</span>
+<span>),</span>
+<span>schedule <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">0</span> <span class="kw">AS</span> <span class="dt">month</span>, principal <span class="kw">AS</span> balance,</span>
+<span>           <span class="fl">0.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> paid, <span class="fl">0.00</span>:<span class="ch">:NUMERIC</span> <span class="kw">AS</span> interest</span>
+<span>    <span class="kw">FROM</span> terms</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> s.<span class="dt">month</span> <span class="op">+</span> <span class="dv">1</span>,</span>
+<span>           s.balance <span class="op">-</span> (p.paid <span class="op">-</span> i.interest),</span>
+<span>           p.paid,</span>
+<span>           i.interest</span>
+<span>    <span class="kw">FROM</span> schedule s</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> terms t</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">SELECT</span> <span class="fu">ROUND</span>(s.balance <span class="op">*</span> t.monthly_rate, <span class="dv">2</span>) <span class="kw">AS</span> interest) i</span>
+<span>    <span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">SELECT</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> s.<span class="dt">month</span> <span class="op">+</span> <span class="dv">1</span> <span class="op">=</span> t.months</span>
+<span>                                    <span class="cf">THEN</span> s.balance <span class="op">+</span> i.interest</span>
+<span>                                    <span class="cf">ELSE</span> t.payment <span class="cf">END</span> <span class="kw">AS</span> paid) p</span>
+<span>    <span class="kw">WHERE</span> s.<span class="dt">month</span> <span class="op">&lt;</span> t.months</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">sum</span>(paid) <span class="kw">AS</span> total_paid, <span class="fu">sum</span>(interest) <span class="kw">AS</span> total_interest, <span class="fu">min</span>(balance) <span class="kw">AS</span> lowest_balance</span>
+<span><span class="kw">FROM</span> schedule;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> total_paid | total_interest | lowest_balance
+------------+----------------+----------------
+  682636.71 |      382636.71 |           0.00
+(1 row)</code></pre>
+<p>Over 30 years the borrower pays back 682,636.71 for a 300,000 loan, of which 382,636.71 is interest.</p>
+<h2 id="stopping-a-runaway-recursion">Stopping a runaway recursion</h2>
+<p>The <code>WHERE</code> clause is the only brake. If it never becomes false, PostgreSQL does not stop on its own: with <code>UNION ALL</code> the recursion keeps producing rows until the query is cancelled or the server runs out of memory or disk. Set a <code>statement_timeout</code> when you experiment with recursive queries.</p>
+<p>There are three ways to bound a recursion that has no obvious end. The first is a step counter in the <code>WHERE</code> clause, as in the Collatz example, and it is the right default.</p>
+<p>The second is a <code>LIMIT</code> in the outer query. PostgreSQL evaluates a recursive CTE lazily, so when the outer query stops asking for rows the recursion stops too:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE naturals <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> n <span class="op">+</span> <span class="dv">1</span> <span class="kw">FROM</span> naturals</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n <span class="kw">FROM</span> naturals <span class="kw">LIMIT</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)</code></pre>
+<p>The recursion above has no stopping condition at all and still finishes, because only five rows are requested. That works only as long as the outer query does not need all rows: add an <code>ORDER BY</code> or an aggregate and it never returns. Treat it as a convenience, not as a safeguard.</p>
+<p>The third is <code>UNION</code> instead of <code>UNION ALL</code>. It discards a row that has already been produced, so a sequence that returns to an earlier value stops by itself. Here <code>x -&gt; (3x + 1) mod 7</code> visits six values and then repeats:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE walk <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">AS</span> n</span>
+<span>    <span class="kw">UNION</span></span>
+<span>    <span class="kw">SELECT</span> (n <span class="op">*</span> <span class="dv">3</span> <span class="op">+</span> <span class="dv">1</span>) % <span class="dv">7</span> <span class="kw">FROM</span> walk</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> n <span class="kw">FROM</span> walk <span class="kw">ORDER</span> <span class="kw">BY</span> n;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n
+---
+ 0
+ 1
+ 2
+ 4
+ 5
+ 6
+(6 rows)</code></pre>
+<p>This only works when the row consists of the value alone. As soon as a step counter is part of the row, every row is different and the dedup never triggers.</p>
+<h2 id="differences-between-databases">Differences between databases</h2>
+<ul>
+<li>PostgreSQL: no iteration limit, see above.</li>
+<li>MySQL 8: stops with an error after 1,000 iterations by default (<code>cte_max_recursion_depth</code>). A 1,001-row sequence needs that setting raised.</li>
+<li>SQL Server: writes <code>WITH</code> without the <code>RECURSIVE</code> keyword, and stops after 100 recursion levels unless the query ends with <code>OPTION (MAXRECURSION n)</code>.</li>
+<li>SQLite: same syntax as PostgreSQL, <code>WITH RECURSIVE</code>.</li>
+</ul>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A recursive CTE is a loop whose variables are columns. Carry whatever the next step needs (the previous value, a running product, a remaining string) as columns.</li>
+<li>The anchor fixes the column types. Pick <code>BIGINT</code> or <code>NUMERIC</code> there if the values grow.</li>
+<li>Bound the recursion yourself: a step limit in <code>WHERE</code>, or <code>UNION</code> when the sequence can repeat.</li>
+<li>For plain runs of numbers or dates in PostgreSQL, <code>generate_series</code> is simpler and cheaper. Use recursion when each value depends on the one before.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day18.pdf" download>Download PDF · Day 18</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../17/">← Day 17</a>
+  <a href="../../">All 31 days</a>
+  <a href="../19/">Day 19 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/18/</span>
+</footer>
+
+</body>
+</html>

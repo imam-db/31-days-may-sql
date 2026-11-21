@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 04: COUNT(DISTINCT) OVER: Counting Unique Values per Window · #31DaysMaySQL</title>
+<meta name="description" content="PostgreSQL does not allow DISTINCT inside a window function. Four ways to get a distinct count next to every row: a pre-aggregated join, a correlated subquery, the DENSE_RANK trick and a first-occurrence flag.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 04: COUNT(DISTINCT) OVER: Counting Unique Values per Window">
+<meta property="og:description" content="PostgreSQL does not allow DISTINCT inside a window function. Four ways to get a distinct count next to every row: a pre-aggregated join, a correlated subquery, the DENSE_RANK trick and a first-occurrence flag.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../03/">← Day 03</a><a href="../05/">Day 05 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 04</p>
+  <h1>COUNT(DISTINCT) OVER: Counting Unique Values per Window</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>You know <code>COUNT(DISTINCT col)</code> and you know window functions, so sooner or later you try to combine them. The setup is a table of employees and the projects they work on:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> assignments (</span>
+<span>    department  TEXT,</span>
+<span>    employee    TEXT,</span>
+<span>    project     TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> assignments <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;Atlas&#39;</span>),</span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;Beacon&#39;</span>),</span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;Atlas&#39;</span>),</span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;Atlas&#39;</span>),   <span class="co">-- duplicate assignment</span></span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Carol&#39;</span>, <span class="st">&#39;Beacon&#39;</span>),</span>
+<span>    (<span class="st">&#39;Engineering&#39;</span>, <span class="st">&#39;Carol&#39;</span>, <span class="st">&#39;Cipher&#39;</span>),</span>
+<span>    (<span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Dave&#39;</span>,  <span class="st">&#39;Atlas&#39;</span>),</span>
+<span>    (<span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Dave&#39;</span>,  <span class="st">&#39;Atlas&#39;</span>),   <span class="co">-- duplicate assignment</span></span>
+<span>    (<span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Eve&#39;</span>,   <span class="st">&#39;Atlas&#39;</span>),</span>
+<span>    (<span class="st">&#39;Sales&#39;</span>,       <span class="st">&#39;Eve&#39;</span>,   <span class="st">&#39;Beacon&#39;</span>);</span></code></pre>
+<p>For every row, show how many different projects exist in that employee's department. Engineering has three (Atlas, Beacon, Cipher) and Sales has two (Atlas, Beacon). The query that comes to mind:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> department, employee,</span>
+<span>       <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> project) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> assignments;</span></code></pre>
+<pre class="text"><code>ERROR:  DISTINCT is not implemented for window functions
+LINE 3:        COUNT(DISTINCT project) OVER (PARTITION BY department) AS...</code></pre>
+<p>PostgreSQL does not implement <code>DISTINCT</code> in an aggregate used as a window function. SQL Server rejects it as well, and MySQL does not accept it. Oracle (with only a <code>PARTITION BY</code>, no <code>ORDER BY</code> or frame) and DuckDB do allow it, so check your engine's documentation before assuming a workaround is needed. The rest of this day uses PostgreSQL 18.</p>
+<h2 id="join-a-pre-aggregated-query">Join a pre-aggregated query</h2>
+<p>The <code>GROUP BY</code> that computes the distinct count already exists, so compute it once per department and join it back:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> department_counts <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> project) <span class="kw">AS</span> unique_projects</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>    <span class="kw">GROUP</span> <span class="kw">BY</span> department</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> a.department, a.employee, a.project, d.unique_projects</span>
+<span><span class="kw">FROM</span> assignments a</span>
+<span><span class="kw">JOIN</span> department_counts d <span class="kw">USING</span> (department)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> a.department, a.employee, a.project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | employee | project | unique_projects
+-------------+----------+---------+-----------------
+ Engineering | Alice    | Atlas   |               3
+ Engineering | Alice    | Beacon  |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Carol    | Beacon  |               3
+ Engineering | Carol    | Cipher  |               3
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Eve      | Atlas   |               2
+ Sales       | Eve      | Beacon  |               2
+(10 rows)</code></pre>
+<p>This is the version I would write first. It is easy to read, the distinct count is computed once per group, and <code>COUNT(DISTINCT)</code> already skips <code>NULL</code>s the way you expect. It gets awkward only when the "window" is not a plain partition, or when the query already has several window functions over the same partition.</p>
+<h2 id="correlated-subquery">Correlated subquery</h2>
+<p>A scalar subquery in the select list gives the same result:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> a.department, a.employee, a.project,</span>
+<span>       (<span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> b.project)</span>
+<span>        <span class="kw">FROM</span> assignments b</span>
+<span>        <span class="kw">WHERE</span> b.department <span class="op">=</span> a.department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> assignments a</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> a.department, a.employee, a.project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | employee | project | unique_projects
+-------------+----------+---------+-----------------
+ Engineering | Alice    | Atlas   |               3
+ Engineering | Alice    | Beacon  |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Carol    | Beacon  |               3
+ Engineering | Carol    | Cipher  |               3
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Eve      | Atlas   |               2
+ Sales       | Eve      | Beacon  |               2
+(10 rows)</code></pre>
+<p>The plan shows the cost:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> a.department, a.employee, a.project,</span>
+<span>       (<span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> b.project)</span>
+<span>        <span class="kw">FROM</span> assignments b</span>
+<span>        <span class="kw">WHERE</span> b.department <span class="op">=</span> a.department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> assignments a;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+-----------------------------------------------------------
+ Seq Scan on assignments a
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Sort
+                 Sort Key: b.project
+                 -&gt;  Seq Scan on assignments b
+                       Filter: (department = a.department)
+(7 rows)</code></pre>
+<p><code>SubPlan 1</code> runs once for each row of <code>a</code>, and each run scans <code>assignments</code> again and sorts the matching rows. With ten rows that does not matter. With millions of rows the work grows with rows times department size, unless an index on <code>department</code> makes each run cheap.</p>
+<h2 id="the-dense_rank-trick">The DENSE_RANK trick</h2>
+<p>If you want to stay in a single pass over the table, rank the distinct values inside each partition and take the largest rank. <code>DENSE_RANK()</code> gives equal values the same rank and has no gaps, so the highest rank equals the number of distinct values:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department <span class="kw">ORDER</span> <span class="kw">BY</span> project) <span class="kw">AS</span> dr</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> department, employee, project,</span>
+<span>       <span class="fu">MAX</span>(dr) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> department, employee, project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | employee | project | unique_projects
+-------------+----------+---------+-----------------
+ Engineering | Alice    | Atlas   |               3
+ Engineering | Alice    | Beacon  |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Carol    | Beacon  |               3
+ Engineering | Carol    | Cipher  |               3
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Eve      | Atlas   |               2
+ Sales       | Eve      | Beacon  |               2
+(10 rows)</code></pre>
+<p>In Engineering the ranks are Atlas 1, Beacon 2, Cipher 3, and both of Bob's Atlas rows get rank 1. <code>MAX(dr)</code> over the department is 3. The plan has one sort and two <code>WindowAgg</code> nodes, and no repeated scans:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department <span class="kw">ORDER</span> <span class="kw">BY</span> project) <span class="kw">AS</span> dr</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> department, employee, project,</span>
+<span>       <span class="fu">MAX</span>(dr) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> ranked;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                    QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (PARTITION BY assignments.department)
+   -&gt;  WindowAgg
+         Window: w1 AS (PARTITION BY assignments.department ORDER BY assignments.project ROWS UNBOUNDED PRECEDING)
+         -&gt;  Sort
+               Sort Key: assignments.department, assignments.project
+               -&gt;  Seq Scan on assignments
+(7 rows)</code></pre>
+<h3 id="why-dense_rank-and-not-rank-or-row_number">Why DENSE_RANK and not RANK or ROW_NUMBER</h3>
+<p>Take three rows, two of them equal:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> project,</span>
+<span>       <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> w <span class="kw">AS</span> <span class="fu">row_number</span>,</span>
+<span>       <span class="fu">RANK</span>()       <span class="kw">OVER</span> w <span class="kw">AS</span> <span class="fu">rank</span>,</span>
+<span>       <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> w <span class="kw">AS</span> <span class="fu">dense_rank</span></span>
+<span><span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="st">&#39;Atlas&#39;</span>), (<span class="st">&#39;Atlas&#39;</span>), (<span class="st">&#39;Beacon&#39;</span>)) <span class="kw">AS</span> t(project)</span>
+<span>WINDOW w <span class="kw">AS</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> project)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> project | row_number | rank | dense_rank
+---------+------------+------+------------
+ Atlas   |          1 |    1 |          1
+ Atlas   |          2 |    1 |          1
+ Beacon  |          3 |    3 |          2
+(3 rows)</code></pre>
+<p>There are two distinct projects. The largest <code>row_number</code> is 3 because duplicates get different numbers, and the largest <code>rank</code> is 3 because it skips 2 after the tie. Only <code>dense_rank</code> ends at 2.</p>
+<h2 id="nulls">NULLs</h2>
+<p><code>COUNT(DISTINCT project)</code> ignores <code>NULL</code>s, but <code>DENSE_RANK</code> ranks a <code>NULL</code> like any other value. Add a Sales employee with no project yet:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> assignments <span class="kw">VALUES</span> (<span class="st">&#39;Sales&#39;</span>, <span class="st">&#39;Frank&#39;</span>, <span class="kw">NULL</span>);</span>
+<span></span>
+<span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department <span class="kw">ORDER</span> <span class="kw">BY</span> project) <span class="kw">AS</span> dr</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> department, employee, project,</span>
+<span>       <span class="fu">MAX</span>(dr) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> department <span class="op">=</span> <span class="st">&#39;Sales&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> employee, project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department | employee | project | unique_projects
+------------+----------+---------+-----------------
+ Sales      | Dave     | Atlas   |               3
+ Sales      | Dave     | Atlas   |               3
+ Sales      | Eve      | Atlas   |               3
+ Sales      | Eve      | Beacon  |               3
+ Sales      | Frank    |         |               3
+(5 rows)</code></pre>
+<p>Sales has two projects, and the query says three because <code>NULL</code> got a rank. Give <code>NULL</code> rows a <code>NULL</code> rank, which <code>MAX</code> ignores:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="cf">CASE</span> <span class="cf">WHEN</span> project <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>                <span class="cf">THEN</span> <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department <span class="kw">ORDER</span> <span class="kw">BY</span> project)</span>
+<span>           <span class="cf">END</span> <span class="kw">AS</span> dr</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> department, employee, project,</span>
+<span>       <span class="fu">MAX</span>(dr) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> department <span class="op">=</span> <span class="st">&#39;Sales&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> employee, project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department | employee | project | unique_projects
+------------+----------+---------+-----------------
+ Sales      | Dave     | Atlas   |               2
+ Sales      | Dave     | Atlas   |               2
+ Sales      | Eve      | Atlas   |               2
+ Sales      | Eve      | Beacon  |               2
+ Sales      | Frank    |         |               2
+(5 rows)</code></pre>
+<p>This fix quietly depends on where <code>NULL</code>s sort. In PostgreSQL an ascending sort puts them last, so the real values are ranked 1, 2, ... without a gap. In a database that sorts <code>NULL</code> first (MySQL, SQL Server) or if you write <code>ORDER BY project NULLS FIRST</code> in PostgreSQL, <code>NULL</code> takes rank 1, the real values start at 2, and <code>MAX</code> is off by one even with the <code>CASE</code>. Day 5 covers where <code>NULL</code>s sort. Here the safest option is to state it:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="cf">CASE</span> <span class="cf">WHEN</span> project <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>                <span class="cf">THEN</span> <span class="fu">DENSE_RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department <span class="kw">ORDER</span> <span class="kw">BY</span> project <span class="kw">NULLS</span> <span class="fu">LAST</span>)</span>
+<span>           <span class="cf">END</span> <span class="kw">AS</span> dr</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> department, <span class="fu">MAX</span>(dr) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> department;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | unique_projects
+-------------+-----------------
+ Engineering |               3
+ Sales       |               2
+(2 rows)</code></pre>
+<h2 id="a-first-occurrence-flag">A first-occurrence flag</h2>
+<p>A different formulation avoids the dependence on <code>NULL</code> ordering. Number the rows within each (department, project) pair. The first row of a pair has <code>row_number = 1</code>, so summing a 1 for each first row counts the distinct projects:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> flagged <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> department, employee, project,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department, project) <span class="kw">AS</span> rn</span>
+<span>    <span class="kw">FROM</span> assignments</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> department, employee, project,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> rn <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> project <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span>)</span>
+<span>           <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> department) <span class="kw">AS</span> unique_projects</span>
+<span><span class="kw">FROM</span> flagged</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> department, employee, project;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> department  | employee | project | unique_projects
+-------------+----------+---------+-----------------
+ Engineering | Alice    | Atlas   |               3
+ Engineering | Alice    | Beacon  |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Bob      | Atlas   |               3
+ Engineering | Carol    | Beacon  |               3
+ Engineering | Carol    | Cipher  |               3
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Dave     | Atlas   |               2
+ Sales       | Eve      | Atlas   |               2
+ Sales       | Eve      | Beacon  |               2
+ Sales       | Frank    |         |               2
+(11 rows)</code></pre>
+<p>The same flag also gives something the <code>DENSE_RANK</code> trick cannot: a running distinct count. Number each visitor's first visit, then sum the flags in date order:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> visits (visit_date <span class="dt">DATE</span>, visitor TEXT);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> visits <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;2025-01-01&#39;</span>, <span class="st">&#39;ann&#39;</span>),</span>
+<span>    (<span class="st">&#39;2025-01-01&#39;</span>, <span class="st">&#39;bob&#39;</span>),</span>
+<span>    (<span class="st">&#39;2025-01-02&#39;</span>, <span class="st">&#39;ann&#39;</span>),</span>
+<span>    (<span class="st">&#39;2025-01-03&#39;</span>, <span class="st">&#39;cat&#39;</span>),</span>
+<span>    (<span class="st">&#39;2025-01-03&#39;</span>, <span class="st">&#39;bob&#39;</span>),</span>
+<span>    (<span class="st">&#39;2025-01-04&#39;</span>, <span class="st">&#39;ann&#39;</span>);</span>
+<span></span>
+<span><span class="kw">WITH</span> flagged <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> visit_date, visitor,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> visitor <span class="kw">ORDER</span> <span class="kw">BY</span> visit_date) <span class="op">=</span> <span class="dv">1</span> <span class="kw">AS</span> first_visit</span>
+<span>    <span class="kw">FROM</span> visits</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> visit_date,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> first_visit) <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> visit_date) <span class="kw">AS</span> distinct_visitors_so_far</span>
+<span><span class="kw">FROM</span> flagged</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> visit_date;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> visit_date | distinct_visitors_so_far
+------------+--------------------------
+ 2025-01-01 |                        2
+ 2025-01-02 |                        2
+ 2025-01-03 |                        3
+ 2025-01-04 |                        3
+(4 rows)</code></pre>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>COUNT(DISTINCT x) OVER (...)</code> is an error in PostgreSQL.</li>
+<li>A join to a <code>GROUP BY</code> subquery is the simplest correct answer. A correlated subquery works but runs once per row.</li>
+<li><code>MAX(DENSE_RANK() ...)</code> gives the distinct count in one pass. Handle <code>NULL</code>s with a <code>CASE</code>, and make sure they sort last.</li>
+<li>A first-occurrence flag (<code>ROW_NUMBER() = 1</code>) is not affected by <code>NULL</code> ordering and also works for running distinct counts.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day04.pdf" download>Download PDF · Day 04</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../03/">← Day 03</a>
+  <a href="../../">All 31 days</a>
+  <a href="../05/">Day 05 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/04/</span>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 21: Mastering JSONB in PostgreSQL · #31DaysMaySQL</title>
+<meta name="description" content="JSON vs JSONB, the -&gt; and -&gt;&gt; operators and the error that comes from comparing them with text, containment and existence checks, which index serves which query (shown with EXPLAIN), jsonb_agg, and updating documents.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 21: Mastering JSONB in PostgreSQL">
+<meta property="og:description" content="JSON vs JSONB, the -&gt; and -&gt;&gt; operators and the error that comes from comparing them with text, containment and existence checks, which index serves which query (shown with EXPLAIN), jsonb_agg, and updating documents.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../20/">← Day 20</a><a href="../22/">Day 22 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 21</p>
+  <h1>Mastering JSONB in PostgreSQL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>Event logs, API responses and audit records often end up in a JSON column. PostgreSQL offers two types for it, <code>json</code> and <code>jsonb</code>, and a handful of operators whose differences (<code>-&gt;</code> against <code>-&gt;&gt;</code>, <code>@&gt;</code> against <code>?</code>) decide whether a query returns the right rows and whether an index is used. This article goes through them on a small events table and checks the index claims with <code>EXPLAIN</code> on 200,000 rows.</p>
+<p>Everything runs on PostgreSQL 18. <code>jsonb</code> is PostgreSQL-specific; the last section lists what MySQL and SQL Server offer instead.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span>    event_id    <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    user_id     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    event_type  <span class="dt">VARCHAR</span>(<span class="dv">50</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    occurred_at <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    payload     JSONB <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> (user_id, event_type, occurred_at, payload) <span class="kw">VALUES</span></span>
+<span>(<span class="dv">101</span>, <span class="st">&#39;page_view&#39;</span>,   <span class="st">&#39;2024-06-10 09:15:22&#39;</span>,</span>
+<span> <span class="st">&#39;{&quot;url&quot;: &quot;/products/laptop&quot;, &quot;referrer&quot;: &quot;google&quot;,</span></span>
+<span><span class="st">   &quot;device&quot;: {&quot;type&quot;: &quot;mobile&quot;, &quot;os&quot;: &quot;iOS&quot;, &quot;version&quot;: &quot;17.2&quot;},</span></span>
+<span><span class="st">   &quot;tags&quot;: [&quot;sale&quot;, &quot;tech&quot;]}&#39;</span>),</span>
+<span>(<span class="dv">101</span>, <span class="st">&#39;add_to_cart&#39;</span>, <span class="st">&#39;2024-06-10 09:16:45&#39;</span>,</span>
+<span> <span class="st">&#39;{&quot;product_id&quot;: 42, &quot;price&quot;: 1299.99, &quot;quantity&quot;: 1,</span></span>
+<span><span class="st">   &quot;device&quot;: {&quot;type&quot;: &quot;mobile&quot;, &quot;os&quot;: &quot;iOS&quot;, &quot;version&quot;: &quot;17.2&quot;}}&#39;</span>),</span>
+<span>(<span class="dv">102</span>, <span class="st">&#39;page_view&#39;</span>,   <span class="st">&#39;2024-06-10 09:17:01&#39;</span>,</span>
+<span> <span class="st">&#39;{&quot;url&quot;: &quot;/products/phone&quot;, &quot;referrer&quot;: &quot;direct&quot;,</span></span>
+<span><span class="st">   &quot;device&quot;: {&quot;type&quot;: &quot;desktop&quot;, &quot;os&quot;: &quot;Windows&quot;, &quot;version&quot;: &quot;11&quot;},</span></span>
+<span><span class="st">   &quot;tags&quot;: [&quot;sale&quot;]}&#39;</span>),</span>
+<span>(<span class="dv">103</span>, <span class="st">&#39;purchase&#39;</span>,    <span class="st">&#39;2024-06-10 09:20:12&#39;</span>,</span>
+<span> <span class="st">&#39;{&quot;order_id&quot;: 5001, &quot;total&quot;: 1299.99,</span></span>
+<span><span class="st">   &quot;items&quot;: [{&quot;product_id&quot;: 42, &quot;qty&quot;: 1}, {&quot;product_id&quot;: 7, &quot;qty&quot;: 2}],</span></span>
+<span><span class="st">   &quot;device&quot;: {&quot;type&quot;: &quot;mobile&quot;, &quot;os&quot;: &quot;Android&quot;}}&#39;</span>);</span></code></pre>
+<p>The fixed attributes (<code>user_id</code>, <code>event_type</code>, <code>occurred_at</code>) are real columns. The part that differs per event type lives in <code>payload</code>.</p>
+<h2 id="json-or-jsonb">json or jsonb</h2>
+<p><code>json</code> stores the text exactly as it was written and parses it again on every access. <code>jsonb</code> parses once on insert and stores a binary form. The visible differences:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;{&quot;b&quot;: 1, &quot;a&quot;:   2, &quot;a&quot;: 3}&#39;</span>:<span class="ch">:json</span>  <span class="kw">AS</span> as_json,</span>
+<span>       <span class="st">&#39;{&quot;b&quot;: 1, &quot;a&quot;:   2, &quot;a&quot;: 3}&#39;</span>:<span class="ch">:jsonb</span> <span class="kw">AS</span> as_jsonb;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>          as_json           |     as_jsonb
+----------------------------+------------------
+ {&quot;b&quot;: 1, &quot;a&quot;:   2, &quot;a&quot;: 3} | {&quot;a&quot;: 3, &quot;b&quot;: 1}
+(1 row)</code></pre>
+<p><code>json</code> keeps the whitespace, the key order and both <code>a</code> keys. <code>jsonb</code> drops the extra whitespace, sorts keys (shorter keys first, then by byte order), and keeps only the last of duplicate keys. Numbers keep their written precision in both (<code>1.50</code> stays <code>1.50</code> in <code>jsonb</code>).</p>
+<p>The bigger difference is what you can do with the column. A <code>json</code> column cannot be given a GIN index:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> t <span class="kw">USING</span> gin (j);   <span class="co">-- j is of type json</span></span></code></pre>
+<pre class="text"><code>ERROR:  data type json has no default operator class for access method &quot;gin&quot;</code></pre>
+<p><code>jsonb</code> also has the containment and existence operators used below, and it is cheaper to read because nothing has to be re-parsed per access. Use <code>jsonb</code> unless you need the original text, byte for byte, for example to verify a signature computed over it. Writes into <code>json</code> are slightly cheaper, since there is no conversion, but that rarely outweighs the rest.</p>
+<h2 id="path-operators">Path operators</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Operator</th>
+<th>Returns</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>-&gt;</code></td>
+<td><code>jsonb</code></td>
+<td>field by name, or array element by position</td>
+</tr>
+<tr class="even">
+<td><code>-&gt;&gt;</code></td>
+<td><code>text</code></td>
+<td>same, converted to text</td>
+</tr>
+<tr class="odd">
+<td><code>#&gt;</code></td>
+<td><code>jsonb</code></td>
+<td>value at a path, given as a text array</td>
+</tr>
+<tr class="even">
+<td><code>#&gt;&gt;</code></td>
+<td><code>text</code></td>
+<td>same, converted to text</td>
+</tr>
+</tbody>
+</table>
+<p>A single arrow keeps the result as JSON, so you can chain more steps. A double arrow ends the chain and gives SQL text.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id,</span>
+<span>       payload <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span>                 <span class="kw">AS</span> device_jsonb,</span>
+<span>       payload <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span> <span class="op">-&gt;&gt;</span> <span class="st">&#39;type&#39;</span>      <span class="kw">AS</span> device_type,</span>
+<span>       payload #<span class="op">&gt;&gt;</span> <span class="st">&#39;{device,os}&#39;</span>           <span class="kw">AS</span> device_os</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> event_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id |                     device_jsonb                      | device_type | device_os
+----------+-------------------------------------------------------+-------------+-----------
+        1 | {&quot;os&quot;: &quot;iOS&quot;, &quot;type&quot;: &quot;mobile&quot;, &quot;version&quot;: &quot;17.2&quot;}    | mobile      | iOS
+        2 | {&quot;os&quot;: &quot;iOS&quot;, &quot;type&quot;: &quot;mobile&quot;, &quot;version&quot;: &quot;17.2&quot;}    | mobile      | iOS
+        3 | {&quot;os&quot;: &quot;Windows&quot;, &quot;type&quot;: &quot;desktop&quot;, &quot;version&quot;: &quot;11&quot;} | desktop     | Windows
+        4 | {&quot;os&quot;: &quot;Android&quot;, &quot;type&quot;: &quot;mobile&quot;}                   | mobile      | Android
+(4 rows)</code></pre>
+<p><code>#&gt;&gt;</code> takes the whole path in one go, which is shorter for deep documents. Array positions in a path start at 0, and a negative position counts from the end:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> payload #<span class="op">&gt;&gt;</span> <span class="st">&#39;{items,0,product_id}&#39;</span>     <span class="kw">AS</span> first_product,</span>
+<span>       payload <span class="op">-&gt;</span> <span class="st">&#39;items&#39;</span> <span class="op">-&gt;</span> <span class="op">-</span><span class="dv">1</span> <span class="op">-&gt;&gt;</span> <span class="st">&#39;qty&#39;</span>     <span class="kw">AS</span> last_item_qty</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;purchase&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> first_product | last_item_qty
+---------------+---------------
+ 42            | 2
+(1 row)</code></pre>
+<p>A key that does not exist gives SQL <code>NULL</code>, not an error, which is convenient but hides typos. One more subtlety: a JSON <code>null</code> is not SQL <code>NULL</code> with <code>-&gt;</code>. <code>'{"a":null}'::jsonb -&gt; 'a'</code> returns the JSON value <code>null</code>, and <code>-&gt;&gt;</code> returns SQL <code>NULL</code>.</p>
+<p>Values come out of <code>-&gt;&gt;</code> as <code>text</code>. To compute with them, cast:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id, (payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;price&#39;</span>):<span class="ch">:numeric</span> <span class="op">*</span> (payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;quantity&#39;</span>):<span class="ch">:int</span> <span class="kw">AS</span> line_total</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">WHERE</span> payload ? <span class="st">&#39;price&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id | line_total
+----------+------------
+        2 |    1299.99
+(1 row)</code></pre>
+<h3 id="the-comparison-mistake">The comparison mistake</h3>
+<p><code>-&gt;</code> returns <code>jsonb</code>, so comparing it with a plain string literal makes PostgreSQL try to read the literal as JSON:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> payload <span class="op">-&gt;</span> <span class="st">&#39;referrer&#39;</span> <span class="op">=</span> <span class="st">&#39;google&#39;</span>;</span></code></pre>
+<pre class="text"><code>ERROR:  invalid input syntax for type json
+DETAIL:  Token &quot;google&quot; is invalid.</code></pre>
+<p>A JSON string includes its double quotes, and <code>google</code> without quotes is not valid JSON. There are two correct forms:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;referrer&#39;</span> <span class="op">=</span> <span class="st">&#39;google&#39;</span>;</span>
+<span><span class="kw">SELECT</span> event_id <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> payload <span class="op">-&gt;</span> <span class="st">&#39;referrer&#39;</span> <span class="op">=</span> <span class="st">&#39;&quot;google&quot;&#39;</span>:<span class="ch">:jsonb</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id
+----------
+        1
+(1 row)</code></pre>
+<p>Both return event 1. Use <code>-&gt;&gt;</code> when comparing with ordinary SQL values, which is almost always the case. If you compare two <code>-&gt;</code> results with each other, they are compared as JSON.</p>
+<h2 id="containment-and-existence">Containment and existence</h2>
+<p><code>@&gt;</code> asks whether the document on the left contains the fragment on the right. A fragment can name nested objects and array members:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> payload @<span class="op">&gt;</span> <span class="st">&#39;{&quot;device&quot;: {&quot;type&quot;: &quot;mobile&quot;}}&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> event_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id
+----------
+        1
+        2
+        4
+(3 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> payload @<span class="op">&gt;</span> <span class="st">&#39;{&quot;tags&quot;: [&quot;sale&quot;]}&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> event_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id
+----------
+        1
+        3
+(2 rows)</code></pre>
+<p>The second query finds both page views, because their <code>tags</code> arrays contain <code>sale</code>. Containment on arrays matches members, not the whole array.</p>
+<p>The existence operators check keys:</p>
+<ul>
+<li><code>payload ? 'order_id'</code>: does the top-level key exist</li>
+<li><code>payload ?| ARRAY['order_id', 'product_id']</code>: does any of these keys exist</li>
+<li><code>payload ?&amp; ARRAY['device', 'url']</code>: do all of these keys exist</li>
+</ul>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id,</span>
+<span>       payload ? <span class="st">&#39;order_id&#39;</span>                           <span class="kw">AS</span> has_order_id,</span>
+<span>       payload ?| <span class="dt">ARRAY</span>[<span class="st">&#39;order_id&#39;</span>, <span class="st">&#39;product_id&#39;</span>]     <span class="kw">AS</span> has_any,</span>
+<span>       payload ?&amp; <span class="dt">ARRAY</span>[<span class="st">&#39;device&#39;</span>, <span class="st">&#39;url&#39;</span>]              <span class="kw">AS</span> has_all</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> event_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id | has_order_id | has_any | has_all
+----------+--------------+---------+---------
+        1 | f            | f       | t
+        2 | f            | t       | f
+        3 | f            | f       | t
+        4 | t            | t       | f
+(4 rows)</code></pre>
+<p><code>?</code> looks only at the top level. <code>payload ? 'type'</code> is false for every row, although <code>device.type</code> exists. For a nested key, use a JSON path expression with <code>@?</code> (PostgreSQL 12 and later):</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_id,</span>
+<span>       payload ? <span class="st">&#39;type&#39;</span>              <span class="kw">AS</span> top_level_type,</span>
+<span>       payload @? <span class="st">&#39;$.device.type&#39;</span>    <span class="kw">AS</span> nested_type,</span>
+<span>       payload @? <span class="st">&#39;$.items[*] ? (@.qty &gt; 1)&#39;</span> <span class="kw">AS</span> has_item_with_qty_over_1</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> event_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id | top_level_type | nested_type | has_item_with_qty_over_1
+----------+----------------+-------------+--------------------------
+        1 | f              | t           | f
+        2 | f              | t           | f
+        3 | f              | t           | f
+        4 | f              | t           | t
+(4 rows)</code></pre>
+<p>The last column uses a filter inside the path: it is true when some element of <code>items</code> has <code>qty</code> above 1. The same <code>?</code> can be asked as containment, <code>payload @&gt; '{"device": {}}'</code>, but that only tells you that <code>device</code> is an object.</p>
+<h2 id="which-index-serves-which-query">Which index serves which query</h2>
+<p>Four rows say nothing about indexes, so here is a table of 200,000 events with the same shape of data:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_events (</span>
+<span>    event_id    <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    user_id     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    event_type  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    occurred_at <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    payload     JSONB <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_events (user_id, event_type, occurred_at, payload)</span>
+<span><span class="kw">SELECT</span> g % <span class="dv">5000</span>,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;purchase&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;page_view&#39;</span> <span class="cf">END</span>,</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-01&#39;</span> <span class="op">+</span> g <span class="op">*</span> <span class="dt">interval</span> <span class="st">&#39;1 second&#39;</span>,</span>
+<span>       jsonb_strip_nulls(jsonb_build_object(</span>
+<span>           <span class="st">&#39;url&#39;</span>,      <span class="st">&#39;/products/p&#39;</span> <span class="op">||</span> (g % <span class="dv">1000</span>),</span>
+<span>           <span class="st">&#39;device&#39;</span>,   jsonb_build_object(<span class="st">&#39;type&#39;</span>, (<span class="dt">ARRAY</span>[<span class="st">&#39;mobile&#39;</span>,<span class="st">&#39;desktop&#39;</span>,<span class="st">&#39;tablet&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">3</span>],</span>
+<span>                                          <span class="st">&#39;os&#39;</span>,   (<span class="dt">ARRAY</span>[<span class="st">&#39;iOS&#39;</span>,<span class="st">&#39;Android&#39;</span>,<span class="st">&#39;Windows&#39;</span>,<span class="st">&#39;macOS&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">4</span>]),</span>
+<span>           <span class="st">&#39;tags&#39;</span>,     <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">500</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> jsonb_build_array(<span class="st">&#39;sale&#39;</span>, <span class="st">&#39;beta&#39;</span>)</span>
+<span>                            <span class="cf">ELSE</span> jsonb_build_array(<span class="st">&#39;sale&#39;</span>) <span class="cf">END</span>,</span>
+<span>           <span class="st">&#39;order_id&#39;</span>, <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">500</span> <span class="op">=</span> <span class="dv">1</span> <span class="cf">THEN</span> g <span class="cf">END</span>))</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) g;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> big_events;</span></code></pre>
+<p>Of the 200,000 rows, 400 have a <code>beta</code> tag, 400 have an <code>order_id</code>, and 200 have the url <code>/products/p42</code>. These are selective filters, which is when an index pays off. The plan lines below show the shape that matters: <code>Seq Scan</code> against <code>Bitmap Index Scan</code>. The number of parallel workers on a <code>Gather</code> node depends on the machine.</p>
+<p>Without any index, a filter on a field is a scan of the whole table:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;url&#39;</span> <span class="op">=</span> <span class="st">&#39;/products/p42&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                   QUERY PLAN
+---------------------------------------------------------------------------------
+ Finalize Aggregate
+   -&gt;  Gather
+         Workers Planned: 2
+         -&gt;  Partial Aggregate
+               -&gt;  Parallel Seq Scan on big_events
+                     Filter: ((payload -&gt;&gt; &#39;url&#39;::text) = &#39;/products/p42&#39;::text)
+(6 rows)</code></pre>
+<h3 id="expression-index-one-known-field">Expression index: one known field</h3>
+<p>If queries always filter on the same field, index that expression. The query has to use the same expression:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_events_url_idx <span class="kw">ON</span> big_events ((payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;url&#39;</span>));</span>
+<span><span class="kw">ANALYZE</span> big_events;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;url&#39;</span> <span class="op">=</span> <span class="st">&#39;/products/p42&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                  QUERY PLAN
+-------------------------------------------------------------------------------
+ Aggregate
+   -&gt;  Bitmap Heap Scan on big_events
+         Recheck Cond: ((payload -&gt;&gt; &#39;url&#39;::text) = &#39;/products/p42&#39;::text)
+         -&gt;  Bitmap Index Scan on big_events_url_idx
+               Index Cond: ((payload -&gt;&gt; &#39;url&#39;::text) = &#39;/products/p42&#39;::text)
+(5 rows)</code></pre>
+<p>This is an ordinary B-tree on text, so it also supports <code>=</code>, <code>IN</code>, ranges and <code>ORDER BY</code> on that field, and <code>ANALYZE</code> collects statistics for the expression, which gives the planner a real selectivity estimate.</p>
+<h3 id="gin-index-arbitrary-containment-and-existence">GIN index: arbitrary containment and existence</h3>
+<p>A GIN index on the whole column serves <code>@&gt;</code>, <code>?</code>, <code>?|</code>, <code>?&amp;</code> and the path operators <code>@?</code> and <code>@@</code>:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_events_gin_idx <span class="kw">ON</span> big_events <span class="kw">USING</span> gin (payload);</span>
+<span><span class="kw">ANALYZE</span> big_events;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload @<span class="op">&gt;</span> <span class="st">&#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+--------------------------------------------------------------------
+ Aggregate
+   -&gt;  Bitmap Heap Scan on big_events
+         Recheck Cond: (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb)
+         -&gt;  Bitmap Index Scan on big_events_gin_idx
+               Index Cond: (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb)
+(5 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload ? <span class="st">&#39;order_id&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                       QUERY PLAN
+--------------------------------------------------------
+ Aggregate
+   -&gt;  Bitmap Heap Scan on big_events
+         Recheck Cond: (payload ? &#39;order_id&#39;::text)
+         -&gt;  Bitmap Index Scan on big_events_gin_idx
+               Index Cond: (payload ? &#39;order_id&#39;::text)
+(5 rows)</code></pre>
+<p>Both plans use the GIN index. The index does not help <code>-&gt;&gt;</code> comparisons. For <code>payload -&gt;&gt; 'url' = ...</code> the planner only considers the B-tree expression index; without it, the GIN index would be ignored and the table scanned. Two indexes can also be combined in one plan when a query has both kinds of condition:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events</span>
+<span><span class="kw">WHERE</span> payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;url&#39;</span> <span class="op">=</span> <span class="st">&#39;/products/p42&#39;</span> <span class="kw">AND</span> payload @<span class="op">&gt;</span> <span class="st">&#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                        QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   -&gt;  Bitmap Heap Scan on big_events
+         Recheck Cond: (((payload -&gt;&gt; &#39;url&#39;::text) = &#39;/products/p42&#39;::text) AND (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb))
+         -&gt;  BitmapAnd
+               -&gt;  Bitmap Index Scan on big_events_url_idx
+                     Index Cond: ((payload -&gt;&gt; &#39;url&#39;::text) = &#39;/products/p42&#39;::text)
+               -&gt;  Bitmap Index Scan on big_events_gin_idx
+                     Index Cond: (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb)
+(8 rows)</code></pre>
+<p><code>BitmapAnd</code> intersects the two bitmaps before visiting the table.</p>
+<h3 id="jsonb_path_ops-smaller-containment-only">jsonb_path_ops: smaller, containment only</h3>
+<p><code>jsonb_path_ops</code> indexes hashes of paths and values. It supports <code>@&gt;</code>, <code>@?</code> and <code>@@</code>, and not the key-existence operators:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_events_pathops_idx <span class="kw">ON</span> big_events <span class="kw">USING</span> gin (payload jsonb_path_ops);</span>
+<span></span>
+<span><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;big_events_gin_idx&#39;</span>))     <span class="kw">AS</span> default_gin,</span>
+<span>       pg_size_pretty(pg_relation_size(<span class="st">&#39;big_events_pathops_idx&#39;</span>)) <span class="kw">AS</span> path_ops;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> default_gin | path_ops
+-------------+----------
+ 3048 kB     | 1904 kB
+(1 row)</code></pre>
+<p>On this data the <code>jsonb_path_ops</code> index is about 60% of the default one. How much smaller it is depends on the data; do not count on a fixed ratio. To see the limitation, drop the default index and ask for key existence:</p>
+<pre class="code"><code><span><span class="kw">DROP</span> <span class="kw">INDEX</span> big_events_gin_idx;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload ? <span class="st">&#39;order_id&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ Finalize Aggregate
+   -&gt;  Gather
+         Workers Planned: 2
+         -&gt;  Partial Aggregate
+               -&gt;  Parallel Seq Scan on big_events
+                     Filter: (payload ? &#39;order_id&#39;::text)
+(6 rows)</code></pre>
+<p>With only the <code>jsonb_path_ops</code> index, <code>?</code> is a sequential scan. Containment still uses it:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> payload @<span class="op">&gt;</span> <span class="st">&#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+--------------------------------------------------------------------
+ Aggregate
+   -&gt;  Bitmap Heap Scan on big_events
+         Recheck Cond: (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb)
+         -&gt;  Bitmap Index Scan on big_events_pathops_idx
+               Index Cond: (payload @&gt; &#39;{&quot;tags&quot;: [&quot;beta&quot;]}&#39;::jsonb)
+(5 rows)</code></pre>
+<p>So: use the default operator class if you need <code>?</code>, <code>?|</code> or <code>?&amp;</code>, and <code>jsonb_path_ops</code> if you only ever use containment and want a smaller, faster index.</p>
+<h3 id="generated-column-promote-a-field">Generated column: promote a field</h3>
+<p>If you read or filter a field all the time, expose it as a stored generated column. It then behaves like any column, with its own statistics, index and type:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> big_events</span>
+<span>    <span class="kw">ADD</span> <span class="kw">COLUMN</span> url TEXT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> (payload <span class="op">-&gt;&gt;</span> <span class="st">&#39;url&#39;</span>) STORED;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_events_url_col_idx <span class="kw">ON</span> big_events (url);</span>
+<span><span class="kw">ANALYZE</span> big_events;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> big_events <span class="kw">WHERE</span> url <span class="op">=</span> <span class="st">&#39;/products/p42&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> count
+-------
+   200
+(1 row)</code></pre>
+<p>The column costs storage for a second copy of the value and is recomputed when the row is written. Queries then write <code>url = ...</code> instead of repeating the expression.</p>
+<h2 id="turning-arrays-into-rows">Turning arrays into rows</h2>
+<p><code>jsonb_array_elements</code> expands a JSON array into one row per element, which is the way to join or aggregate over array contents:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> e.event_id,</span>
+<span>       (item <span class="op">-&gt;&gt;</span> <span class="st">&#39;product_id&#39;</span>):<span class="ch">:int</span> <span class="kw">AS</span> product_id,</span>
+<span>       (item <span class="op">-&gt;&gt;</span> <span class="st">&#39;qty&#39;</span>):<span class="ch">:int</span>        <span class="kw">AS</span> qty</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span> e,</span>
+<span>     jsonb_array_elements(e.payload <span class="op">-&gt;</span> <span class="st">&#39;items&#39;</span>) <span class="kw">AS</span> item</span>
+<span><span class="kw">WHERE</span> e.event_type <span class="op">=</span> <span class="st">&#39;purchase&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> product_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id | product_id | qty
+----------+------------+-----
+        4 |          7 |   2
+        4 |         42 |   1
+(2 rows)</code></pre>
+<p>Events without an <code>items</code> array produce no rows here, since <code>jsonb_array_elements(NULL)</code> is empty.</p>
+<h2 id="jsonb_agg">jsonb_agg</h2>
+<p><code>jsonb_agg</code> collects the values of a group into one JSON array, which is handy for building an API response in the query:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> user_id,</span>
+<span>       jsonb_agg(jsonb_build_object(<span class="st">&#39;type&#39;</span>, event_type, <span class="st">&#39;at&#39;</span>, occurred_at)</span>
+<span>                 <span class="kw">ORDER</span> <span class="kw">BY</span> occurred_at <span class="kw">DESC</span>) <span class="kw">AS</span> <span class="kw">events</span></span>
+<span><span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> user_id</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                                                   events
+---------+------------------------------------------------------------------------------------------------------------
+     101 | [{&quot;at&quot;: &quot;2024-06-10T09:16:45&quot;, &quot;type&quot;: &quot;add_to_cart&quot;}, {&quot;at&quot;: &quot;2024-06-10T09:15:22&quot;, &quot;type&quot;: &quot;page_view&quot;}]
+     102 | [{&quot;at&quot;: &quot;2024-06-10T09:17:01&quot;, &quot;type&quot;: &quot;page_view&quot;}]
+     103 | [{&quot;at&quot;: &quot;2024-06-10T09:20:12&quot;, &quot;type&quot;: &quot;purchase&quot;}]
+(3 rows)</code></pre>
+<p>The aggregate builds each group's array fully before it returns it, and the result is a single value per group. For users with a handful of events that is fine. For a user with a million events it is one very large value, and aggregation gives no way to stop early: <code>LIMIT</code> applies to the output rows, not to the rows going into <code>jsonb_agg</code>. If you only need the latest few events per user, restrict the input before aggregating. With a window function:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> user_id,</span>
+<span>       jsonb_agg(jsonb_build_object(<span class="st">&#39;type&#39;</span>, event_type, <span class="st">&#39;at&#39;</span>, occurred_at)</span>
+<span>                 <span class="kw">ORDER</span> <span class="kw">BY</span> occurred_at <span class="kw">DESC</span>) <span class="kw">AS</span> latest_event</span>
+<span><span class="kw">FROM</span> (<span class="kw">SELECT</span> user_id, event_type, occurred_at,</span>
+<span>             <span class="fu">row_number</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> user_id <span class="kw">ORDER</span> <span class="kw">BY</span> occurred_at <span class="kw">DESC</span>) <span class="kw">AS</span> rn</span>
+<span>      <span class="kw">FROM</span> <span class="kw">events</span>) t</span>
+<span><span class="kw">WHERE</span> rn <span class="op">&lt;=</span> <span class="dv">1</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> user_id</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                      latest_event
+---------+--------------------------------------------------------
+     101 | [{&quot;at&quot;: &quot;2024-06-10T09:16:45&quot;, &quot;type&quot;: &quot;add_to_cart&quot;}]
+     102 | [{&quot;at&quot;: &quot;2024-06-10T09:17:01&quot;, &quot;type&quot;: &quot;page_view&quot;}]
+     103 | [{&quot;at&quot;: &quot;2024-06-10T09:20:12&quot;, &quot;type&quot;: &quot;purchase&quot;}]
+(3 rows)</code></pre>
+<p>The window version still numbers every event of every user. When there is an index on <code>(user_id, occurred_at)</code> and a list of users, a correlated subquery with <code>LIMIT</code> reads only the rows it keeps:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> events_user_time_idx <span class="kw">ON</span> <span class="kw">events</span> (user_id, occurred_at);</span>
+<span></span>
+<span><span class="kw">SELECT</span> u.user_id,</span>
+<span>       (<span class="kw">SELECT</span> jsonb_agg(jsonb_build_object(<span class="st">&#39;type&#39;</span>, e.event_type, <span class="st">&#39;at&#39;</span>, e.occurred_at)</span>
+<span>                         <span class="kw">ORDER</span> <span class="kw">BY</span> e.occurred_at <span class="kw">DESC</span>)</span>
+<span>        <span class="kw">FROM</span> (<span class="kw">SELECT</span> event_type, occurred_at</span>
+<span>              <span class="kw">FROM</span> <span class="kw">events</span></span>
+<span>              <span class="kw">WHERE</span> user_id <span class="op">=</span> u.user_id</span>
+<span>              <span class="kw">ORDER</span> <span class="kw">BY</span> occurred_at <span class="kw">DESC</span></span>
+<span>              <span class="kw">LIMIT</span> <span class="dv">1</span>) e) <span class="kw">AS</span> latest_event</span>
+<span><span class="kw">FROM</span> (<span class="kw">SELECT</span> <span class="kw">DISTINCT</span> user_id <span class="kw">FROM</span> <span class="kw">events</span>) u</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> u.user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                      latest_event
+---------+--------------------------------------------------------
+     101 | [{&quot;at&quot;: &quot;2024-06-10T09:16:45&quot;, &quot;type&quot;: &quot;add_to_cart&quot;}]
+     102 | [{&quot;at&quot;: &quot;2024-06-10T09:17:01&quot;, &quot;type&quot;: &quot;page_view&quot;}]
+     103 | [{&quot;at&quot;: &quot;2024-06-10T09:20:12&quot;, &quot;type&quot;: &quot;purchase&quot;}]
+(3 rows)</code></pre>
+<p>If the client is going to loop over the events anyway, return plain rows and group them there, so no large intermediate JSON value has to be built and parsed.</p>
+<h2 id="updating-documents">Updating documents</h2>
+<p><code>jsonb</code> has no in-place update. Changing one key writes a new version of the whole row, including the whole document, the way any <code>UPDATE</code> does. The functions below build the new document:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;add key&#39;</span>       <span class="kw">AS</span> operation, payload <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span> <span class="op">||</span> <span class="st">&#39;{&quot;rooted&quot;: false}&#39;</span>:<span class="ch">:jsonb</span> <span class="kw">AS</span> result</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id <span class="op">=</span> <span class="dv">4</span></span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;remove key&#39;</span>,    (payload <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span>) <span class="op">-</span> <span class="st">&#39;os&#39;</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id <span class="op">=</span> <span class="dv">4</span></span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;set nested&#39;</span>,    jsonb_set(payload, <span class="st">&#39;{device,type}&#39;</span>, <span class="st">&#39;&quot;tablet&quot;&#39;</span>) <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id <span class="op">=</span> <span class="dv">4</span></span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;remove nested&#39;</span>, (payload #<span class="op">-</span> <span class="st">&#39;{device,type}&#39;</span>) <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id <span class="op">=</span> <span class="dv">4</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   operation   |                        result
+---------------+------------------------------------------------------
+ add key       | {&quot;os&quot;: &quot;Android&quot;, &quot;type&quot;: &quot;mobile&quot;, &quot;rooted&quot;: false}
+ remove key    | {&quot;type&quot;: &quot;mobile&quot;}
+ set nested    | {&quot;os&quot;: &quot;Android&quot;, &quot;type&quot;: &quot;tablet&quot;}
+ remove nested | {&quot;os&quot;: &quot;Android&quot;}
+(4 rows)</code></pre>
+<p>Each expression can be used on the right of <code>UPDATE ... SET payload = ...</code>. A few points to know:</p>
+<p><code>||</code> merges objects at the top level only. If both sides have a <code>device</code> key, the right-hand one replaces the whole <code>device</code> object, not just the keys it mentions:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;{&quot;device&quot;: {&quot;os&quot;: &quot;iOS&quot;, &quot;type&quot;: &quot;mobile&quot;}}&#39;</span>:<span class="ch">:jsonb</span> <span class="op">||</span> <span class="st">&#39;{&quot;device&quot;: {&quot;os&quot;: &quot;Android&quot;}}&#39;</span>:<span class="ch">:jsonb</span> <span class="kw">AS</span> merged;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>            merged
+-------------------------------
+ {&quot;device&quot;: {&quot;os&quot;: &quot;Android&quot;}}
+(1 row)</code></pre>
+<p><code>type</code> is gone. To change one nested value, use <code>jsonb_set</code>, or subscript assignment in PostgreSQL 14 and later:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> <span class="kw">events</span></span>
+<span><span class="kw">SET</span> payload[<span class="st">&#39;device&#39;</span>][<span class="st">&#39;os&#39;</span>] <span class="op">=</span> <span class="st">&#39;&quot;iPadOS&quot;&#39;</span></span>
+<span><span class="kw">WHERE</span> event_id <span class="op">=</span> <span class="dv">1</span></span>
+<span><span class="kw">RETURNING</span> event_id, payload <span class="op">-&gt;</span> <span class="st">&#39;device&#39;</span> <span class="kw">AS</span> device;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_id |                        device
+----------+-------------------------------------------------------
+        1 | {&quot;os&quot;: &quot;iPadOS&quot;, &quot;type&quot;: &quot;mobile&quot;, &quot;version&quot;: &quot;17.2&quot;}
+(1 row)</code></pre>
+<p><code>jsonb_set</code> creates the last key of a path if it is missing, but not the objects on the way: with <code>{x,type}</code> on a document that has no <code>x</code>, it returns the document unchanged.</p>
+<p>Because every change rewrites the row, a document that is tens of kilobytes large and has one counter updated constantly is a poor fit for <code>jsonb</code>. Keep such a field in its own column.</p>
+<h2 id="when-a-column-is-better">When a column is better</h2>
+<p><code>jsonb</code> is a good fit for payloads whose shape varies by record, for stored API responses and for audit data that is written often and rarely queried by field. It is a poor fit for:</p>
+<ul>
+<li>fields that are in every query. Put them in columns, or promote them with a generated column as above.</li>
+<li>values that must reference other tables. A foreign key cannot point inside a document.</li>
+<li>constraints. <code>NOT NULL</code>, <code>CHECK</code> and typed columns do not reach inside the document unless you write a <code>CHECK</code> on an expression yourself.</li>
+<li>statistics. For a <code>jsonb</code> column the planner has no per-key statistics unless you index the expression, so its row estimates for conditions like <code>payload @&gt; ...</code> are rough guesses.</li>
+<li>fields updated frequently inside a large document, for the reason above.</li>
+</ul>
+<p>A common compromise is real columns for what you filter and join on, and <code>jsonb</code> for the rest.</p>
+<h2 id="other-databases">Other databases</h2>
+<ul>
+<li>MySQL has a <code>JSON</code> type stored in a binary form, with <code>-&gt;</code> and <code>-&gt;&gt;</code> operators that take a path (<code>payload-&gt;&gt;'$.device.type'</code>), <code>JSON_CONTAINS</code>, <code>JSON_SET</code> and <code>JSON_ARRAYAGG</code>. It indexes JSON values through generated columns or multi-valued indexes, not GIN.</li>
+<li>SQL Server stores JSON as text in an <code>NVARCHAR</code> column and reads it with <code>JSON_VALUE</code> and <code>JSON_QUERY</code>, and changes it with <code>JSON_MODIFY</code>. <code>ISJSON</code> in a <code>CHECK</code> constraint validates it. Indexing goes through computed columns.</li>
+</ul>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Use <code>jsonb</code>; use <code>json</code> only when the exact original text matters.</li>
+<li><code>-&gt;</code> returns <code>jsonb</code>, <code>-&gt;&gt;</code> returns text. Compare with strings using <code>-&gt;&gt;</code>, and cast to <code>numeric</code> or <code>int</code> before doing arithmetic.</li>
+<li><code>@&gt;</code> finds containment, including inside arrays and nested objects. <code>?</code> checks only top-level keys; use <code>@?</code> with a path for nested ones.</li>
+<li>A GIN index serves <code>@&gt;</code> and the existence operators, <code>jsonb_path_ops</code> serves only containment and is smaller, and neither helps <code>-&gt;&gt;</code>. For one known field, index the expression or promote it to a generated column.</li>
+<li>Aggregate after limiting the input, not before. Update with <code>jsonb_set</code> or subscripts, remember <code>||</code> is shallow, and expect every update to rewrite the row.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day21.pdf" download>Download PDF · Day 21</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../20/">← Day 20</a>
+  <a href="../../">All 31 days</a>
+  <a href="../22/">Day 22 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/21/</span>
+</footer>
+
+</body>
+</html>

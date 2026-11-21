@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 29: Second-Order SQL Injection: When the Payload Comes From Your Own Database · #31DaysMaySQL</title>
+<meta name="description" content="A value stored safely through a parameterized INSERT can still inject SQL months later, when another job concatenates it into a new query. A runnable demonstration in PL/pgSQL, and the fixes: parameters, format() with %L and %I, and allowlists.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 29: Second-Order SQL Injection: When the Payload Comes From Your Own Database">
+<meta property="og:description" content="A value stored safely through a parameterized INSERT can still inject SQL months later, when another job concatenates it into a new query. A runnable demonstration in PL/pgSQL, and the fixes: parameters, format() with %L and %I, and allowlists.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../28/">← Day 28</a><a href="../30/">Day 30 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 29</p>
+  <h1>Second-Order SQL Injection: When the Payload Comes From Your Own Database</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A support ticket arrives: the admin tool throws a syntax error whenever someone reviews the user "Pat O'Brien". The signup form has used parameterized queries from day one, the code review checklist has a line about string concatenation, and the linter is green. The error comes from a different place. The admin tool reads the display name back out of the database and pastes it into the SQL text of an audit-log <code>INSERT</code>.</p>
+<p>An apostrophe in a name is the harmless version of this bug. Someone who wants to do damage picks a different name, and the stored value then runs as SQL the next time something concatenates it. That is second-order (or stored) SQL injection: the payload goes in through a safe door, sits in a table, and fires later in a query written by someone who assumed data from our own database is clean.</p>
+<p>The demonstrations below run on PostgreSQL 18 and use PL/pgSQL, so everything can be executed here. The mechanism is the same in application code: a Python f-string does exactly what <code>||</code> does in the functions below. The rule that fixes it, "never build SQL text out of values", holds for every database and driver.</p>
+<h2 id="storing-the-payload-is-safe">Storing the payload is safe</h2>
+<p>These tables are used throughout. <code>activities</code> has a <code>is_hidden</code> flag for rows an admin should not see in the normal view:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span>    user_id       <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    email         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">UNIQUE</span>,</span>
+<span>    display_name  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> audit_log (</span>
+<span>    log_id  SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    event   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> activities (</span>
+<span>    activity_id  SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    username     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    action       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    is_hidden    <span class="dt">BOOLEAN</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> activities (username, action, is_hidden) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Ann&#39;</span>, <span class="st">&#39;logged in&#39;</span>,           <span class="kw">false</span>),</span>
+<span>    (<span class="st">&#39;Ann&#39;</span>, <span class="st">&#39;exported salary data&#39;</span>, <span class="kw">true</span>);</span></code></pre>
+<p>The signup path uses a prepared statement, so the values travel separately from the SQL text. Four people sign up. Three of the names are hostile:</p>
+<pre class="code"><code><span><span class="kw">PREPARE</span> signup(<span class="dt">INT</span>, TEXT, TEXT) <span class="kw">AS</span></span>
+<span>    <span class="kw">INSERT</span> <span class="kw">INTO</span> users (user_id, email, display_name) <span class="kw">VALUES</span> ($<span class="dv">1</span>, $<span class="dv">2</span>, $<span class="dv">3</span>);</span>
+<span></span>
+<span><span class="kw">EXECUTE</span> signup(<span class="dv">1</span>, <span class="st">&#39;ann@example.com&#39;</span>, <span class="st">&#39;Ann&#39;</span>);</span>
+<span><span class="kw">EXECUTE</span> signup(<span class="dv">2</span>, <span class="st">&#39;pat@example.com&#39;</span>, <span class="st">&#39;Pat O</span><span class="ch">&#39;&#39;</span><span class="st">Brien&#39;</span>);</span>
+<span><span class="kw">EXECUTE</span> signup(<span class="dv">3</span>, <span class="st">&#39;mal@example.com&#39;</span>, <span class="st">&#39;x</span><span class="ch">&#39;&#39;</span><span class="st">), (</span><span class="ch">&#39;&#39;</span><span class="st">forged: refund approved by admin&#39;</span>);</span>
+<span><span class="kw">EXECUTE</span> signup(<span class="dv">4</span>, <span class="st">&#39;tom@example.com&#39;</span>, <span class="st">&#39;Tom</span><span class="ch">&#39;&#39;</span><span class="st">); UPDATE users SET display_name = </span><span class="ch">&#39;&#39;</span><span class="st">pwned</span><span class="ch">&#39;&#39;</span><span class="st"> WHERE user_id = 1; --&#39;</span>);</span>
+<span><span class="kw">EXECUTE</span> signup(<span class="dv">5</span>, <span class="st">&#39;eve@example.com&#39;</span>, <span class="st">&#39;Ann</span><span class="ch">&#39;&#39;</span><span class="st"> --&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> user_id, display_name <span class="kw">FROM</span> users <span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                             display_name
+---------+----------------------------------------------------------------------
+       1 | Ann
+       2 | Pat O&#39;Brien
+       3 | x&#39;), (&#39;forged: refund approved by admin
+       4 | Tom&#39;); UPDATE users SET display_name = &#39;pwned&#39; WHERE user_id = 1; --
+       5 | Ann&#39; --
+(5 rows)</code></pre>
+<p>Every name is stored exactly as typed, quotes and semicolons included. This is the correct behaviour: the signup code did nothing wrong, and escaping the value before storing it would be a bug of its own (the user would see doubled quotes everywhere). Safety is decided when a query is built, not when a value is saved.</p>
+<h2 id="the-vulnerable-tool">The vulnerable tool</h2>
+<p>The admin tool records a moderation event. It looks up the name and builds the <code>INSERT</code> as a string:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">PROCEDURE</span> log_review_unsafe(p_user_id <span class="dt">INT</span>)</span>
+<span>LANGUAGE plpgsql <span class="kw">AS</span> $$</span>
+<span><span class="kw">DECLARE</span></span>
+<span>    v_name TEXT;</span>
+<span><span class="cf">BEGIN</span></span>
+<span>    <span class="kw">SELECT</span> display_name <span class="kw">INTO</span> v_name <span class="kw">FROM</span> users <span class="kw">WHERE</span> user_id <span class="op">=</span> p_user_id;</span>
+<span>    <span class="kw">EXECUTE</span> <span class="st">&#39;INSERT INTO audit_log (event) VALUES (</span><span class="ch">&#39;&#39;</span><span class="st">Admin reviewed user: &#39;</span> <span class="op">||</span> v_name <span class="op">||</span> <span class="st">&#39;</span><span class="ch">&#39;&#39;</span><span class="st">)&#39;</span>;</span>
+<span><span class="cf">END</span></span>
+<span>$$;</span></code></pre>
+<p>The Python equivalent is <code>cursor.execute(f"INSERT INTO audit_log (event) VALUES ('Admin reviewed user: {name}')")</code>. It works for Ann:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> log_review_unsafe(<span class="dv">1</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> log_id, event <span class="kw">FROM</span> audit_log <span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> log_id |          event
+--------+--------------------------
+      1 | Admin reviewed user: Ann
+(1 row)</code></pre>
+<h3 id="the-apostrophe">The apostrophe</h3>
+<p>For Pat the generated statement is <code>VALUES ('Admin reviewed user: Pat O'Brien')</code>, which is not valid SQL:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> log_review_unsafe(<span class="dv">2</span>);</span></code></pre>
+<pre class="text"><code>ERROR:  syntax error at or near &quot;Brien&quot;
+LINE 1: ...udit_log (event) VALUES (&#39;Admin reviewed user: Pat O&#39;Brien&#39;)
+                                                                ^
+QUERY:  INSERT INTO audit_log (event) VALUES (&#39;Admin reviewed user: Pat O&#39;Brien&#39;)
+CONTEXT:  PL/pgSQL function log_review_unsafe(integer) line 6 at EXECUTE</code></pre>
+<p>This is how most second-order injections get noticed: as a bug report about a user with a quote in their name. If the failure is the only symptom you ever see, you are looking at the harmless case of a hole that is open.</p>
+<h3 id="forging-data">Forging data</h3>
+<p>Mallory's name closes the string and the row, then starts another row:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> log_review_unsafe(<span class="dv">3</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> log_id, event <span class="kw">FROM</span> audit_log <span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> log_id |              event
+--------+----------------------------------
+      1 | Admin reviewed user: Ann
+      2 | Admin reviewed user: x
+      3 | forged: refund approved by admin
+(3 rows)</code></pre>
+<p>Reviewing Mallory wrote two rows, and the second one is text of Mallory's choosing in the audit log. In a table that other systems trust, such as a payments queue or a permissions table, that is real damage.</p>
+<h3 id="running-other-statements">Running other statements</h3>
+<p>Tom's name ends the <code>INSERT</code> and appends an <code>UPDATE</code>:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> log_review_unsafe(<span class="dv">4</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> user_id, display_name <span class="kw">FROM</span> users <span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                             display_name
+---------+----------------------------------------------------------------------
+       1 | pwned
+       2 | Pat O&#39;Brien
+       3 | x&#39;), (&#39;forged: refund approved by admin
+       4 | Tom&#39;); UPDATE users SET display_name = &#39;pwned&#39; WHERE user_id = 1; --
+       5 | Ann&#39; --
+(5 rows)</code></pre>
+<p>Ann's name is now <code>pwned</code>. The same shape drops a table, as in the classic <code>'); DROP TABLE audit_log; --</code>. Two things limit this variant. A driver that sends the statement with bound parameters through PostgreSQL's extended protocol rejects a text containing several commands, so stacked statements depend on the driver and call path; here <code>EXECUTE</code> of a plain string allows them. And the application role's privileges bound the damage, which is a reason to give the admin tool a role that cannot drop or update arbitrary tables. Neither limit helps against the forged-row case above, which uses only the <code>INSERT</code> the tool was already allowed to run.</p>
+<p>Put Ann's name back before going on:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users <span class="kw">SET</span> display_name <span class="op">=</span> <span class="st">&#39;Ann&#39;</span> <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1</span>;</span></code></pre>
+<h3 id="bypassing-a-filter">Bypassing a filter</h3>
+<p>A comment marker turns off whatever follows the concatenated value. A second tool lists a user's visible activity, looking the user up by ID and then querying <code>activities</code> by name:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> activity_for_user_unsafe(p_user_id <span class="dt">INT</span>)</span>
+<span>RETURNS SETOF activities</span>
+<span>LANGUAGE plpgsql <span class="kw">AS</span> $$</span>
+<span><span class="kw">DECLARE</span></span>
+<span>    v_name TEXT;</span>
+<span><span class="cf">BEGIN</span></span>
+<span>    <span class="kw">SELECT</span> display_name <span class="kw">INTO</span> v_name <span class="kw">FROM</span> users <span class="kw">WHERE</span> user_id <span class="op">=</span> p_user_id;</span>
+<span>    <span class="kw">RETURN</span> <span class="kw">QUERY</span> <span class="kw">EXECUTE</span></span>
+<span>        <span class="st">&#39;SELECT * FROM activities WHERE username = </span><span class="ch">&#39;&#39;</span><span class="st">&#39;</span> <span class="op">||</span> v_name <span class="op">||</span> <span class="st">&#39;</span><span class="ch">&#39;&#39;</span><span class="st"> AND NOT is_hidden ORDER BY activity_id&#39;</span>;</span>
+<span><span class="cf">END</span></span>
+<span>$$;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> activity_for_user_unsafe(<span class="dv">1</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> activity_id | username |  action   | is_hidden
+-------------+----------+-----------+-----------
+           1 | Ann      | logged in | f
+(1 row)</code></pre>
+<p>User 5 registered as <code>Ann' --</code>. The query text becomes <code>... WHERE username = 'Ann' --' AND NOT is_hidden</code>, so the <code>--</code> removes the visibility filter, and the tool shows the hidden row for a different person, Ann:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> activity_for_user_unsafe(<span class="dv">5</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> activity_id | username |        action        | is_hidden
+-------------+----------+----------------------+-----------
+           1 | Ann      | logged in            | f
+           2 | Ann      | exported salary data | t
+(2 rows)</code></pre>
+<h2 id="why-it-passes-review">Why it passes review</h2>
+<p>Each piece is correct on its own. The signup <code>INSERT</code> is parameterized and the <code>SELECT</code> that reads the name is parameterized. The unsafe line is a third query, often in another file or service, and its input comes from "our own database". A scanner that flags string building near an <code>execute</code> call can catch it, but only when the concatenation is in the same function as the call. Tests rarely contain a user named <code>x'), ('forged...</code>, and the trigger can come months after the payload was stored, which makes the cause hard to find.</p>
+<p>The mental error is treating safety as a property of the data: "user input is dangerous, database content is clean". Safety is a property of how the query is built. Any value that ends up inside SQL text through string building is an injection point, whatever table it came from.</p>
+<h2 id="the-fix-do-not-build-sql-from-values">The fix: do not build SQL from values</h2>
+<p>In PL/pgSQL, plain SQL statements already use their variables as parameters. The rewrite of the first tool needs no dynamic SQL at all:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">PROCEDURE</span> log_review_safe(p_user_id <span class="dt">INT</span>)</span>
+<span>LANGUAGE plpgsql <span class="kw">AS</span> $$</span>
+<span><span class="cf">BEGIN</span></span>
+<span>    <span class="kw">INSERT</span> <span class="kw">INTO</span> audit_log (event)</span>
+<span>    <span class="kw">SELECT</span> <span class="st">&#39;Admin reviewed user: &#39;</span> <span class="op">||</span> display_name</span>
+<span>    <span class="kw">FROM</span> users</span>
+<span>    <span class="kw">WHERE</span> user_id <span class="op">=</span> p_user_id;</span>
+<span><span class="cf">END</span></span>
+<span>$$;</span>
+<span></span>
+<span><span class="kw">TRUNCATE</span> audit_log RESTART IDENTITY;</span>
+<span></span>
+<span><span class="kw">CALL</span> log_review_safe(<span class="dv">2</span>);</span>
+<span><span class="kw">CALL</span> log_review_safe(<span class="dv">3</span>);</span>
+<span><span class="kw">CALL</span> log_review_safe(<span class="dv">4</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> log_id, event <span class="kw">FROM</span> audit_log <span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> log_id |                                           event
+--------+-------------------------------------------------------------------------------------------
+      1 | Admin reviewed user: Pat O&#39;Brien
+      2 | Admin reviewed user: x&#39;), (&#39;forged: refund approved by admin
+      3 | Admin reviewed user: Tom&#39;); UPDATE users SET display_name = &#39;pwned&#39; WHERE user_id = 1; --
+(3 rows)</code></pre>
+<p>The concatenation <code>'Admin reviewed user: ' || display_name</code> still happens, but it builds a value, not SQL text, so the apostrophes are just characters. Pat's name works, and the two hostile names are stored in the log as the text they are.</p>
+<p>When a statement really has to be dynamic, pass values with <code>USING</code>. They arrive as <code>$1</code>, <code>$2</code> and are never parsed as SQL:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> activity_for_user_safe(p_user_id <span class="dt">INT</span>)</span>
+<span>RETURNS SETOF activities</span>
+<span>LANGUAGE plpgsql <span class="kw">AS</span> $$</span>
+<span><span class="kw">DECLARE</span></span>
+<span>    v_name TEXT;</span>
+<span><span class="cf">BEGIN</span></span>
+<span>    <span class="kw">SELECT</span> display_name <span class="kw">INTO</span> v_name <span class="kw">FROM</span> users <span class="kw">WHERE</span> user_id <span class="op">=</span> p_user_id;</span>
+<span>    <span class="kw">RETURN</span> <span class="kw">QUERY</span> <span class="kw">EXECUTE</span></span>
+<span>        <span class="st">&#39;SELECT * FROM activities WHERE username = $1 AND NOT is_hidden ORDER BY activity_id&#39;</span></span>
+<span>        <span class="kw">USING</span> v_name;</span>
+<span><span class="cf">END</span></span>
+<span>$$;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> activity_for_user_safe(<span class="dv">5</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> activity_id | username | action | is_hidden
+-------------+----------+--------+-----------
+(0 rows)</code></pre>
+<p>Eve's name <code>Ann' --</code> is now looked up as a literal and matches nobody. The same call for user 1 returns Ann's visible row. In application code this is <code>cursor.execute("... WHERE username = %s AND NOT is_hidden", (name,))</code>, with the value in the second argument and never formatted into the string.</p>
+<h3 id="if-you-must-build-the-string">If you must build the string</h3>
+<p>Sometimes a value has to go into SQL text, for example in a <code>DO</code> block or a script generator. <code>format()</code> has two placeholders for that: <code>%L</code> quotes a literal and <code>%I</code> quotes an identifier. With the hostile name from user 3:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> format(<span class="st">&#39;INSERT INTO audit_log (event) VALUES (%L)&#39;</span>, <span class="st">&#39;Admin reviewed user: &#39;</span> <span class="op">||</span> display_name) <span class="kw">AS</span> statement</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                statement
+---------------------------------------------------------------------------------------------------------
+ INSERT INTO audit_log (event) VALUES (&#39;Admin reviewed user: x&#39;&#39;), (&#39;&#39;forged: refund approved by admin&#39;)
+(1 row)</code></pre>
+<p>The embedded quotes are doubled, so the whole name stays inside one string literal. <code>%L</code> also handles two things hand-written escaping gets wrong: a <code>NULL</code> becomes the keyword <code>NULL</code>, and a backslash makes it emit an <code>E''</code> string so the result means the same thing under any <code>standard_conforming_strings</code> setting:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> format(<span class="st">&#39;%L&#39;</span>, <span class="kw">NULL</span>:<span class="ch">:text</span>) <span class="kw">AS</span> null_value, format(<span class="st">&#39;%L&#39;</span>, <span class="st">&#39;a</span><span class="ch">\b</span><span class="st">&#39;</span>) <span class="kw">AS</span> backslash;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> null_value | backslash
+------------+-----------
+ NULL       | E&#39;a\\b&#39;
+(1 row)</code></pre>
+<p>Prefer <code>USING</code> whenever the position accepts a parameter, and use <code>%L</code> only for the cases that do not.</p>
+<h2 id="identifiers-cannot-be-parameters">Identifiers cannot be parameters</h2>
+<p>Parameters stand in for values. Table names, column names and <code>ASC</code>/<code>DESC</code> cannot be parameters, so a dynamic <code>ORDER BY</code> always means building text. A saved sort preference that was stored as <code>name; DROP TABLE products; --</code> is the second-order version of this. Quote it with <code>%I</code>, which turns the whole string into a single identifier:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> format(<span class="st">&#39;SELECT * FROM products ORDER BY %I&#39;</span>, <span class="st">&#39;name; DROP TABLE products; --&#39;</span>) <span class="kw">AS</span> statement;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                            statement
+-----------------------------------------------------------------
+ SELECT * FROM products ORDER BY &quot;name; DROP TABLE products; --&quot;
+(1 row)</code></pre>
+<p>That statement is harmless: it fails because no column has that name. Quoting alone still lets a caller sort by any column, including ones that should not be exposed (ordering by a column leaks information about its values even when the column is not shown), so pair <code>%I</code> with an allowlist. Check the identifier against the list you meant to support, and map the direction instead of passing it through:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> products (</span>
+<span>    product_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name        TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    price       <span class="dt">NUMERIC</span>(<span class="dv">8</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    <span class="kw">cost</span>        <span class="dt">NUMERIC</span>(<span class="dv">8</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>  <span class="co">-- internal, not for customers</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> products <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Desk&#39;</span>,  <span class="fl">250.00</span>, <span class="fl">120.00</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Chair&#39;</span>, <span class="fl">120.00</span>,  <span class="fl">90.00</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Lamp&#39;</span>,   <span class="fl">40.00</span>,  <span class="fl">10.00</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> list_products(p_sort TEXT, p_desc <span class="dt">BOOLEAN</span> <span class="kw">DEFAULT</span> <span class="kw">false</span>)</span>
+<span>RETURNS <span class="kw">TABLE</span> (product_id <span class="dt">INT</span>, name TEXT, price <span class="dt">NUMERIC</span>)</span>
+<span>LANGUAGE plpgsql <span class="kw">AS</span> $$</span>
+<span><span class="cf">BEGIN</span></span>
+<span>    <span class="cf">IF</span> p_sort <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="st">&#39;name&#39;</span>, <span class="st">&#39;price&#39;</span>) <span class="cf">THEN</span></span>
+<span>        RAISE <span class="kw">EXCEPTION</span> <span class="st">&#39;cannot sort by %&#39;</span>, p_sort <span class="kw">USING</span> ERRCODE <span class="op">=</span> <span class="st">&#39;22023&#39;</span>;</span>
+<span>    <span class="cf">END</span> <span class="cf">IF</span>;</span>
+<span>    <span class="kw">RETURN</span> <span class="kw">QUERY</span> <span class="kw">EXECUTE</span> format(</span>
+<span>        <span class="st">&#39;SELECT p.product_id, p.name, p.price FROM products p ORDER BY %I %s&#39;</span>,</span>
+<span>        p_sort,</span>
+<span>        <span class="cf">CASE</span> <span class="cf">WHEN</span> p_desc <span class="cf">THEN</span> <span class="st">&#39;DESC&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;ASC&#39;</span> <span class="cf">END</span>);</span>
+<span><span class="cf">END</span></span>
+<span>$$;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> list_products(<span class="st">&#39;price&#39;</span>, <span class="kw">true</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> product_id | name  | price
+------------+-------+--------
+          1 | Desk  | 250.00
+          2 | Chair | 120.00
+          3 | Lamp  |  40.00
+(3 rows)</code></pre>
+<p><code>list_products('cost')</code> and the DROP string are both refused with <code>cannot sort by ...</code> before any SQL is built. In psycopg the same two pieces are <code>psycopg.sql.Identifier(col)</code> (or <code>psycopg2.sql.Identifier</code>) for the quoting and a Python set for the allowlist:</p>
+<p>```python norun from psycopg import sql</p>
+<p>ALLOWED_SORT = {"name", "price"} if sort_column not in ALLOWED_SORT: raise ValueError(f"cannot sort by {sort_column}")</p>
+<p>query = sql.SQL("SELECT * FROM products ORDER BY {col}").format(col=sql.Identifier(sort_column)) cursor.execute(query)</p>
+<pre><code>
+Saved filters are a case with no clean fix. If users store a `WHERE` clause as text and the application runs it, the stored text is the payload by design. Store a structured filter (column, operator, value) and build the query from an allowlist of columns and operators, with the value as a parameter.
+
+## Why validating input is the wrong layer
+
+Rejecting quotes at signup fails on its own terms: &quot;O&#39;Brien&quot; is a real name, and a filter that blocks it breaks real users while a determined attacker moves to some other payload. It also does nothing about data that already exists, or that enters through an import, an API or a replicated feed, none of which pass through the signup form. Validation is worth having for business rules (length, allowed characters in a username), as a second layer. Structure is protected by keeping values out of SQL text.
+
+## Finding it in an existing system
+
+Search the code for SQL built from strings (f-strings, `+`, `.format`, `%` formatting, template literals) near `execute`, and read each hit with the question &quot;where does this value come from?&quot; instead of &quot;is this user input?&quot;. Dynamic `ORDER BY`, `GROUP BY` and table names deserve a separate pass.
+
+Inside the database, functions that build SQL text are easy to list. This query is crude and will miss `format(&#39;%s&#39;, ...)`, but it finds the pattern used above:
+
+```sql
+SELECT proname
+FROM pg_proc
+WHERE pronamespace = &#39;public&#39;::regnamespace
+  AND prosrc ILIKE &#39;%execute%&#39;
+  AND prosrc LIKE &#39;%||%&#39;
+ORDER BY proname;</code></pre>
+<pre class="out" aria-label="Query result"><code>         proname
+--------------------------
+ activity_for_user_unsafe
+ log_review_unsafe
+(2 rows)</code></pre>
+<p>At runtime, a burst of syntax errors from an internal job on a table of user-supplied names is the signal to look for. PostgreSQL logs the failing statement text (<code>log_min_error_statement</code> defaults to <code>error</code>), which shows exactly what was concatenated. It is the same bug as the "Pat O'Brien" ticket, caught earlier.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Storing a value safely does not make it safe to use. Every query that reads it and puts it into SQL text is a new injection point.</li>
+<li>Keep values out of SQL text: static SQL, <code>EXECUTE ... USING</code>, or driver parameters. Use <code>format('%L')</code> only where a parameter is not possible.</li>
+<li>Identifiers cannot be parameters. Quote them with <code>%I</code> (or the driver's identifier type) and check them against an allowlist.</li>
+<li>Do not escape on the way in. Escaping belongs to the query builder, at the moment of use.</li>
+<li>A syntax error caused by an apostrophe in a stored value is a vulnerability report, not just a bug.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day29.pdf" download>Download PDF · Day 29</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../28/">← Day 28</a>
+  <a href="../../">All 31 days</a>
+  <a href="../30/">Day 30 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/29/</span>
+</footer>
+
+</body>
+</html>

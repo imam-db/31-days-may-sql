@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 30: Write Skew and Phantom Reads: Isolation Levels You're Getting Wrong · #31DaysMaySQL</title>
+<meta name="description" content="Two doctors go off call at the same moment and the hospital is left with nobody. Write skew, lost updates and phantoms reproduced with two real sessions on PostgreSQL 18, and what REPEATABLE READ, SERIALIZABLE and explicit locks do about each.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 30: Write Skew and Phantom Reads: Isolation Levels You're Getting Wrong">
+<meta property="og:description" content="Two doctors go off call at the same moment and the hospital is left with nobody. Write skew, lost updates and phantoms reproduced with two real sessions on PostgreSQL 18, and what REPEATABLE READ, SERIALIZABLE and explicit locks do about each.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../29/">← Day 29</a><a href="../31/">Day 31 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 30</p>
+  <h1>Write Skew and Phantom Reads: Isolation Levels You're Getting Wrong</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A hospital has one rule: at least one doctor must be on call. Alice and Bob are both on call. Each opens the app and sees that the other is on call, so each is allowed to go off call. Both transactions check the rule, both pass, both update their own row, both commit. Nobody is on call.</p>
+<p>Neither transaction did anything wrong against the data it saw. This anomaly is called write skew, and it survives <code>REPEATABLE READ</code> in PostgreSQL. This article reproduces it with two real sessions, then goes through the other anomalies the isolation levels are defined by, and finishes with the three ways of closing the gap: <code>SERIALIZABLE</code>, row locks, and advisory locks.</p>
+<p>All sessions below ran against PostgreSQL 18. In the two-session examples, the code lists the statements in the order they ran, with <code>-- A</code> and <code>-- B</code> marking the session, and the block after it shows the output that was observed.</p>
+<h2 id="the-tables">The tables</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> doctors (</span>
+<span>    doctor_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    on_call    <span class="dt">BOOLEAN</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> doctors <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>, <span class="kw">true</span>), (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>, <span class="kw">true</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> employees (</span>
+<span>    employee_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    department   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> employees <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;Ann&#39;</span>, <span class="st">&#39;Eng&#39;</span>), (<span class="dv">2</span>, <span class="st">&#39;Bo&#39;</span>, <span class="st">&#39;Eng&#39;</span>), (<span class="dv">3</span>, <span class="st">&#39;Cy&#39;</span>, <span class="st">&#39;Ops&#39;</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> accounts (</span>
+<span>    account_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    balance     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="dv">100</span>);</span></code></pre>
+<h2 id="the-four-levels-and-what-postgresql-does-with-them">The four levels and what PostgreSQL does with them</h2>
+<p>The SQL standard defines four isolation levels by which anomalies they allow. PostgreSQL implements three distinct behaviours, and its <code>REPEATABLE READ</code> is stricter than the standard asks:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Level</th>
+<th>Dirty read</th>
+<th>Non-repeatable read</th>
+<th>Phantom read</th>
+<th>Write skew</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>READ UNCOMMITTED</code> (PostgreSQL runs it as <code>READ COMMITTED</code>)</td>
+<td>not possible</td>
+<td>possible</td>
+<td>possible</td>
+<td>possible</td>
+</tr>
+<tr class="even">
+<td><code>READ COMMITTED</code> (PostgreSQL default)</td>
+<td>not possible</td>
+<td>possible</td>
+<td>possible</td>
+<td>possible</td>
+</tr>
+<tr class="odd">
+<td><code>REPEATABLE READ</code> (PostgreSQL, snapshot isolation)</td>
+<td>not possible</td>
+<td>not possible</td>
+<td>not possible</td>
+<td>possible</td>
+</tr>
+<tr class="even">
+<td><code>SERIALIZABLE</code> (PostgreSQL, SSI)</td>
+<td>not possible</td>
+<td>not possible</td>
+<td>not possible</td>
+<td>not possible</td>
+</tr>
+</tbody>
+</table>
+<p>In the standard, <code>REPEATABLE READ</code> still allows phantoms, and write skew is not in the standard's list of named anomalies at all; it is what is left when a level that is "good enough" by the standard's definitions still does not behave like running the transactions one after another. The default can be checked:</p>
+<pre class="code"><code><span>SHOW default_transaction_isolation;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> default_transaction_isolation
+-------------------------------
+ read committed
+(1 row)</code></pre>
+<p>Each of the next sections uses two sessions. To make the interleaving exact and repeatable, session A held its transaction open and ran session B as a separate <code>psql</code> process from inside it (<code>\!</code> in <code>psql</code>). The statements therefore ran in the order shown.</p>
+<h2 id="dirty-read">Dirty read</h2>
+<p>A dirty read means seeing another transaction's uncommitted change. PostgreSQL does not allow it at any level. Even <code>READ UNCOMMITTED</code> is accepted as a name and behaves like <code>READ COMMITTED</code>:</p>
+<pre class="code"><code><span><span class="co">-- A</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> UNCOMMITTED;</span>
+<span><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">0</span> <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="co">-- B (a separate session, while A is still open)</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> UNCOMMITTED;</span>
+<span><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="co">-- A</span></span>
+<span><span class="kw">ROLLBACK</span>;</span></code></pre>
+<pre class="text"><code> balance
+---------
+     100
+(1 row)</code></pre>
+<p>B sees 100, the committed value, not A's uncommitted 0. <code>SHOW transaction_isolation</code> inside such a transaction reports <code>read uncommitted</code>, so the name is kept, but the behaviour is that of <code>READ COMMITTED</code>.</p>
+<h2 id="non-repeatable-read-and-phantom-read">Non-repeatable read and phantom read</h2>
+<p>Under <code>READ COMMITTED</code>, every statement gets a fresh snapshot. A transaction that runs the same query twice can get different answers if someone commits in between. Here A counts the engineers and reads an account balance twice, and B commits an insert and an update between the two reads:</p>
+<pre class="code"><code><span><span class="co">-- A</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> <span class="kw">COMMITTED</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> employees <span class="kw">WHERE</span> department <span class="op">=</span> <span class="st">&#39;Eng&#39;</span>;   <span class="co">-- 2</span></span>
+<span><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;         <span class="co">-- 100</span></span>
+<span><span class="co">-- B (autocommit, so both statements commit immediately)</span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> employees <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="st">&#39;Dee&#39;</span>, <span class="st">&#39;Eng&#39;</span>);</span>
+<span><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">200</span> <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="co">-- A</span></span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> employees <span class="kw">WHERE</span> department <span class="op">=</span> <span class="st">&#39;Eng&#39;</span>;</span>
+<span><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="kw">COMMIT</span>;</span></code></pre>
+<pre class="text"><code> count
+-------
+     3
+
+ balance
+---------
+     200</code></pre>
+<p>The changed balance is a non-repeatable read, and the extra engineer, Dee, is a phantom: a new row that matches a predicate the transaction already queried. Run the same script with <code>BEGIN ISOLATION LEVEL REPEATABLE READ</code> and the second reads return <code>2</code> and <code>100</code>. A keeps the snapshot it took at its first statement for the whole transaction, so B's commits are invisible to it.</p>
+<p>That second result is the PostgreSQL-specific part. The standard allows phantoms at <code>REPEATABLE READ</code>; PostgreSQL's snapshot makes them impossible. In MySQL InnoDB, which also defaults to <code>REPEATABLE READ</code>, plain <code>SELECT</code>s read from a snapshot too, but locking statements (<code>SELECT ... FOR UPDATE</code>, <code>UPDATE</code>, <code>DELETE</code>) see the latest committed rows and use gap locks to keep phantoms out of the range they lock. So the level name is the same and what a transaction can observe is not, which is the usual trap when moving code between the two. Another difference is the default level itself: MySQL starts at <code>REPEATABLE READ</code>, PostgreSQL at <code>READ COMMITTED</code>.</p>
+<h2 id="lost-update">Lost update</h2>
+<p>Before write skew, a simpler problem: two transactions change the same row. An account holds 100. Two withdrawals of 80 each should leave -60, or one of them should be refused. If the application reads the balance, computes the new value and writes it back, the second write overwrites the first:</p>
+<pre class="code"><code><span><span class="co">-- A</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> <span class="kw">COMMITTED</span>;</span>
+<span><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;         <span class="co">-- 100</span></span>
+<span><span class="co">-- B (autocommit)</span></span>
+<span><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">80</span> <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="co">-- A: new value computed in the application from the 100 it read</span></span>
+<span><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">100</span> <span class="op">-</span> <span class="dv">80</span> <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="kw">COMMIT</span>;</span>
+<span><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="text"><code> balance
+---------
+      20
+(1 row)</code></pre>
+<p>Two withdrawals of 80 and the balance fell by 80. B's withdrawal vanished. At <code>REPEATABLE READ</code> the same script behaves differently: A's <code>UPDATE</code> fails with</p>
+<pre class="text"><code>ERROR:  could not serialize access due to concurrent update</code></pre>
+<p>because A's snapshot is older than B's committed change to that very row, and A's transaction is rolled back. Lost updates are therefore caught by PostgreSQL's <code>REPEATABLE READ</code> and <code>SERIALIZABLE</code>, and the application must retry. The cheaper fix is to let the database do the arithmetic (<code>SET balance = balance - 80 WHERE balance &gt;= 80</code>), which is safe at <code>READ COMMITTED</code>.</p>
+<h2 id="write-skew">Write skew</h2>
+<p>Write skew needs two transactions that read the same data and write different rows. A lost-update check cannot see a conflict, because no row is written twice. This is the on-call scenario, at <code>REPEATABLE READ</code>:</p>
+<pre class="code"><code><span><span class="co">-- A (Alice)</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> doctors <span class="kw">WHERE</span> on_call;                <span class="co">-- 2</span></span>
+<span><span class="co">-- B (Bob)</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> doctors <span class="kw">WHERE</span> on_call;                <span class="co">-- 2</span></span>
+<span><span class="kw">UPDATE</span> doctors <span class="kw">SET</span> on_call <span class="op">=</span> <span class="kw">false</span> <span class="kw">WHERE</span> doctor_id <span class="op">=</span> <span class="dv">2</span>;</span>
+<span><span class="kw">COMMIT</span>;</span>
+<span><span class="co">-- A: still believes there are two</span></span>
+<span><span class="kw">UPDATE</span> doctors <span class="kw">SET</span> on_call <span class="op">=</span> <span class="kw">false</span> <span class="kw">WHERE</span> doctor_id <span class="op">=</span> <span class="dv">1</span>;</span>
+<span><span class="kw">COMMIT</span>;</span>
+<span><span class="kw">SELECT</span> doctor_id, name, on_call <span class="kw">FROM</span> doctors <span class="kw">ORDER</span> <span class="kw">BY</span> doctor_id;</span></code></pre>
+<pre class="text"><code> doctor_id | name  | on_call
+-----------+-------+---------
+         1 | Alice | f
+         2 | Bob   | f
+(2 rows)</code></pre>
+<p>Both commits succeed and the table now violates the rule. Each transaction read a consistent snapshot and wrote a row nobody else wrote, so snapshot isolation has nothing to object to. The anomaly appears whenever a rule spans several rows (a minimum headcount, a total that must stay under a limit, a room that can be booked only once) and the check and the write are separate statements. An inventory counter on a single row is not write skew: two buyers of the last item both update that row, so it is the lost-update case above.</p>
+<h2 id="serializable">SERIALIZABLE</h2>
+<p>At <code>SERIALIZABLE</code>, PostgreSQL uses Serializable Snapshot Isolation. It runs transactions on snapshots as before but also tracks which transaction read what another one wrote, and cancels one of them when the pattern could not have happened in any one-after-the-other order. The same interleaving as above, with both sessions at <code>SERIALIZABLE</code>:</p>
+<pre class="code"><code><span><span class="co">-- A</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">SERIALIZABLE</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> doctors <span class="kw">WHERE</span> on_call;                <span class="co">-- 2</span></span>
+<span><span class="co">-- B</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">SERIALIZABLE</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> doctors <span class="kw">WHERE</span> on_call;                <span class="co">-- 2</span></span>
+<span><span class="kw">UPDATE</span> doctors <span class="kw">SET</span> on_call <span class="op">=</span> <span class="kw">false</span> <span class="kw">WHERE</span> doctor_id <span class="op">=</span> <span class="dv">2</span>;</span>
+<span><span class="kw">COMMIT</span>;                                                    <span class="co">-- succeeds</span></span>
+<span><span class="co">-- A</span></span>
+<span><span class="kw">UPDATE</span> doctors <span class="kw">SET</span> on_call <span class="op">=</span> <span class="kw">false</span> <span class="kw">WHERE</span> doctor_id <span class="op">=</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="text"><code>ERROR:  40001: could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during write.
+HINT:  The transaction might succeed if retried.</code></pre>
+<p>After A rolls back, Alice is still on call and Bob is off. Here the error came at A's <code>UPDATE</code>; it can also come at <code>COMMIT</code>, and which of the two transactions is cancelled depends on the interleaving, so the code must be prepared to handle SQLSTATE <code>40001</code> anywhere in the transaction. A retry of A runs the check again, counts one doctor on call, and the application refuses the request.</p>
+<p>The cost is real but specific:</p>
+<ul>
+<li>Aborts have to be retried, so every code path that runs at <code>SERIALIZABLE</code> needs a retry loop.</li>
+<li>PostgreSQL tracks reads with predicate locks, which it may coarsen from rows to pages to the whole relation when there are many of them. A sequential scan takes a relation-level one. Coarser locks mean more false-positive aborts, so queries on indexed access paths and short transactions abort less.</li>
+<li>It does not need extra blocking: transactions are not made to wait for each other, they are cancelled.</li>
+</ul>
+<p>A retry loop looks like this. Retry only on <code>40001</code> (and <code>40P01</code>, deadlock), cap the attempts, and back off:</p>
+<p>```python norun import time from psycopg import errors</p>
+<p>def run_serializable(conn, work, attempts=5): for attempt in range(attempts): try: with conn.transaction(): conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE") return work(conn) except (errors.SerializationFailure, errors.DeadlockDetected): if attempt == attempts - 1: raise time.sleep(0.01 * 2 ** attempt)</p>
+<pre><code>
+The `SET TRANSACTION` has to be the first statement inside the transaction. Putting it before `BEGIN`, as sometimes written, affects only the (nonexistent) current transaction and does nothing for the next one.
+
+## Closing the gap without SERIALIZABLE
+
+If the rest of the application runs at `READ COMMITTED`, one or two critical paths can serialize themselves explicitly.
+
+### Lock the rows you decide from
+
+`SELECT ... FOR UPDATE` takes row locks on the rows it returns. A second transaction doing the same blocks until the first commits, then re-checks its rows. The pattern at `READ COMMITTED`: lock every on-call doctor, then do the update conditionally. Session A starts first and sleeps for three seconds while holding its locks; session B starts one second later and has to wait:
+
+```sql
+-- both sessions run the same statements, with doctor_id 1 (A) and 2 (B)
+BEGIN;
+SELECT doctor_id FROM doctors WHERE on_call ORDER BY doctor_id FOR UPDATE;
+UPDATE doctors SET on_call = false
+WHERE doctor_id = 1                                -- 2 in session B
+  AND (SELECT count(*) FROM doctors WHERE on_call) &gt; 1;
+COMMIT;</code></pre>
+<pre class="text"><code>-- session A
+ doctor_id
+-----------
+         1
+         2
+(2 rows)
+UPDATE 1
+
+-- session B (blocked on the first statement until A committed)
+ doctor_id
+-----------
+         2
+(1 row)
+UPDATE 0</code></pre>
+<p>A locked both rows and went off call. B was blocked at <code>FOR UPDATE</code>. Once A committed, PostgreSQL re-evaluated <code>WHERE on_call</code> against A's committed row, which no longer qualified, so B locked only its own row, the count was 1, and the conditional <code>UPDATE</code> changed nothing. The application sees <code>UPDATE 0</code> and reports that the last doctor cannot leave. This works because every code path that changes on-call status takes the same locks first. A path that skips the <code>FOR UPDATE</code> is not protected, and a rule that depends on rows that do not exist yet (a booking slot with no row) has nothing to lock.</p>
+<h3 id="advisory-locks">Advisory locks</h3>
+<p>When there is no row to lock, or the rule covers a whole resource, an advisory lock gives every participant the same lock to take:</p>
+<pre class="code"><code><span><span class="cf">BEGIN</span>;</span>
+<span><span class="kw">SELECT</span> pg_advisory_xact_lock(<span class="dv">42</span>);   <span class="co">-- 42 is an application-chosen key for &quot;the on-call roster&quot;</span></span>
+<span><span class="co">-- check the rule and make the change</span></span>
+<span><span class="kw">COMMIT</span>;                             <span class="co">-- the lock is released here</span></span></code></pre>
+<p>The same two-session test with this lock at <code>READ COMMITTED</code> gave <code>UPDATE 0</code> for the second session, as above. At <code>REPEATABLE READ</code> it did not work: the second session's snapshot is taken when it runs the <code>pg_advisory_xact_lock</code> query, before it has waited, so after the wait it still sees two doctors on call and both go off. The pattern "lock, then read" needs a level where the read after the lock gets a fresh snapshot, which means <code>READ COMMITTED</code>.</p>
+<h3 id="version-columns">Version columns</h3>
+<p>Optimistic locking with a <code>version</code> column (<code>UPDATE ... WHERE id = 1 AND version = 5</code>) detects two writers of the same row. It is the application-level counterpart of the lost-update error and does not help against write skew unless every transaction also updates one shared row, such as a version on the roster. A version column on each doctor would not have stopped Alice and Bob.</p>
+<h2 id="choosing">Choosing</h2>
+<ul>
+<li>Single-row read-modify-write: let the <code>UPDATE</code> compute the new value, or use <code>REPEATABLE READ</code> with retries.</li>
+<li>A rule over several rows, with many code paths that could break it: <code>SERIALIZABLE</code> with retries, so no path can forget a lock.</li>
+<li>One or two known paths: <code>FOR UPDATE</code> on the rows involved, or an advisory lock, at <code>READ COMMITTED</code>.</li>
+</ul>
+<p>For other databases, only the headline differences are safe to generalize. MySQL InnoDB defaults to <code>REPEATABLE READ</code> and behaves differently for locking statements as described above. SQL Server's default <code>READ COMMITTED</code> uses locks unless the database has snapshot-based read committed switched on, and its <code>SERIALIZABLE</code> uses range locks. Oracle's <code>SERIALIZABLE</code> is snapshot isolation, so write skew is possible there as well. Check the manual of the engine before assuming a level name means what it means in PostgreSQL.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>READ COMMITTED</code> gives every statement a new snapshot, so reads can change within a transaction. <code>REPEATABLE READ</code> in PostgreSQL pins one snapshot, which removes non-repeatable reads and phantoms and catches concurrent updates of the same row with an error.</li>
+<li>Write skew is two transactions checking a multi-row rule and each writing a different row. Only <code>SERIALIZABLE</code> (or explicit locking) stops it.</li>
+<li>Retry on SQLSTATE <code>40001</code> at any level above <code>READ COMMITTED</code>.</li>
+<li>Explicit locks only protect code paths that take them.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day30.pdf" download>Download PDF · Day 30</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../29/">← Day 29</a>
+  <a href="../../">All 31 days</a>
+  <a href="../31/">Day 31 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/30/</span>
+</footer>
+
+</body>
+</html>

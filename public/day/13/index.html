@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 13: Median and Percentiles Without Built-in Functions · #31DaysMaySQL</title>
+<meta name="description" content="A median is the value at a position in the sorted data. Compute it, and any percentile with interpolation, from ROW_NUMBER and COUNT, then check the result against PERCENTILE_CONT.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 13: Median and Percentiles Without Built-in Functions">
+<meta property="og:description" content="A median is the value at a position in the sorted data. Compute it, and any percentile with interpolation, from ROW_NUMBER and COUNT, then check the result against PERCENTILE_CONT.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../12/">← Day 12</a><a href="../14/">Day 14 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 13</p>
+  <h1>Median and Percentiles Without Built-in Functions</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A product manager asks for the median response time of an API. <code>AVG</code> is the first function you reach for, and it is the wrong one: one slow request among a thousand fast ones moves the mean noticeably and leaves the median where it was. Then you look for a <code>MEDIAN</code> function. PostgreSQL does not have one, and neither does MySQL, which has no percentile function of any kind.</p>
+<p>PostgreSQL does have <code>PERCENTILE_CONT</code>, and the end of this article compares against it. Computing the median by hand is still worth knowing, because it works in any database with window functions, and the same position arithmetic gives you any percentile. The examples run on PostgreSQL 18.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> products (</span>
+<span>    product_id    <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    <span class="kw">category</span>      TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    product_name  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    price         <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> products <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;USB Cable&#39;</span>,      <span class="fl">8.00</span>),</span>
+<span>    (<span class="dv">2</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;Wireless Mouse&#39;</span>, <span class="fl">25.00</span>),</span>
+<span>    (<span class="dv">3</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;Keyboard&#39;</span>,       <span class="fl">45.00</span>),</span>
+<span>    (<span class="dv">4</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;Headphones&#39;</span>,     <span class="fl">80.00</span>),</span>
+<span>    (<span class="dv">5</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;Monitor&#39;</span>,       <span class="fl">350.00</span>),</span>
+<span>    (<span class="dv">6</span>,  <span class="st">&#39;electronics&#39;</span>, <span class="st">&#39;Laptop&#39;</span>,       <span class="fl">1200.00</span>),</span>
+<span>    (<span class="dv">7</span>,  <span class="st">&#39;books&#39;</span>,       <span class="st">&#39;Paperback&#39;</span>,      <span class="fl">12.00</span>),</span>
+<span>    (<span class="dv">8</span>,  <span class="st">&#39;books&#39;</span>,       <span class="st">&#39;Cookbook&#39;</span>,       <span class="fl">17.00</span>),</span>
+<span>    (<span class="dv">9</span>,  <span class="st">&#39;books&#39;</span>,       <span class="st">&#39;Textbook&#39;</span>,       <span class="fl">20.00</span>),</span>
+<span>    (<span class="dv">10</span>, <span class="st">&#39;books&#39;</span>,       <span class="st">&#39;Atlas&#39;</span>,          <span class="fl">35.00</span>),</span>
+<span>    (<span class="dv">11</span>, <span class="st">&#39;furniture&#39;</span>,   <span class="st">&#39;Stool&#39;</span>,          <span class="fl">90.00</span>),</span>
+<span>    (<span class="dv">12</span>, <span class="st">&#39;furniture&#39;</span>,   <span class="st">&#39;Desk&#39;</span>,          <span class="fl">150.00</span>),</span>
+<span>    (<span class="dv">13</span>, <span class="st">&#39;furniture&#39;</span>,   <span class="st">&#39;Chair&#39;</span>,         <span class="fl">220.00</span>),</span>
+<span>    (<span class="dv">14</span>, <span class="st">&#39;furniture&#39;</span>,   <span class="st">&#39;Bookshelf&#39;</span>,     <span class="fl">400.00</span>),</span>
+<span>    (<span class="dv">15</span>, <span class="st">&#39;furniture&#39;</span>,   <span class="st">&#39;Sofa&#39;</span>,          <span class="fl">900.00</span>);</span></code></pre>
+<h2 id="mean-and-median-disagree">Mean and median disagree</h2>
+<p>Six electronics prices, from $8 to $1,200. The laptop pulls the mean far above what a typical product costs:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">ROUND</span>(<span class="fu">AVG</span>(price), <span class="dv">2</span>) <span class="kw">AS</span> mean_price,</span>
+<span>       <span class="fu">PERCENTILE_CONT</span>(<span class="fl">0.5</span>) WITHIN <span class="kw">GROUP</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> price) <span class="kw">AS</span> median_price</span>
+<span><span class="kw">FROM</span> products</span>
+<span><span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> mean_price | median_price
+------------+--------------
+     284.67 |         62.5
+(1 row)</code></pre>
+<p>The mean is $284.67 and the median is $62.50, the average of the 3rd and 4th prices (45 and 80). <code>PERCENTILE_CONT</code> is the built-in version, and it is the reference the hand-written queries below are checked against.</p>
+<h2 id="a-median-is-a-position">A median is a position</h2>
+<p>Sort the values, find the middle, read it. With <code>n</code> rows:</p>
+<ul>
+<li>Odd <code>n</code> (7 rows): the median is the value at position 4, which is <code>(n+1)/2</code>.</li>
+<li>Even <code>n</code> (6 rows): the median is the average of the values at positions 3 and 4.</li>
+</ul>
+<p>Both cases can be written as "average the values at positions <code>FLOOR((n+1)/2)</code> and <code>CEIL((n+1)/2)</code>". For odd <code>n</code> the two positions are the same row, so the average is that row's value.</p>
+<p>In SQL, <code>ROW_NUMBER()</code> supplies the position and <code>COUNT(*) OVER ()</code> supplies <code>n</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> price,</span>
+<span>       <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> price) <span class="kw">AS</span> rn,</span>
+<span>       <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> () <span class="kw">AS</span> total</span>
+<span><span class="kw">FROM</span> products</span>
+<span><span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> price;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  price  | rn | total
+---------+----+-------
+    8.00 |  1 |     6
+   25.00 |  2 |     6
+   45.00 |  3 |     6
+   80.00 |  4 |     6
+  350.00 |  5 |     6
+ 1200.00 |  6 |     6
+(6 rows)</code></pre>
+<p>Now keep only the middle rows and average them:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> price,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> price) <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> () <span class="kw">AS</span> total</span>
+<span>    <span class="kw">FROM</span> products</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">AVG</span>(price) <span class="kw">AS</span> median_price</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="kw">IN</span> (<span class="fu">FLOOR</span>((total <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="fl">2.0</span>), <span class="fu">CEIL</span>((total <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="fl">2.0</span>));</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    median_price
+---------------------
+ 62.5000000000000000
+(1 row)</code></pre>
+<p>62.50, the same as <code>PERCENTILE_CONT</code>. The <code>2.0</code> matters. <code>total</code> is an integer, and with <code>2</code> the division truncates: <code>(6 + 1) / 2</code> is 3, so <code>FLOOR</code> and <code>CEIL</code> both give 3 and the query returns 45 instead of 62.50.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> (<span class="dv">6</span> <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="dv">2</span>   <span class="kw">AS</span> int_division,</span>
+<span>       (<span class="dv">6</span> <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="fl">2.0</span> <span class="kw">AS</span> decimal_division;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> int_division |  decimal_division
+--------------+--------------------
+            3 | 3.5000000000000000
+(1 row)</code></pre>
+<p>If you prefer to stay in integers, <code>FLOOR((n+1)/2)</code> is <code>(n+1)/2</code> with truncation and <code>CEIL((n+1)/2)</code> is <code>(n+2)/2</code>. The filter becomes <code>rn IN ((total + 1) / 2, (total + 2) / 2)</code>, which gives the same rows without any decimal arithmetic.</p>
+<p>An odd count works with no change to the query. Here are seven values:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> x,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> x) <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> () <span class="kw">AS</span> total</span>
+<span>    <span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="dv">3</span>), (<span class="dv">9</span>), (<span class="dv">1</span>), (<span class="dv">7</span>), (<span class="dv">5</span>), (<span class="dv">11</span>), (<span class="dv">13</span>)) <span class="kw">AS</span> t(x)</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">AVG</span>(x) <span class="kw">AS</span> <span class="fu">median</span></span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="kw">IN</span> ((total <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="dv">2</span>, (total <span class="op">+</span> <span class="dv">2</span>) <span class="op">/</span> <span class="dv">2</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>       median
+--------------------
+ 7.0000000000000000
+(1 row)</code></pre>
+<p>Both expressions are 4 when <code>total</code> is 7, so the filter matches one row, and the average of one value is that value.</p>
+<h2 id="a-shortcut-that-only-half-works">A shortcut that only half works</h2>
+<p>Because you know there are 6 rows, you might skip the window functions:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> price</span>
+<span><span class="kw">FROM</span> products</span>
+<span><span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> price</span>
+<span><span class="kw">LIMIT</span> <span class="dv">1</span> OFFSET <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> price
+-------
+ 80.00
+(1 row)</code></pre>
+<p>That returns 80, the upper of the two middle values and not the median. <code>OFFSET</code> takes a number you must already have computed, and for an even row count one row is not enough. Running a <code>COUNT(*)</code> first and building the <code>OFFSET</code> in application code works only if both queries see the same data.</p>
+<h2 id="median-per-group">Median per group</h2>
+<p>Add <code>PARTITION BY</code> to both window functions and <code>GROUP BY</code> to the outer query:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="kw">category</span>, price,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> <span class="kw">category</span> <span class="kw">ORDER</span> <span class="kw">BY</span> price) <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> <span class="kw">category</span>) <span class="kw">AS</span> total</span>
+<span>    <span class="kw">FROM</span> products</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">category</span>, <span class="fu">AVG</span>(price) <span class="kw">AS</span> median_price</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="kw">IN</span> ((total <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="dv">2</span>, (total <span class="op">+</span> <span class="dv">2</span>) <span class="op">/</span> <span class="dv">2</span>)</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="kw">category</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">category</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  category   |     median_price
+-------------+----------------------
+ books       |  18.5000000000000000
+ electronics |  62.5000000000000000
+ furniture   | 220.0000000000000000
+(3 rows)</code></pre>
+<p>Books has four prices (12, 17, 20, 35), so its median is (17 + 20) / 2 = 18.50. Furniture has five, and the median is the third, 220.</p>
+<h2 id="nulls-distort-the-position">NULLs distort the position</h2>
+<p>The pattern counts rows, so a <code>NULL</code> in the column is counted and then sorted last, and the "middle" shifts. With the values 1, 2, 3 and one <code>NULL</code> the median should be 2:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> x,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> x) <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> () <span class="kw">AS</span> total</span>
+<span>    <span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="dv">1</span>), (<span class="dv">2</span>), (<span class="dv">3</span>), (<span class="kw">NULL</span>:<span class="ch">:int</span>)) <span class="kw">AS</span> t(x)</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">AVG</span>(x) <span class="kw">AS</span> median_with_null</span>
+<span><span class="kw">FROM</span> ranked</span>
+<span><span class="kw">WHERE</span> rn <span class="kw">IN</span> ((total <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> <span class="dv">2</span>, (total <span class="op">+</span> <span class="dv">2</span>) <span class="op">/</span> <span class="dv">2</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  median_with_null
+--------------------
+ 2.5000000000000000
+(1 row)</code></pre>
+<p>It reports 2.5, from positions 2 and 3, because <code>total</code> is 4. Filter the <code>NULL</code>s out in the CTE (<code>WHERE x IS NOT NULL</code>) so that the count and the positions agree. <code>PERCENTILE_CONT</code> ignores <code>NULL</code> inputs, so the comparison with the built-in only holds after that filter.</p>
+<h2 id="any-percentile-with-interpolation">Any percentile, with interpolation</h2>
+<p>The median is the 50th percentile. For a fraction <code>p</code> between 0 and 1, the target position is <code>1 + p * (n - 1)</code>. For <code>p = 0.5</code> and <code>n = 6</code> that is 3.5, halfway between positions 3 and 4. If the position falls between two rows, take the lower row and add the fractional part of the distance to the next row. <code>LEAD()</code> gives each row its successor's value, so the lower row has what it needs:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> price,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> w <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> () <span class="kw">AS</span> total,</span>
+<span>           <span class="fu">LEAD</span>(price) <span class="kw">OVER</span> w <span class="kw">AS</span> next_price</span>
+<span>    <span class="kw">FROM</span> products</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span></span>
+<span>    WINDOW w <span class="kw">AS</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> price)</span>
+<span>),</span>
+<span>target <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="op">*</span>, <span class="dv">1</span> <span class="op">+</span> <span class="fl">0.9</span> <span class="op">*</span> (total <span class="op">-</span> <span class="dv">1</span>) <span class="kw">AS</span> pos</span>
+<span>    <span class="kw">FROM</span> ranked</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> price <span class="op">+</span> (pos <span class="op">-</span> rn) <span class="op">*</span> <span class="fu">COALESCE</span>(next_price <span class="op">-</span> price, <span class="dv">0</span>) <span class="kw">AS</span> p90_price</span>
+<span><span class="kw">FROM</span> target</span>
+<span><span class="kw">WHERE</span> rn <span class="op">=</span> <span class="fu">FLOOR</span>(pos);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> p90_price
+-----------
+   775.000
+(1 row)</code></pre>
+<p>For the 90th percentile, <code>pos</code> is 5.5, so the row at position 5 ($350) is chosen and half the distance to the next row ($1,200) is added: 350 + 0.5 * 850 = 775. At the very top, <code>p = 1</code>, <code>pos</code> equals <code>n</code> and the last row has no successor, which is what the <code>COALESCE</code> covers.</p>
+<p><code>PERCENTILE_CONT</code> does the same interpolation, so it should agree:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">PERCENTILE_CONT</span>(<span class="fl">0.9</span>) WITHIN <span class="kw">GROUP</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> price) <span class="kw">AS</span> p90_price</span>
+<span><span class="kw">FROM</span> products</span>
+<span><span class="kw">WHERE</span> <span class="kw">category</span> <span class="op">=</span> <span class="st">&#39;electronics&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> p90_price
+-----------
+       775
+(1 row)</code></pre>
+<h2 id="percentiles-per-endpoint">Percentiles per endpoint</h2>
+<p>The case that started this: latency percentiles per endpoint. The table below has 40 requests per endpoint with synthetic response times. Percentiles go in a <code>VALUES</code> list, so adding p99 means adding a row:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> api_requests (</span>
+<span>    endpoint          TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    response_time_ms  <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> api_requests</span>
+<span><span class="kw">SELECT</span> e.endpoint, <span class="dv">20</span> <span class="op">+</span> (g <span class="op">*</span> g <span class="op">*</span> <span class="dv">7</span> <span class="op">+</span> e.k <span class="op">*</span> <span class="dv">31</span>) % <span class="dv">480</span></span>
+<span><span class="kw">FROM</span> (<span class="kw">VALUES</span> (<span class="st">&#39;/search&#39;</span>, <span class="dv">1</span>), (<span class="st">&#39;/login&#39;</span>, <span class="dv">2</span>), (<span class="st">&#39;/checkout&#39;</span>, <span class="dv">3</span>)) <span class="kw">AS</span> e(endpoint, k),</span>
+<span>     generate_series(<span class="dv">1</span>, <span class="dv">40</span>) <span class="kw">AS</span> g;</span>
+<span></span>
+<span><span class="kw">WITH</span> ranked <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> endpoint, response_time_ms <span class="kw">AS</span> v,</span>
+<span>           <span class="fu">ROW_NUMBER</span>() <span class="kw">OVER</span> w <span class="kw">AS</span> rn,</span>
+<span>           <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> endpoint) <span class="kw">AS</span> n,</span>
+<span>           <span class="fu">LEAD</span>(response_time_ms) <span class="kw">OVER</span> w <span class="kw">AS</span> next_v</span>
+<span>    <span class="kw">FROM</span> api_requests</span>
+<span>    WINDOW w <span class="kw">AS</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> endpoint <span class="kw">ORDER</span> <span class="kw">BY</span> response_time_ms)</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> r.endpoint, q.p,</span>
+<span>       <span class="fu">ROUND</span>(r.v <span class="op">+</span> (l.pos <span class="op">-</span> r.rn) <span class="op">*</span> <span class="fu">COALESCE</span>(r.next_v <span class="op">-</span> r.v, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> value_ms</span>
+<span><span class="kw">FROM</span> ranked r</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> (<span class="kw">VALUES</span> (<span class="fl">0.5</span>), (<span class="fl">0.95</span>)) <span class="kw">AS</span> q(p)</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="op">+</span> q.p <span class="op">*</span> (r.n <span class="op">-</span> <span class="dv">1</span>) <span class="kw">AS</span> pos) <span class="kw">AS</span> l</span>
+<span><span class="kw">WHERE</span> r.rn <span class="op">=</span> <span class="fu">FLOOR</span>(l.pos)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> r.endpoint, q.p;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> endpoint  |  p   | value_ms
+-----------+------+----------
+ /checkout |  0.5 |   200.00
+ /checkout | 0.95 |   461.20
+ /login    |  0.5 |   213.00
+ /login    | 0.95 |   494.00
+ /search   |  0.5 |   250.50
+ /search   | 0.95 |   483.80
+(6 rows)</code></pre>
+<p>The built-in gives the same numbers:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> endpoint, q.p,</span>
+<span>       <span class="fu">ROUND</span>(<span class="fu">PERCENTILE_CONT</span>(q.p) WITHIN <span class="kw">GROUP</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> response_time_ms):<span class="ch">:numeric</span>, <span class="dv">2</span>) <span class="kw">AS</span> value_ms</span>
+<span><span class="kw">FROM</span> api_requests</span>
+<span><span class="kw">CROSS</span> <span class="kw">JOIN</span> (<span class="kw">VALUES</span> (<span class="fl">0.5</span>), (<span class="fl">0.95</span>)) <span class="kw">AS</span> q(p)</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> endpoint, q.p</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> endpoint, q.p;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> endpoint  |  p   | value_ms
+-----------+------+----------
+ /checkout |  0.5 |   200.00
+ /checkout | 0.95 |   461.20
+ /login    |  0.5 |   213.00
+ /login    | 0.95 |   494.00
+ /search   |  0.5 |   250.50
+ /search   | 0.95 |   483.80
+(6 rows)</code></pre>
+<p>With 40 rows the 95th percentile sits at position 38.05, so p95 is the 38th value plus 5 percent of the gap to the 39th. Averaging the two neighbouring rows instead of weighting them is a common shortcut. It gives the right answer only when the fraction happens to be 0.5, which is the case for the median of an even count and for few other percentiles.</p>
+<h2 id="what-the-databases-offer">What the databases offer</h2>
+<ul>
+<li>PostgreSQL: <code>PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x)</code> interpolates, as above. <code>PERCENTILE_DISC</code> returns an actual value from the data with no interpolation, so <code>PERCENTILE_DISC(0.5)</code> over the electronics prices is 45, the lower middle value, and not 62.50. Both are aggregates and take <code>GROUP BY</code> directly.</li>
+<li>SQL Server and BigQuery have <code>PERCENTILE_CONT</code>, but only as a window function (<code>... OVER (PARTITION BY ...)</code>), so you cannot use it with <code>GROUP BY</code> directly.</li>
+<li>Oracle has a <code>MEDIAN</code> aggregate. MariaDB has <code>MEDIAN()</code> as a window function.</li>
+<li>MySQL has none of these, which is where the hand-written version earns its keep.</li>
+</ul>
+<p>The basic median query (<code>ROW_NUMBER</code>, <code>COUNT(*) OVER ()</code>, <code>AVG</code>) runs on MySQL 8 as written. Division with <code>/</code> returns a decimal there, so the <code>2.0</code> is not needed.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A median is the average of the values at positions <code>(n+1)/2</code> and <code>(n+2)/2</code> (integer division) of the sorted data. <code>ROW_NUMBER()</code> and <code>COUNT(*) OVER ()</code> supply both numbers.</li>
+<li>For any percentile <code>p</code>, the target position is <code>1 + p * (n - 1)</code>, and the answer interpolates between that row and the next one. <code>LEAD()</code> supplies the next value.</li>
+<li>Remove <code>NULL</code>s before ranking, or the count and the positions disagree.</li>
+<li>When the database has <code>PERCENTILE_CONT</code> as an aggregate, use it, and use this version to understand what it computes.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day13.pdf" download>Download PDF · Day 13</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../12/">← Day 12</a>
+  <a href="../../">All 31 days</a>
+  <a href="../14/">Day 14 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/13/</span>
+</footer>
+
+</body>
+</html>

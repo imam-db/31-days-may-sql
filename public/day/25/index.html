@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 25: Outdated Statistics: Why Queries Suddenly Get Slow · #31DaysMaySQL</title>
+<meta name="description" content="The planner chooses plans from table statistics, not from the data. How statistics go stale, how to see it in EXPLAIN ANALYZE, and how ANALYZE, per-column targets and extended statistics fix it.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 25: Outdated Statistics: Why Queries Suddenly Get Slow">
+<meta property="og:description" content="The planner chooses plans from table statistics, not from the data. How statistics go stale, how to see it in EXPLAIN ANALYZE, and how ANALYZE, per-column targets and extended statistics fix it.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../24/">← Day 24</a><a href="../26/">Day 26 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 25</p>
+  <h1>Outdated Statistics: Why Queries Suddenly Get Slow</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A query ran in a few milliseconds last week and now takes minutes. The SQL is the same, no index was dropped and the table is not much bigger. What changed is the plan, and the plan changed because the numbers the planner works from no longer describe the data.</p>
+<p>PostgreSQL does not look at the table when it plans a query. It reads a summary kept in <code>pg_class</code> and <code>pg_statistic</code> (readable through the <code>pg_stats</code> view): how many rows and pages the table has, how many distinct values each column has, which values are most common and how often. From these it estimates how many rows each step will produce, and it picks join methods and scans from those estimates. This article uses PostgreSQL 18 and shows what happens when the summary is wrong.</p>
+<p>Other databases keep similar statistics (SQL Server, Oracle and MySQL all have them) but refresh and expose them differently. The commands below are PostgreSQL's.</p>
+<h2 id="what-the-planner-knows">What the planner knows</h2>
+<p>Two tables, a user table and an event log:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span>    user_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    <span class="kw">plan</span>     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users</span>
+<span><span class="kw">SELECT</span> g, <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;pro&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;free&#39;</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">5000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span>    event_id    <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    user_id     <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    event_type  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="co">-- Statistics only refresh when this script says so. Autovacuum would otherwise</span></span>
+<span><span class="co">-- analyze the table in the background and make the demonstration depend on timing.</span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">SET</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">false</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> events_type_idx <span class="kw">ON</span> <span class="kw">events</span> (event_type);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> (user_id, event_type)</span>
+<span><span class="kw">SELECT</span> <span class="dv">1</span> <span class="op">+</span> g % <span class="dv">5000</span>,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;signup&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;page_view&#39;</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10000</span>) g;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> users;</span>
+<span><span class="kw">ANALYZE</span> <span class="kw">events</span>;</span></code></pre>
+<p>After <code>ANALYZE</code>, <code>pg_stats</code> has one row per column:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> attname, n_distinct, null_frac, <span class="fu">round</span>(correlation:<span class="ch">:numeric</span>, <span class="dv">2</span>) <span class="kw">AS</span> correlation</span>
+<span><span class="kw">FROM</span> pg_stats</span>
+<span><span class="kw">WHERE</span> tablename <span class="op">=</span> <span class="st">&#39;events&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> attname;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  attname   | n_distinct | null_frac | correlation
+------------+------------+-----------+-------------
+ event_id   |         -1 |         0 |        1.00
+ event_type |          2 |         0 |        0.82
+ user_id    |       -0.5 |         0 |        0.50
+(3 rows)</code></pre>
+<p><code>n_distinct</code> is the estimated number of distinct values. A negative number means a fraction of the row count: <code>-1</code> is "every row is different" (<code>event_id</code>), and <code>-0.5</code> would be "half as many distinct values as rows". <code>user_id</code> shows <code>-0.5</code>: 5,000 distinct values in 10,000 rows. Storing a ratio lets the estimate follow the table as it grows. <code>correlation</code> says how closely the column's order follows the physical order of the rows (1 means sorted). It is what makes a range scan on an index cheap or expensive.</p>
+<p>For a column with few distinct values, the most common values and their frequencies are the part that matters most:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> most_common_vals, most_common_freqs</span>
+<span><span class="kw">FROM</span> pg_stats</span>
+<span><span class="kw">WHERE</span> tablename <span class="op">=</span> <span class="st">&#39;events&#39;</span> <span class="kw">AND</span> attname <span class="op">=</span> <span class="st">&#39;event_type&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  most_common_vals  | most_common_freqs
+--------------------+-------------------
+ {page_view,signup} | {0.9,0.1}
+(1 row)</code></pre>
+<p>The planner now knows 90% of the rows are <code>page_view</code> and 10% are <code>signup</code>. At table level, <code>pg_class</code> keeps a row count and a page count:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> reltuples, relpages</span>
+<span><span class="kw">FROM</span> pg_class</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;events&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> reltuples | relpages
+-----------+----------
+     10000 |       63
+(1 row)</code></pre>
+<h2 id="statistics-that-no-longer-match">Statistics that no longer match</h2>
+<p>Now a campaign starts and 15,000 <code>click</code> events arrive. Nothing has analyzed the table since the first 10,000 rows:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> (user_id, event_type)</span>
+<span><span class="kw">SELECT</span> <span class="dv">1</span> <span class="op">+</span> g % <span class="dv">5000</span>, <span class="st">&#39;click&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">15000</span>) g;</span></code></pre>
+<p>The planner has never seen the value <code>click</code>, and the stored frequencies cover all of the old rows. Here is what it expects against what it gets:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;click&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                  QUERY PLAN
+--------------------------------------------------------------------------------------------------------------
+ Index Scan using events_type_idx on events  (cost=0.29..8.30 rows=1 width=17) (actual rows=15000.00 loops=1)
+   Index Cond: (event_type = &#39;click&#39;::text)
+   Index Searches: 1
+(3 rows)</code></pre>
+<p>The estimate is <code>rows=1</code> and the scan returned 15,000 rows. That gap between <code>rows=</code> and <code>actual rows=</code> is what to look for when a plan seems wrong. It is also why this query flips to a different join when a second table comes in:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span> e</span>
+<span><span class="kw">JOIN</span> users u <span class="kw">USING</span> (user_id)</span>
+<span><span class="kw">WHERE</span> e.event_type <span class="op">=</span> <span class="st">&#39;click&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ Aggregate
+   -&gt;  Nested Loop
+         -&gt;  Index Scan using events_type_idx on events e
+               Index Cond: (event_type = &#39;click&#39;::text)
+         -&gt;  Index Only Scan using users_pkey on users u
+               Index Cond: (user_id = e.user_id)
+(6 rows)</code></pre>
+<p>Believing there is about one <code>click</code> row, the planner picks a nested loop: find the click rows through the index, then do one primary-key lookup in <code>users</code> per row. With 15,000 rows that is 15,000 lookups where one pass over each table would do. On a table with a hundred times as many rows, this is the plan that takes minutes.</p>
+<p>The table size estimate held up better, and the reason is worth knowing. The planner does not take <code>reltuples</code> at face value; it measures the table's current number of pages and scales the old rows-per-page density to it:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+-------------------------------------------------------------
+ Seq Scan on events  (cost=0.00..372.57 rows=22857 width=17)
+(1 row)</code></pre>
+<p><code>reltuples</code> still says 10,000, the table really has 25,000 rows, and the estimate is 22,857, close enough to be useful. A bulk insert of more of the same kind of rows is therefore not what hurts. What hurts is a change in the distribution of values, which the page count cannot reveal.</p>
+<p>Run <code>ANALYZE</code> and the same two queries change:</p>
+<pre class="code"><code><span><span class="kw">ANALYZE</span> <span class="kw">events</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;click&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                         QUERY PLAN
+--------------------------------------------------------------------------------------------
+ Seq Scan on events  (cost=0.00..456.50 rows=15000 width=15) (actual rows=15000.00 loops=1)
+   Filter: (event_type = &#39;click&#39;::text)
+   Rows Removed by Filter: 10000
+(3 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> <span class="kw">events</span> e</span>
+<span><span class="kw">JOIN</span> users u <span class="kw">USING</span> (user_id)</span>
+<span><span class="kw">WHERE</span> e.event_type <span class="op">=</span> <span class="st">&#39;click&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                     QUERY PLAN
+----------------------------------------------------
+ Aggregate
+   -&gt;  Hash Join
+         Hash Cond: (e.user_id = u.user_id)
+         -&gt;  Seq Scan on events e
+               Filter: (event_type = &#39;click&#39;::text)
+         -&gt;  Hash
+               -&gt;  Seq Scan on users u
+(7 rows)</code></pre>
+<p>The estimate is exact, a sequential scan is chosen over the index, and the join becomes a hash join that reads each table once. The frequencies have caught up with the data:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> most_common_vals, most_common_freqs</span>
+<span><span class="kw">FROM</span> pg_stats</span>
+<span><span class="kw">WHERE</span> tablename <span class="op">=</span> <span class="st">&#39;events&#39;</span> <span class="kw">AND</span> attname <span class="op">=</span> <span class="st">&#39;event_type&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     most_common_vals     | most_common_freqs
+--------------------------+-------------------
+ {click,page_view,signup} | {0.6,0.36,0.04}
+(1 row)</code></pre>
+<p>A note on how small this example is: 25,000 rows is below the size <code>ANALYZE</code> samples (more on that below), so every row was read and these numbers come out the same on every run. On bigger tables the sample is random and the estimates vary slightly between runs.</p>
+<h2 id="a-mass-delete">A mass delete</h2>
+<p>Deleting rows leaves the table with the same number of pages, because <code>DELETE</code> only marks rows dead. The row estimate stays where it was until <code>VACUUM</code> or <code>ANALYZE</code> updates it:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> logs (</span>
+<span>    log_id   <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    <span class="kw">level</span>    TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    payload  TEXT</span>
+<span>);</span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> logs <span class="kw">SET</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">false</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> logs</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;info&#39;</span>, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">50</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">20000</span>) g;</span>
+<span><span class="kw">ANALYZE</span> logs;</span>
+<span></span>
+<span><span class="kw">DELETE</span> <span class="kw">FROM</span> logs <span class="kw">WHERE</span> log_id <span class="op">&lt;=</span> <span class="dv">16000</span>;</span></code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> live_rows <span class="kw">FROM</span> logs;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> live_rows
+-----------
+      4000
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> logs;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+-----------------------------------------------------------
+ Seq Scan on logs  (cost=0.00..428.00 rows=20000 width=60)
+(1 row)</code></pre>
+<p>The table has 4,000 live rows and the planner expects 20,000. Plans for queries on <code>logs</code> assume five times too many rows until the table is vacuumed or analyzed. A scan that returns an estimated 20,000 rows may well choose a different join order than one that returns 4,000.</p>
+<h2 id="why-statistics-fall-behind">Why statistics fall behind</h2>
+<p>Autovacuum analyzes a table when the number of rows changed since the last analyze exceeds a threshold:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, setting</span>
+<span><span class="kw">FROM</span> pg_settings</span>
+<span><span class="kw">WHERE</span> name <span class="kw">IN</span> (<span class="st">&#39;autovacuum_analyze_threshold&#39;</span>,</span>
+<span>               <span class="st">&#39;autovacuum_analyze_scale_factor&#39;</span>,</span>
+<span>               <span class="st">&#39;autovacuum_naptime&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>              name               | setting
+---------------------------------+---------
+ autovacuum_analyze_scale_factor | 0.1
+ autovacuum_analyze_threshold    | 50
+ autovacuum_naptime              | 60
+(3 rows)</code></pre>
+<p>The threshold is <code>autovacuum_analyze_threshold + autovacuum_analyze_scale_factor * reltuples</code>, so 50 rows plus 10% of the table by default, and autovacuum looks every <code>autovacuum_naptime</code> seconds (60). For a table of 100 million rows that means ten million changes before an automatic analyze. Several situations get past it:</p>
+<ul>
+<li><strong>A bulk load followed by an immediate query.</strong> The load can finish well inside the one-minute naptime. Nothing has analyzed the new rows when the first report runs.</li>
+<li><strong>A change in distribution that stays under the threshold.</strong> If 2% of a large table suddenly becomes the value everyone is querying (a new tenant, a campaign, one very busy customer), that is far below 10% of the rows and nothing triggers. The <code>click</code> example above is the small version of this.</li>
+<li><strong>Tables autovacuum never analyzes.</strong> Temporary tables are never analyzed automatically, so analyze them yourself after filling them. The parent of a partitioned table is not analyzed by autovacuum either, which matters for queries that join or aggregate across partitions.</li>
+<li><strong>Autovacuum that is behind.</strong> A long-running transaction, a busy server or a disabled worker can keep it from reaching the table.</li>
+</ul>
+<p>To see how far a table has drifted, look at the modification counter:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> relname,</span>
+<span>       n_mod_since_analyze,</span>
+<span>       last_analyze,</span>
+<span>       last_autoanalyze</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> n_mod_since_analyze <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<p>A table with a large <code>n_mod_since_analyze</code> compared with its size, and an old <code>last_autoanalyze</code>, is a candidate. The counter is a hint only. The proof is <code>rows=</code> against <code>actual rows=</code> in <code>EXPLAIN (ANALYZE)</code> on the query that got slow.</p>
+<h2 id="fixing-it">Fixing it</h2>
+<h3 id="analyze-and-analyze-after-loads">Analyze, and analyze after loads</h3>
+<p><code>ANALYZE table_name;</code> rebuilds the statistics with a sample of the table and is cheap compared to the queries it protects. For a nightly import or any other bulk job, run it as the last step of the job. It does not need to wait for autovacuum, and it can run inside the same transaction as the load:</p>
+<pre class="code"><code><span><span class="cf">BEGIN</span>;</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> staging_orders;</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span><span class="kw">COMMIT</span>;</span></code></pre>
+<p>Running a plain <code>ANALYZE;</code> with no table name analyzes every table in the database, which is something to schedule rather than to run casually on a large system.</p>
+<h3 id="make-autovacuum-analyze-sooner-on-big-tables">Make autovacuum analyze sooner on big tables</h3>
+<p>For a large table the 10% default is a lot of rows. A per-table setting lowers it:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">SET</span> (autovacuum_analyze_scale_factor <span class="op">=</span> <span class="fl">0.02</span>);</span></code></pre>
+<p>That makes autovacuum analyze <code>orders</code> after 2% of its rows have changed instead of 10%. <code>autovacuum_vacuum_scale_factor</code> is the separate setting for dead-row cleanup.</p>
+<h3 id="bigger-sample-and-more-detail-for-one-column">Bigger sample and more detail for one column</h3>
+<p><code>ANALYZE</code> reads <code>300 * default_statistics_target</code> rows, and the target is 100 by default, so 30,000 rows. It also keeps up to 100 most common values and 100 histogram buckets per column. I checked the sample on a table of a million rows with <code>ANALYZE VERBOSE</code>, which reports it:</p>
+<pre class="code"><code><span><span class="kw">ANALYZE</span> VERBOSE big;</span>
+<span><span class="co">-- INFO:  &quot;big&quot;: scanned 4480 of 4480 pages, containing 1000000 live rows and 0 dead rows;</span></span>
+<span><span class="co">--        30000 rows in sample, 1000000 estimated total rows</span></span>
+<span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> big <span class="kw">ALTER</span> <span class="kw">COLUMN</span> grp <span class="kw">SET</span> <span class="kw">STATISTICS</span> <span class="dv">1000</span>;</span>
+<span><span class="kw">ANALYZE</span> VERBOSE big;</span>
+<span><span class="co">-- INFO:  &quot;big&quot;: scanned 4480 of 4480 pages, containing 1000000 live rows and 0 dead rows;</span></span>
+<span><span class="co">--        300000 rows in sample, 1000000 estimated total rows</span></span></code></pre>
+<p>The sample size follows the largest target among the table's columns. A column with many distinct values and a skewed distribution (a few customers with most of the rows) can lose its rare-but-important values with only 100 slots. <code>ALTER TABLE ... ALTER COLUMN ... SET STATISTICS 1000</code> raises the target for that column alone (the maximum is 10,000). The cost is a slower <code>ANALYZE</code> and a larger <code>pg_statistic</code>, so do it for columns where <code>EXPLAIN (ANALYZE)</code> shows repeated bad estimates, not everywhere.</p>
+<h2 id="columns-that-are-not-independent">Columns that are not independent</h2>
+<p>For <code>WHERE a = 1 AND b = 2</code> the planner multiplies the selectivity of each condition, as if the columns were unrelated. When one column determines the other, as a city does its country, that produces a serious underestimate:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> places (</span>
+<span>    <span class="kw">id</span>       <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    city     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    country  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> places <span class="kw">SET</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">false</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> places</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;city&#39;</span> <span class="op">||</span> (g % <span class="dv">100</span>), <span class="st">&#39;country&#39;</span> <span class="op">||</span> ((g % <span class="dv">100</span>) <span class="op">/</span> <span class="dv">10</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">20000</span>) g;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> places;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> places <span class="kw">WHERE</span> city <span class="op">=</span> <span class="st">&#39;city7&#39;</span> <span class="kw">AND</span> country <span class="op">=</span> <span class="st">&#39;country0&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                      QUERY PLAN
+---------------------------------------------------------------------------------------
+ Seq Scan on places  (cost=0.00..428.00 rows=20 width=19) (actual rows=200.00 loops=1)
+   Filter: ((city = &#39;city7&#39;::text) AND (country = &#39;country0&#39;::text))
+   Rows Removed by Filter: 19800
+(3 rows)</code></pre>
+<p>There are 100 cities in 10 countries, each city in exactly one country. Filtering on the city alone selects 1% of the rows and the country adds nothing, so 200 rows match. The planner multiplies 1% by 10% and expects 20, a tenth of the real count. With a join added, an error like that can move the plan the same way as the stale <code>click</code> statistics did.</p>
+<p><code>CREATE STATISTICS</code> tells the planner about the relationship:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">STATISTICS</span> places_city_country (dependencies) <span class="kw">ON</span> city, country <span class="kw">FROM</span> places;</span>
+<span><span class="kw">ANALYZE</span> places;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> places <span class="kw">WHERE</span> city <span class="op">=</span> <span class="st">&#39;city7&#39;</span> <span class="kw">AND</span> country <span class="op">=</span> <span class="st">&#39;country0&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                       QUERY PLAN
+----------------------------------------------------------------------------------------
+ Seq Scan on places  (cost=0.00..428.00 rows=200 width=19) (actual rows=200.00 loops=1)
+   Filter: ((city = &#39;city7&#39;::text) AND (country = &#39;country0&#39;::text))
+   Rows Removed by Filter: 19800
+(3 rows)</code></pre>
+<p>The estimate is now 200. <code>dependencies</code> covers equality conditions on the columns together (column order does not matter). Other kinds are <code>ndistinct</code>, for <code>GROUP BY</code> on several columns, and <code>mcv</code>, which stores the most common value combinations and also handles other kinds of conditions. Extended statistics are only computed by <code>ANALYZE</code>, so they go stale in the same way. Where a column is an expression such as <code>lower(email)</code>, an expression index also makes PostgreSQL collect statistics on the expression, which is another reason the planner estimates those queries well.</p>
+<h2 id="prepared-statements-and-old-plans">Prepared statements and old plans</h2>
+<p>A common belief is that a prepared statement keeps its old plan after you run <code>ANALYZE</code> and needs <code>DISCARD PLANS</code>. That is not the case in PostgreSQL 18. <code>ANALYZE</code> invalidates cached plans that depend on the analyzed table, and the next <code>EXECUTE</code> plans again. I checked this in one psql session with <code>plan_cache_mode = force_generic_plan</code>, on a 20,000-row table of <code>'view'</code> events, adding 20,000 <code>'click'</code> rows afterwards:</p>
+<pre class="code"><code><span><span class="kw">PREPARE</span> q(text) <span class="kw">AS</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> ev <span class="kw">WHERE</span> typ <span class="op">=</span> $<span class="dv">1</span>;</span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> q(<span class="st">&#39;click&#39;</span>);   <span class="co">-- Seq Scan on ev   (generic plan)</span></span>
+<span><span class="co">-- ... INSERT of the click rows, no ANALYZE yet ...</span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> q(<span class="st">&#39;click&#39;</span>);   <span class="co">-- Seq Scan on ev   (same cached plan)</span></span>
+<span><span class="kw">ANALYZE</span> ev;</span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> q(<span class="st">&#39;click&#39;</span>);   <span class="co">-- Bitmap Heap Scan on ev   (replanned)</span></span></code></pre>
+<p>So the cached plan stays only while nothing invalidates it, and the stale statistics are the problem, not the cache. The prepared-statement issue that remains is a different one: a generic plan is built without knowing the parameter value, so it uses average selectivity and can be wrong for a skewed column. <code>plan_cache_mode = force_custom_plan</code> makes PostgreSQL plan with the actual value each time.</p>
+<h2 id="when-a-plan-changed-and-you-do-not-know-why">When a plan changed and you do not know why</h2>
+<ol type="1">
+<li>Run <code>EXPLAIN (ANALYZE)</code> on the slow query and compare <code>rows=</code> with <code>actual rows=</code> at each node. The first node where they diverge by a large factor is where the plan went wrong.</li>
+<li>Check <code>pg_stat_user_tables</code> for the tables involved: <code>n_mod_since_analyze</code>, <code>last_analyze</code>, <code>last_autoanalyze</code>.</li>
+<li>Run <code>ANALYZE table_name;</code> and run <code>EXPLAIN (ANALYZE)</code> again. If the estimates and the plan improve, you have found it.</li>
+<li>Find out why autovacuum did not do it: scale factor too high for the table size, a temporary or partitioned table, or autovacuum blocked.</li>
+<li>If the estimates are still wrong after <code>ANALYZE</code>, the cause is a skewed column (raise its statistics target) or related columns (extended statistics).</li>
+</ol>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The planner estimates rows from statistics, and a plan is only as good as the estimate. A big gap between <code>rows=</code> and <code>actual rows=</code> in <code>EXPLAIN (ANALYZE)</code> is the sign to look for.</li>
+<li>Statistics fall behind after bulk loads and after sudden shifts in the data. Autoanalyze waits for 50 rows plus 10% of the table by default, and skips temporary tables and partitioned parents.</li>
+<li>Run <code>ANALYZE</code> at the end of load jobs. Lower the analyze scale factor per table for large tables.</li>
+<li><code>ANALYZE</code> samples 300 times the statistics target (30,000 rows by default). Raise the target for a skewed column, and use <code>CREATE STATISTICS</code> for columns that depend on each other.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day25.pdf" download>Download PDF · Day 25</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../24/">← Day 24</a>
+  <a href="../../">All 31 days</a>
+  <a href="../26/">Day 26 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/25/</span>
+</footer>
+
+</body>
+</html>

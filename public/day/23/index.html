@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 23: Functions on Indexed Columns: Why Indexes Get Ignored · #31DaysMaySQL</title>
+<meta name="description" content="Wrapping an indexed column in a function or a cast hides it from the planner. How to see it in EXPLAIN, and the fixes: range rewrites, expression indexes and stored generated columns.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 23: Functions on Indexed Columns: Why Indexes Get Ignored">
+<meta property="og:description" content="Wrapping an indexed column in a function or a cast hides it from the planner. How to see it in EXPLAIN, and the fixes: range rewrites, expression indexes and stored generated columns.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../22/">← Day 22</a><a href="../24/">Day 24 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 23</p>
+  <h1>Functions on Indexed Columns: Why Indexes Get Ignored</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>An <code>orders</code> table has an index on <code>created_at</code>, and someone needs every order from 2020:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> orders</span>
+<span><span class="kw">WHERE</span> <span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> created_at) <span class="op">=</span> <span class="dv">2020</span>;</span></code></pre>
+<p>The query reads as if it should use the index, and it does not. A B-tree on <code>created_at</code> is sorted by the full timestamp. PostgreSQL has no way to know where <code>EXTRACT(YEAR FROM created_at) = 2020</code> begins and ends in that order, so it reads the whole table and applies <code>EXTRACT</code> to every row.</p>
+<p>The plans below are from PostgreSQL 18. A function around the column also hides it from an ordinary index in SQL Server, Oracle and MySQL, but I only ran the examples on PostgreSQL, and the fixes differ in syntax between databases.</p>
+<h2 id="the-data">The data</h2>
+<p>One million orders, one every five minutes from 2016 to mid 2025, so 2020 is about a tenth of the table:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     BIGINT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span>  <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    email        TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    status       TEXT,                 <span class="co">-- nullable on purpose, used later</span></span>
+<span>    created_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders (customer_id, email, status, created_at)</span>
+<span><span class="kw">SELECT</span> g % <span class="dv">5000</span>,</span>
+<span>       <span class="st">&#39;user&#39;</span> <span class="op">||</span> g % <span class="dv">20000</span> <span class="op">||</span> <span class="st">&#39;@Shop.com&#39;</span>,</span>
+<span>       (<span class="dt">ARRAY</span>[<span class="st">&#39;completed&#39;</span>,<span class="st">&#39;completed&#39;</span>,<span class="st">&#39;completed&#39;</span>,<span class="st">&#39;pending&#39;</span>,<span class="st">&#39;cancelled&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">5</span>],</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2016-01-01&#39;</span> <span class="op">+</span> g <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">&#39;5 minutes&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_created_at <span class="kw">ON</span> orders (created_at);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_customer   <span class="kw">ON</span> orders (customer_id);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_email      <span class="kw">ON</span> orders (email);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_status     <span class="kw">ON</span> orders (status);</span>
+<span></span>
+<span><span class="co">-- keeps the plans below free of parallel workers, which depend on server settings</span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">SET</span> (parallel_workers <span class="op">=</span> <span class="dv">0</span>);</span>
+<span>VACUUM <span class="kw">ANALYZE</span> orders;</span></code></pre>
+<p>The <code>VACUUM</code> makes index-only scans possible and <code>ANALYZE</code> gives the planner its row counts. Skip them and the plans below can come out differently.</p>
+<h2 id="function-on-the-column-and-the-range-rewrite">Function on the column, and the range rewrite</h2>
+<p>Query A wraps the column:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> orders</span>
+<span><span class="kw">WHERE</span> <span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> created_at) <span class="op">=</span> <span class="dv">2020</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                            QUERY PLAN
+-------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   -&gt;  Seq Scan on orders (actual rows=105408.00 loops=1)
+         Filter: (EXTRACT(year FROM created_at) = &#39;2020&#39;::numeric)
+         Rows Removed by Filter: 894592
+(4 rows)</code></pre>
+<p>Query B asks for the same rows as a range:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)</span>
+<span><span class="kw">FROM</span> orders</span>
+<span><span class="kw">WHERE</span> created_at <span class="op">&gt;=</span> <span class="st">&#39;2020-01-01&#39;</span></span>
+<span>  <span class="kw">AND</span> created_at <span class="op">&lt;</span>  <span class="st">&#39;2021-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                                           QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   -&gt;  Index Only Scan using idx_orders_created_at on orders (actual rows=105408.00 loops=1)
+         Index Cond: ((created_at &gt;= &#39;2020-01-01 00:00:00&#39;::timestamp without time zone) AND (created_at &lt; &#39;2021-01-01 00:00:00&#39;::timestamp without time zone))
+         Heap Fetches: 0
+         Index Searches: 1
+(5 rows)</code></pre>
+<p>Both count 105,408 orders. The first reads all million rows and discards 894,592 of them (<code>Rows Removed by Filter</code>). The second walks the index from the first 2020 entry to the last and never touches the rest. The range is half-open (<code>&gt;=</code> the start, <code>&lt;</code> the next start), so it is correct whether the column holds dates, timestamps or timestamps with fractions of a second. <code>BETWEEN '2020-01-01' AND '2020-12-31'</code> on a timestamp loses everything after midnight on December 31st.</p>
+<p>A single day works the same way. <code>date(created_at) = '2020-06-01'</code> and <code>created_at::date = '2020-06-01'</code> are both sequential scans here, and the rewrite is an index scan:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span><span class="kw">WHERE</span> created_at <span class="op">&gt;=</span> <span class="dt">DATE</span> <span class="st">&#39;2020-06-01&#39;</span></span>
+<span>  <span class="kw">AND</span> created_at <span class="op">&lt;</span>  <span class="dt">DATE</span> <span class="st">&#39;2020-06-01&#39;</span> <span class="op">+</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                        QUERY PLAN
+------------------------------------------------------------------------------------------
+ Index Scan using idx_orders_created_at on orders
+   Index Cond: ((created_at &gt;= &#39;2020-06-01&#39;::date) AND (created_at &lt; &#39;2020-06-02&#39;::date))
+(2 rows)</code></pre>
+<h2 id="any-change-to-the-column-counts">Any change to the column counts</h2>
+<p>The year is the usual case, but the rule is general: if the left side of the comparison is not the bare indexed column, an ordinary index on that column cannot be used.</p>
+<pre class="code"><code><span><span class="kw">WHERE</span> <span class="fu">lower</span>(email) <span class="op">=</span> <span class="st">&#39;user42@shop.com&#39;</span>      <span class="co">-- function</span></span>
+<span><span class="kw">WHERE</span> substring(email, <span class="dv">1</span>, <span class="dv">6</span>) <span class="op">=</span> <span class="st">&#39;user42&#39;</span>     <span class="co">-- function</span></span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">+</span> <span class="dv">1</span> <span class="op">=</span> <span class="dv">43</span>                  <span class="co">-- arithmetic</span></span>
+<span><span class="kw">WHERE</span> customer_id:<span class="ch">:text</span> <span class="op">=</span> <span class="st">&#39;42&#39;</span>              <span class="co">-- cast</span></span>
+<span><span class="kw">WHERE</span> <span class="dt">date</span>(created_at) <span class="op">=</span> <span class="st">&#39;2020-06-01&#39;</span>       <span class="co">-- function</span></span></code></pre>
+<p>PostgreSQL does not do algebra for you. <code>customer_id + 1 = 43</code> obviously means <code>customer_id = 42</code>, and it is still a sequential scan:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">+</span> <span class="dv">1</span> <span class="op">=</span> <span class="dv">43</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>             QUERY PLAN
+------------------------------------
+ Seq Scan on orders
+   Filter: ((customer_id + 1) = 43)
+(2 rows)</code></pre>
+<h2 id="fix-1-move-the-work-to-the-constant-side">Fix 1: move the work to the constant side</h2>
+<p>If the computation can go to the other side of the operator, put it there. The constant is evaluated once, before the scan starts:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">43</span> <span class="op">-</span> <span class="dv">1</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                   QUERY PLAN
+------------------------------------------------
+ Bitmap Heap Scan on orders
+   Recheck Cond: (customer_id = 42)
+   -&gt;  Bitmap Index Scan on idx_orders_customer
+         Index Cond: (customer_id = 42)
+(4 rows)</code></pre>
+<p><code>43 - 1</code> is folded to <code>42</code> before planning. A cast on the column is the same problem as <code>lower(email)</code>:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id:<span class="ch">:text</span> <span class="op">=</span> <span class="st">&#39;42&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Seq Scan on orders
+   Filter: ((customer_id)::text = &#39;42&#39;::text)
+(2 rows)</code></pre>
+<p>Write <code>customer_id = 42</code> and the cast is gone.</p>
+<h2 id="fix-2-an-expression-index">Fix 2: an expression index</h2>
+<p>When the function is really needed, as in a case-insensitive email lookup, index the expression itself:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="fu">lower</span>(email) <span class="op">=</span> <span class="st">&#39;user42@shop.com&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                     QUERY PLAN
+----------------------------------------------------
+ Seq Scan on orders
+   Filter: (lower(email) = &#39;user42@shop.com&#39;::text)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_email_lower <span class="kw">ON</span> orders (<span class="fu">lower</span>(email));</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="fu">lower</span>(email) <span class="op">=</span> <span class="st">&#39;user42@shop.com&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                          QUERY PLAN
+--------------------------------------------------------------
+ Bitmap Heap Scan on orders
+   Recheck Cond: (lower(email) = &#39;user42@shop.com&#39;::text)
+   -&gt;  Bitmap Index Scan on idx_orders_email_lower
+         Index Cond: (lower(email) = &#39;user42@shop.com&#39;::text)
+(4 rows)</code></pre>
+<p>Three things to know about expression indexes:</p>
+<ul>
+<li>The query has to use the same expression. An index on <code>lower(email)</code> does nothing for <code>upper(email)</code> or <code>email ILIKE ...</code>.</li>
+<li>The function must be <code>IMMUTABLE</code>, because PostgreSQL stores its results. The next section shows where that bites.</li>
+<li>Every <code>INSERT</code>, and every <code>UPDATE</code> that touches the column, evaluates the expression again, so it costs write time and disk space like any other index. If you control every writer, storing the email already lowercased is cheaper.</li>
+</ul>
+<p>An expression index can also stand in for the range rewrite, for example when a tool generates the query and you cannot change it:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_year <span class="kw">ON</span> orders ((<span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> created_at)));</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> created_at) <span class="op">=</span> <span class="dv">2020</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                           QUERY PLAN
+-----------------------------------------------------------------
+ Index Scan using idx_orders_year on orders
+   Index Cond: (EXTRACT(year FROM created_at) = &#39;2020&#39;::numeric)
+(2 rows)</code></pre>
+<p>This index serves year lookups and nothing else. The range rewrite on <code>idx_orders_created_at</code> serves any period with the index you already have, so try the rewrite first.</p>
+<h3 id="timestamps-with-time-zone">Timestamps with time zone</h3>
+<p>The index above works because <code>created_at</code> is <code>TIMESTAMP</code>. On a <code>TIMESTAMPTZ</code> column the year of a given instant depends on the session's <code>TimeZone</code> setting, so <code>EXTRACT(YEAR FROM ...)</code>, <code>date(...)</code> and <code>date_trunc(...)</code> are only <code>STABLE</code>, and PostgreSQL refuses to index them:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span>    event_id  <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    <span class="kw">at</span>        TIMESTAMPTZ <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span></code></pre>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> <span class="kw">events</span> ((<span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> <span class="kw">at</span>)));</span>
+<span><span class="co">-- ERROR:  functions in index expression must be marked IMMUTABLE</span></span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> <span class="kw">events</span> (date_trunc(<span class="st">&#39;month&#39;</span>, <span class="kw">at</span>));</span>
+<span><span class="co">-- ERROR:  functions in index expression must be marked IMMUTABLE</span></span></code></pre>
+<p>Convert to a fixed zone first and the expression no longer depends on the session:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_events_day_utc <span class="kw">ON</span> <span class="kw">events</span> (<span class="dt">date</span>(<span class="kw">at</span> <span class="kw">AT</span> <span class="dt">TIME</span> <span class="dt">ZONE</span> <span class="st">&#39;UTC&#39;</span>));</span></code></pre>
+<p>Queries then have to repeat <code>date(at AT TIME ZONE 'UTC') = ...</code> exactly. The range rewrite is simpler: <code>at &gt;= '2020-01-01 00:00 UTC' AND at &lt; '2021-01-01 00:00 UTC'</code> names the zone in the literal and uses a plain index on <code>at</code>. A literal without a zone is read in the session's time zone, so two connections with different settings ask for different years.</p>
+<h2 id="fix-3-a-stored-generated-column">Fix 3: a stored generated column</h2>
+<p>A generated column gives the derived value a name and lets an ordinary B-tree index it:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders</span>
+<span>    <span class="kw">ADD</span> <span class="kw">COLUMN</span> created_year <span class="dt">INT</span></span>
+<span>    <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> (<span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> created_at):<span class="ch">:INT</span>) STORED;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_created_year <span class="kw">ON</span> orders (created_year);</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> created_year <span class="op">=</span> <span class="dv">2020</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                     QUERY PLAN
+----------------------------------------------------
+ Index Scan using idx_orders_created_year on orders
+   Index Cond: (created_year = 2020)
+(2 rows)</code></pre>
+<p><code>STORED</code> is required if you want an index. PostgreSQL 18 added virtual generated columns, which are computed when read and are the default when you leave out <code>STORED</code>, but it does not allow indexes on them:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> gen_demo (</span>
+<span>    a  <span class="dt">INT</span>,</span>
+<span>    b  <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> (a <span class="op">*</span> <span class="dv">2</span>) VIRTUAL</span>
+<span>);</span></code></pre>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> gen_demo (b);</span>
+<span><span class="co">-- ERROR:  indexes on virtual generated columns are not supported</span></span></code></pre>
+<p>Adding a stored column rewrites the whole table, which on a large production table is a real cost. Other databases offer the same idea: MySQL 8 indexes generated columns and, from 8.0.13, also accepts an expression as an index key part; SQL Server indexes persisted computed columns; Oracle has function-based indexes.</p>
+<h2 id="three-cases-that-look-different">Three cases that look different</h2>
+<h3 id="type-mismatches">Type mismatches</h3>
+<p>A cast is not always in the SQL you wrote. PostgreSQL will not compare text with an integer at all (<code>WHERE email = 12345</code> fails with <code>operator does not exist: text = integer</code>), so that mistake gets caught. A decimal literal against an integer column is not caught:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="fl">42.0</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                QUERY PLAN
+-------------------------------------------
+ Seq Scan on orders
+   Filter: ((customer_id)::numeric = 42.0)
+(2 rows)</code></pre>
+<p>There is no <code>integer = numeric</code> operator that can use the integer index, so PostgreSQL casts the column. The same thing happens when a driver sends a decimal or floating-point parameter for an integer column. The sign is a <code>Filter:</code> line with a cast on the column, here <code>(customer_id)::numeric</code>.</p>
+<h3 id="coalesce">COALESCE</h3>
+<p>About one order in a thousand has no status. Treating NULL as <code>'unknown'</code> with <code>COALESCE</code> hides the column again:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> orders <span class="kw">SET</span> status <span class="op">=</span> <span class="kw">NULL</span> <span class="kw">WHERE</span> order_id % <span class="dv">1000</span> <span class="op">=</span> <span class="dv">0</span>;</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="fu">COALESCE</span>(status, <span class="st">&#39;unknown&#39;</span>) <span class="op">=</span> <span class="st">&#39;unknown&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                           QUERY PLAN
+-----------------------------------------------------------------
+ Seq Scan on orders
+   Filter: (COALESCE(status, &#39;unknown&#39;::text) = &#39;unknown&#39;::text)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">IS</span> <span class="kw">NULL</span> <span class="kw">OR</span> status <span class="op">=</span> <span class="st">&#39;unknown&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                            QUERY PLAN
+------------------------------------------------------------------
+ Bitmap Heap Scan on orders
+   Recheck Cond: ((status IS NULL) OR (status = &#39;unknown&#39;::text))
+   -&gt;  BitmapOr
+         -&gt;  Bitmap Index Scan on idx_orders_status
+               Index Cond: (status IS NULL)
+         -&gt;  Bitmap Index Scan on idx_orders_status
+               Index Cond: (status = &#39;unknown&#39;::text)
+(7 rows)</code></pre>
+<p>PostgreSQL indexes NULLs in B-trees, so <code>IS NULL</code> can use the index. Oracle does not store entries for all-NULL keys in a B-tree index, so this rewrite does not carry over there.</p>
+<h3 id="functions-in-join-conditions">Functions in join conditions</h3>
+<p><code>ON lower(o.email) = lower(w.email)</code> is the same problem inside a join. Take a small <code>watchlist</code> table and join it to <code>orders</code>. Without the expression index, <code>orders</code> is scanned in full:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> watchlist (email TEXT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>);</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> watchlist</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;USER&#39;</span> <span class="op">||</span> g <span class="op">||</span> <span class="st">&#39;@shop.com&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">5</span>) g;</span>
+<span><span class="kw">ANALYZE</span> watchlist;</span>
+<span></span>
+<span><span class="kw">DROP</span> <span class="kw">INDEX</span> idx_orders_email_lower;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> o.<span class="op">*</span></span>
+<span><span class="kw">FROM</span> watchlist w</span>
+<span><span class="kw">JOIN</span> orders o <span class="kw">ON</span> <span class="fu">lower</span>(o.email) <span class="op">=</span> <span class="fu">lower</span>(w.email);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                   QUERY PLAN
+------------------------------------------------
+ Hash Join
+   Hash Cond: (lower(o.email) = lower(w.email))
+   -&gt;  Seq Scan on orders o
+   -&gt;  Hash
+         -&gt;  Seq Scan on watchlist w
+(5 rows)</code></pre>
+<p>With the index back, PostgreSQL probes <code>orders</code> once per watched address:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_email_lower <span class="kw">ON</span> orders (<span class="fu">lower</span>(email));</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> o.<span class="op">*</span></span>
+<span><span class="kw">FROM</span> watchlist w</span>
+<span><span class="kw">JOIN</span> orders o <span class="kw">ON</span> <span class="fu">lower</span>(o.email) <span class="op">=</span> <span class="fu">lower</span>(w.email);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+-----------------------------------------------------------
+ Nested Loop
+   -&gt;  Seq Scan on watchlist w
+   -&gt;  Bitmap Heap Scan on orders o
+         Recheck Cond: (lower(email) = lower(w.email))
+         -&gt;  Bitmap Index Scan on idx_orders_email_lower
+               Index Cond: (lower(email) = lower(w.email))
+(6 rows)</code></pre>
+<p>When both sides are large, a hash join over everything is often the right plan and the index would not change it. The index pays off when one side is small and the other large, as here.</p>
+<h2 id="finding-these-queries-in-a-real-database">Finding these queries in a real database</h2>
+<p>On a live system, start from the symptom, a table that is read sequentially far more than expected:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> relname, seq_scan, seq_tup_read, idx_scan,</span>
+<span>       seq_tup_read <span class="op">/</span> <span class="fu">NULLIF</span>(seq_scan, <span class="dv">0</span>) <span class="kw">AS</span> avg_rows_per_seq_scan</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> seq_tup_read <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<p>A big table with a high <code>seq_tup_read</code> and millions of rows per sequential scan is the one to look at. Then find the statements: with the <code>pg_stat_statements</code> extension, sort by <code>total_exec_time</code> and read the <code>WHERE</code> clauses for functions around column names. <code>auto_explain</code> with <code>auto_explain.log_min_duration</code> logs the plans of slow statements, including the <code>Filter:</code> line.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A function, cast or arithmetic on the indexed column hides it from an ordinary index. A <code>Seq Scan</code> whose <code>Filter:</code> line shows the expression is the symptom, and <code>Rows Removed by Filter</code> shows what it cost.</li>
+<li>For dates, rewrite to a half-open range on the bare column. One index then serves any period.</li>
+<li>Move casts and arithmetic to the constant side, and send parameters in the column's own type.</li>
+<li>If the expression is unavoidable, index that same expression, or add a stored generated column and index it. Both cost write time and space.</li>
+<li>On <code>TIMESTAMPTZ</code>, the zone has to be explicit before an expression can be indexed.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day23.pdf" download>Download PDF · Day 23</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../22/">← Day 22</a>
+  <a href="../../">All 31 days</a>
+  <a href="../24/">Day 24 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/23/</span>
+</footer>
+
+</body>
+</html>

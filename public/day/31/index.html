@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 31: SQL Is Declarative, and That Has Consequences · #31DaysMaySQL</title>
+<meta name="description" content="SQL states what result you want and leaves the how to the planner. What PostgreSQL 18 actually rewrites (checked with EXPLAIN), what it leaves alone, and where wrong estimates or opaque functions take the decision out of its hands.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 31: SQL Is Declarative, and That Has Consequences">
+<meta property="og:description" content="SQL states what result you want and leaves the how to the planner. What PostgreSQL 18 actually rewrites (checked with EXPLAIN), what it leaves alone, and where wrong estimates or opaque functions take the decision out of its hands.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../30/">← Day 30</a><span></span></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 31</p>
+  <h1>SQL Is Declarative, and That Has Consequences</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A query does not say how it should be executed. The same text can run as an index scan today and a sequential scan next month, because the table grew, the statistics changed or the server was upgraded. Two queries that look different can compile to the same plan, and a rewrite you were sure was an optimization can change nothing at all.</p>
+<p>All of this follows from SQL being declarative: you describe the rows you want and the planner chooses the algorithm. This last article checks what that means in practice, with <code>EXPLAIN</code> output from PostgreSQL 18 for each claim. Other engines make different choices in the details, so the plans are PostgreSQL's.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    region       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers,</span>
+<span>    status       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    total        <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    created_at   <span class="dt">DATE</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> order_items (</span>
+<span>    item_id   <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    order_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> orders,</span>
+<span>    sku       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;c&#39;</span> <span class="op">||</span> g, (<span class="dt">ARRAY</span>[<span class="st">&#39;EU&#39;</span>, <span class="st">&#39;US&#39;</span>, <span class="st">&#39;APAC&#39;</span>, <span class="st">&#39;LATAM&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">4</span>]</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders</span>
+<span><span class="kw">SELECT</span> g,</span>
+<span>       <span class="dv">1</span> <span class="op">+</span> (g <span class="op">*</span> <span class="dv">7</span>) % <span class="dv">1000</span>,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">100</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;cancelled&#39;</span></span>
+<span>            <span class="cf">WHEN</span> g % <span class="dv">2</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;completed&#39;</span></span>
+<span>            <span class="cf">ELSE</span> <span class="st">&#39;pending&#39;</span> <span class="cf">END</span>,</span>
+<span>       (g % <span class="dv">500</span>) <span class="op">+</span> <span class="fl">0.5</span>,</span>
+<span>       <span class="dt">DATE</span> <span class="st">&#39;2024-01-01&#39;</span> <span class="op">+</span> (g % <span class="dv">365</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">20000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> order_items</span>
+<span><span class="kw">SELECT</span> g, <span class="dv">1</span> <span class="op">+</span> (g <span class="op">*</span> <span class="dv">13</span>) % <span class="dv">20000</span>, <span class="st">&#39;sku&#39;</span> <span class="op">||</span> (g % <span class="dv">50</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">40000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> orders_status_idx <span class="kw">ON</span> orders (status);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> orders_created_idx <span class="kw">ON</span> orders (created_at);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> order_items_order_idx <span class="kw">ON</span> order_items (order_id);</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> customers;</span>
+<span><span class="kw">ANALYZE</span> orders;</span>
+<span><span class="kw">ANALYZE</span> order_items;</span></code></pre>
+<h2 id="the-same-sql-gets-a-different-plan-when-the-data-changes">The same SQL gets a different plan when the data changes</h2>
+<p>The planner picks a plan from statistics about the data. A table where one value is rare and another is common shows both choices from the same query shape:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tickets (</span>
+<span>    ticket_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    state      TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    payload    TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tickets</span>
+<span><span class="kw">SELECT</span> g, <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">100</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;rare&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;common&#39;</span> <span class="cf">END</span>, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">100</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> tickets_state_idx <span class="kw">ON</span> tickets (state);</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> tickets;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> tickets <span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;rare&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+-----------------------------------------------
+ Index Scan using tickets_state_idx on tickets
+   Index Cond: (state = &#39;rare&#39;::text)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> tickets <span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;common&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>             QUERY PLAN
+------------------------------------
+ Seq Scan on tickets
+   Filter: (state = &#39;common&#39;::text)
+(2 rows)</code></pre>
+<p>One percent of the rows through an index, ninety-nine percent with a sequential scan, because reading nearly every page through an index would be slower than reading the table in order. Nobody wrote either plan. If <code>rare</code> grows to half the table, the first query changes its plan without anyone touching it, and sometimes that is the "same query, suddenly slower" report.</p>
+<h2 id="different-sql-same-plan">Different SQL, same plan</h2>
+<p>Predicates in a different order, or wrapped in a subquery, mean the same thing, and the planner treats them as the same:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;completed&#39;</span> <span class="kw">AND</span> total <span class="op">&gt;</span> <span class="dv">100</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> total <span class="op">&gt;</span> <span class="dv">100</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;completed&#39;</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;completed&#39;</span>) s <span class="kw">WHERE</span> total <span class="op">&gt;</span> <span class="dv">100</span>;</span></code></pre>
+<p>All three print:</p>
+<pre class="out" aria-label="Query result"><code>                    QUERY PLAN
+--------------------------------------------------
+ Bitmap Heap Scan on orders
+   Recheck Cond: (status = &#39;completed&#39;::text)
+   Filter: (total &gt; &#39;100&#39;::numeric)
+   -&gt;  Bitmap Index Scan on orders_status_idx
+         Index Cond: (status = &#39;completed&#39;::text)
+(5 rows)</code></pre>
+<p>The subquery was pulled up into the outer query (flattening), which is why a "pre-filter in a subquery" is not an optimization: the planner would have done the same. The same holds for <code>IN</code> against an <code>OR</code> chain, which PostgreSQL turns into the same array comparison:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> customer_id <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>);</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">1</span> <span class="kw">OR</span> customer_id <span class="op">=</span> <span class="dv">2</span> <span class="kw">OR</span> customer_id <span class="op">=</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ Index Scan using customers_pkey on customers
+   Index Cond: (customer_id = ANY (&#39;{1,2,3}&#39;::integer[]))
+(2 rows)</code></pre>
+<p>Constants are folded at planning time, so <code>50 + 50</code> costs nothing per row:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> total <span class="op">&gt;</span> <span class="dv">50</span> <span class="op">+</span> <span class="dv">50</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>             QUERY PLAN
+------------------------------------
+ Seq Scan on orders
+   Filter: (total &gt; &#39;100&#39;::numeric)
+(2 rows)</code></pre>
+<p><code>now()</code> is different. It is stable, not constant: the plan keeps the expression and the executor evaluates it once at the start of the query, which is enough to use it as an index condition but is not "folding":</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> created_at <span class="op">&gt;</span> now() <span class="op">-</span> <span class="dt">interval</span> <span class="st">&#39;1 day&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ Index Scan using orders_created_idx on orders
+   Index Cond: (created_at &gt; (now() - &#39;1 day&#39;::interval))
+(2 rows)</code></pre>
+<h2 id="what-the-planner-pushes-down-and-what-stops-it">What the planner pushes down, and what stops it</h2>
+<p>Filters on a subquery or view are moved into it when that does not change the result. A filter on a grouping column goes below the aggregation; a filter on an aggregate cannot:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> (<span class="kw">SELECT</span> customer_id, <span class="fu">sum</span>(total) <span class="kw">AS</span> s <span class="kw">FROM</span> orders <span class="kw">GROUP</span> <span class="kw">BY</span> customer_id) x</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>            QUERY PLAN
+-----------------------------------
+ GroupAggregate
+   -&gt;  Seq Scan on orders
+         Filter: (customer_id = 5)
+(3 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> (<span class="kw">SELECT</span> customer_id, <span class="fu">sum</span>(total) <span class="kw">AS</span> s <span class="kw">FROM</span> orders <span class="kw">GROUP</span> <span class="kw">BY</span> customer_id) x</span>
+<span><span class="kw">WHERE</span> s <span class="op">&gt;</span> <span class="dv">1000</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                   QUERY PLAN
+-------------------------------------------------
+ HashAggregate
+   Group Key: orders.customer_id
+   Filter: (sum(orders.total) &gt; &#39;1000&#39;::numeric)
+   -&gt;  Seq Scan on orders
+(4 rows)</code></pre>
+<p>The first plan has the <code>customer_id = 5</code> test on the scan, before any grouping; the second can only filter after the sums exist. Some subqueries cannot be flattened at all because doing so would change the answer. <code>LIMIT</code> is the common case: the 100 earliest orders and the orders of customer 5 are different things, so the filter has to stay outside the limit:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">LIMIT</span> <span class="dv">100</span>) x</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+-----------------------------------------------------------
+ Subquery Scan on x
+   Filter: (x.customer_id = 5)
+   -&gt;  Limit
+         -&gt;  Index Scan using orders_created_idx on orders
+(4 rows)</code></pre>
+<p><code>OFFSET 0</code> also stops the subquery being flattened. It is an old trick for forcing a fence around a subquery, and it is a good example of the declarative model leaking: the query means the same with or without it, but the plan does not.</p>
+<p>Predicates on one table are not reordered by how selective they are. PostgreSQL orders the conditions of a scan by estimated cost, and conditions that cost the same stay in the order you wrote them:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> total <span class="op">&gt;</span> <span class="dv">10</span> <span class="kw">AND</span> status <span class="op">&lt;&gt;</span> <span class="st">&#39;x&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                          QUERY PLAN
+---------------------------------------------------------------
+ Seq Scan on orders
+   Filter: ((total &gt; &#39;10&#39;::numeric) AND (status &lt;&gt; &#39;x&#39;::text))
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">&lt;&gt;</span> <span class="st">&#39;x&#39;</span> <span class="kw">AND</span> total <span class="op">&gt;</span> <span class="dv">10</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                          QUERY PLAN
+---------------------------------------------------------------
+ Seq Scan on orders
+   Filter: ((status &lt;&gt; &#39;x&#39;::text) AND (total &gt; &#39;10&#39;::numeric))
+(2 rows)</code></pre>
+<p>The two plans differ only in the order of the filter. Put the cheap, selective test first if the order matters, such as before an expensive function call.</p>
+<h2 id="join-order">Join order</h2>
+<p>For inner joins, the order in which you write the tables does not decide the join order. Three tables, written in two different orders, give the same plan:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers c</span>
+<span><span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">JOIN</span> order_items i <span class="kw">ON</span> i.order_id <span class="op">=</span> o.order_id</span>
+<span><span class="kw">WHERE</span> c.region <span class="op">=</span> <span class="st">&#39;EU&#39;</span> <span class="kw">AND</span> i.sku <span class="op">=</span> <span class="st">&#39;sku7&#39;</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> order_items i</span>
+<span><span class="kw">JOIN</span> orders o <span class="kw">ON</span> i.order_id <span class="op">=</span> o.order_id</span>
+<span><span class="kw">JOIN</span> customers c <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> c.region <span class="op">=</span> <span class="st">&#39;EU&#39;</span> <span class="kw">AND</span> i.sku <span class="op">=</span> <span class="st">&#39;sku7&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                     QUERY PLAN
+----------------------------------------------------
+ Hash Join
+   Hash Cond: (o.order_id = i.order_id)
+   -&gt;  Hash Join
+         Hash Cond: (o.customer_id = c.customer_id)
+         -&gt;  Seq Scan on orders o
+         -&gt;  Hash
+               -&gt;  Seq Scan on customers c
+                     Filter: (region = &#39;EU&#39;::text)
+   -&gt;  Hash
+         -&gt;  Seq Scan on order_items i
+               Filter: (sku = &#39;sku7&#39;::text)
+(11 rows)</code></pre>
+<p>The planner searches orderings and keeps the cheapest one. That search is bounded: only the first <code>join_collapse_limit</code> tables of a join list are reordered freely, and past <code>geqo_threshold</code> tables PostgreSQL switches to a genetic search instead of exhaustive enumeration:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, setting</span>
+<span><span class="kw">FROM</span> pg_settings</span>
+<span><span class="kw">WHERE</span> name <span class="kw">IN</span> (<span class="st">&#39;join_collapse_limit&#39;</span>, <span class="st">&#39;from_collapse_limit&#39;</span>, <span class="st">&#39;geqo_threshold&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>        name         | setting
+---------------------+---------
+ from_collapse_limit | 8
+ geqo_threshold      | 12
+ join_collapse_limit | 8
+(3 rows)</code></pre>
+<p>Setting <code>join_collapse_limit</code> to 1 makes the planner keep the join order as written. The same second query then joins <code>order_items</code> to <code>orders</code> first, exactly as it was typed:</p>
+<pre class="code"><code><span><span class="kw">SET</span> join_collapse_limit <span class="op">=</span> <span class="dv">1</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> order_items i</span>
+<span><span class="kw">JOIN</span> orders o <span class="kw">ON</span> i.order_id <span class="op">=</span> o.order_id</span>
+<span><span class="kw">JOIN</span> customers c <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> c.region <span class="op">=</span> <span class="st">&#39;EU&#39;</span> <span class="kw">AND</span> i.sku <span class="op">=</span> <span class="st">&#39;sku7&#39;</span>;</span>
+<span></span>
+<span><span class="kw">RESET</span> join_collapse_limit;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                    QUERY PLAN
+--------------------------------------------------
+ Hash Join
+   Hash Cond: (o.customer_id = c.customer_id)
+   -&gt;  Hash Join
+         Hash Cond: (o.order_id = i.order_id)
+         -&gt;  Seq Scan on orders o
+         -&gt;  Hash
+               -&gt;  Seq Scan on order_items i
+                     Filter: (sku = &#39;sku7&#39;::text)
+   -&gt;  Hash
+         -&gt;  Seq Scan on customers c
+               Filter: (region = &#39;EU&#39;::text)
+(11 rows)</code></pre>
+<p>Outer joins restrict reordering, since moving a table across a <code>LEFT JOIN</code> can change the result. In a query with many joins, a plan that looks wrong is sometimes the cut-off at work, not a statistics problem.</p>
+<h2 id="ctes">CTEs</h2>
+<p>Since PostgreSQL 12, a non-recursive CTE that is referenced once and has no side effects is inlined like a subquery, so the outer filter reaches the base table:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> c <span class="kw">AS</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;cancelled&#39;</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> c <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                    QUERY PLAN
+--------------------------------------------------
+ Bitmap Heap Scan on orders
+   Recheck Cond: (status = &#39;cancelled&#39;::text)
+   Filter: (customer_id = 5)
+   -&gt;  Bitmap Index Scan on orders_status_idx
+         Index Cond: (status = &#39;cancelled&#39;::text)
+(5 rows)</code></pre>
+<p><code>MATERIALIZED</code> turns the CTE into a separate step that is computed on its own and then scanned:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> c <span class="kw">AS</span> <span class="kw">MATERIALIZED</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;cancelled&#39;</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> c <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ CTE Scan on c
+   Filter: (customer_id = 5)
+   CTE c
+     -&gt;  Bitmap Heap Scan on orders
+           Recheck Cond: (status = &#39;cancelled&#39;::text)
+           -&gt;  Bitmap Index Scan on orders_status_idx
+                 Index Cond: (status = &#39;cancelled&#39;::text)
+(7 rows)</code></pre>
+<p>A CTE that is referenced twice is materialized by default, which is right when it is expensive and wrong when the outer filters would cut it down. <code>NOT MATERIALIZED</code> inlines it into each reference, so the <code>order_id = 100</code> filter can use the primary key:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> c <span class="kw">AS</span> <span class="kw">NOT</span> <span class="kw">MATERIALIZED</span> (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;cancelled&#39;</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> c a <span class="kw">JOIN</span> c b <span class="kw">ON</span> a.customer_id <span class="op">=</span> b.customer_id <span class="kw">WHERE</span> a.order_id <span class="op">=</span> <span class="dv">100</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+----------------------------------------------------------
+ Hash Join
+   Hash Cond: (orders_1.customer_id = orders.customer_id)
+   -&gt;  Bitmap Heap Scan on orders orders_1
+         Recheck Cond: (status = &#39;cancelled&#39;::text)
+         -&gt;  Bitmap Index Scan on orders_status_idx
+               Index Cond: (status = &#39;cancelled&#39;::text)
+   -&gt;  Hash
+         -&gt;  Index Scan using orders_pkey on orders
+               Index Cond: (order_id = 100)
+               Filter: (status = &#39;cancelled&#39;::text)
+(10 rows)</code></pre>
+<h2 id="equivalent-results-different-plans">Equivalent results, different plans</h2>
+<p>Rewriting a query to something equivalent does not always lead to the same plan. "Customers that have an order" can be written three ways. <code>EXISTS</code> (and <code>IN</code>, which gives the same plan on this data) becomes a join against a de-duplicated copy of <code>orders</code>:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Hash Join
+   Hash Cond: (c.customer_id = o.customer_id)
+   -&gt;  Seq Scan on customers c
+   -&gt;  Hash
+         -&gt;  HashAggregate
+               Group Key: o.customer_id
+               -&gt;  Seq Scan on orders o
+(7 rows)</code></pre>
+<p><code>JOIN</code> plus <code>DISTINCT</code> returns the same customers but joins first and removes duplicates afterwards, over every matching row:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> c.<span class="op">*</span> <span class="kw">FROM</span> customers c <span class="kw">JOIN</span> orders o <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                     QUERY PLAN
+----------------------------------------------------
+ HashAggregate
+   Group Key: c.customer_id, c.name, c.region
+   -&gt;  Hash Join
+         Hash Cond: (o.customer_id = c.customer_id)
+         -&gt;  Seq Scan on orders o
+         -&gt;  Hash
+               -&gt;  Seq Scan on customers c
+(7 rows)</code></pre>
+<p>A correlated subquery in the select list is not turned into a join at all. It stays a subplan that runs once per customer row:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id,</span>
+<span>       (<span class="kw">SELECT</span> <span class="fu">max</span>(o.total) <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> biggest</span>
+<span><span class="kw">FROM</span> customers c;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+-------------------------------------------------------
+ Seq Scan on customers c
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Seq Scan on orders o
+                 Filter: (customer_id = c.customer_id)
+(5 rows)</code></pre>
+<p>The planner can only rewrite what it can prove to be equivalent. <code>NOT IN</code> and <code>NOT EXISTS</code> look interchangeable and are not once a <code>NULL</code> is involved (Day 22), so PostgreSQL never converts one into the other.</p>
+<h2 id="constraints-are-information">Constraints are information</h2>
+<p>The planner uses what the schema declares. A <code>NOT NULL</code> column makes <code>IS NOT NULL</code> redundant and <code>IS NULL</code> impossible:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     QUERY PLAN
+--------------------
+ Seq Scan on orders
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">IS</span> <span class="kw">NULL</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>        QUERY PLAN
+--------------------------
+ Result
+   One-Time Filter: false
+(2 rows)</code></pre>
+<p>A <code>LEFT JOIN</code> to a table through its primary key can add no rows and, when no column of that table is used, the join is dropped:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> o.order_id <span class="kw">FROM</span> orders o <span class="kw">LEFT</span> <span class="kw">JOIN</span> customers c <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>      QUERY PLAN
+----------------------
+ Seq Scan on orders o
+(1 row)</code></pre>
+<p>This is a place where it helps to check rather than assume. A foreign key does not allow the same removal for an inner join in PostgreSQL, so the same query with <code>JOIN</code> still joins <code>customers</code>:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> o.order_id <span class="kw">FROM</span> orders o <span class="kw">JOIN</span> customers c <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Hash Join
+   Hash Cond: (o.customer_id = c.customer_id)
+   -&gt;  Seq Scan on orders o
+   -&gt;  Hash
+         -&gt;  Seq Scan on customers c
+(5 rows)</code></pre>
+<p>Dropping a unique index or a <code>NOT NULL</code> can therefore change plans, not just data validation.</p>
+<h2 id="combining-indexes-and-new-capabilities">Combining indexes, and new capabilities</h2>
+<p>Two single-column indexes can answer a two-column condition. The planner builds a bitmap from each and intersects them:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> people (</span>
+<span>    person_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    city       <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    age        <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    bio        TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> people</span>
+<span><span class="kw">SELECT</span> g, g % <span class="dv">200</span>, g % <span class="dv">90</span>, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">50</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> people_city_idx <span class="kw">ON</span> people (city);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> people_age_idx <span class="kw">ON</span> people (age);</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> people;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> people <span class="kw">WHERE</span> city <span class="op">=</span> <span class="dv">7</span> <span class="kw">AND</span> age <span class="op">=</span> <span class="dv">30</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                    QUERY PLAN
+--------------------------------------------------
+ Bitmap Heap Scan on people
+   Recheck Cond: ((city = 7) AND (age = 30))
+   -&gt;  BitmapAnd
+         -&gt;  Bitmap Index Scan on people_city_idx
+               Index Cond: (city = 7)
+         -&gt;  Bitmap Index Scan on people_age_idx
+               Index Cond: (age = 30)
+(7 rows)</code></pre>
+<p>An upgrade can also change a plan with no change to the query. PostgreSQL 18 can use a composite b-tree index when the query skips its leading column, by probing each distinct value of that column ("skip scan"). With an index on <code>(sensor, ts)</code> and five sensors, a search on <code>ts</code> alone needs six index searches (five probes and one more):</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> readings (</span>
+<span>    sensor  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    ts      <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    v       <span class="dt">INT</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> readings <span class="kw">SELECT</span> g % <span class="dv">5</span>, g, g <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> readings_sensor_ts_idx <span class="kw">ON</span> readings (sensor, ts);</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> readings;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> sensor, ts <span class="kw">FROM</span> readings <span class="kw">WHERE</span> ts <span class="op">=</span> <span class="dv">500</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                     QUERY PLAN
+-------------------------------------------------------------------------------------
+ Index Only Scan using readings_sensor_ts_idx on readings (actual rows=1.00 loops=1)
+   Index Cond: (ts = 500)
+   Heap Fetches: 1
+   Index Searches: 6
+(4 rows)</code></pre>
+<p>Earlier versions could not do this; they would have scanned the whole index or the table. It is the declarative model working in your favour: the same SQL, a better plan.</p>
+<h2 id="where-the-plan-goes-wrong">Where the plan goes wrong</h2>
+<p>Plans come from estimates, and estimates come from per-column statistics. The planner assumes columns are independent. When they are not, the combined estimate is far off. In <code>sales</code>, every country has exactly one currency:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> sales (</span>
+<span>    sale_id   <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    country   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    currency  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> sales</span>
+<span><span class="kw">SELECT</span> g,</span>
+<span>       (<span class="dt">ARRAY</span>[<span class="st">&#39;JP&#39;</span>, <span class="st">&#39;US&#39;</span>, <span class="st">&#39;DE&#39;</span>, <span class="st">&#39;BR&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">4</span>],</span>
+<span>       (<span class="dt">ARRAY</span>[<span class="st">&#39;JPY&#39;</span>, <span class="st">&#39;USD&#39;</span>, <span class="st">&#39;EUR&#39;</span>, <span class="st">&#39;BRL&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">4</span>]</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10000</span>) g;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> sales;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> sales <span class="kw">WHERE</span> country <span class="op">=</span> <span class="st">&#39;JP&#39;</span> <span class="kw">AND</span> currency <span class="op">=</span> <span class="st">&#39;JPY&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                       QUERY PLAN
+----------------------------------------------------------------------------------------
+ Seq Scan on sales  (cost=0.00..205.00 rows=625 width=11) (actual rows=2500.00 loops=1)
+   Filter: ((country = &#39;JP&#39;::text) AND (currency = &#39;JPY&#39;::text))
+   Rows Removed by Filter: 7500
+(3 rows)</code></pre>
+<p>A quarter of the rows are <code>JP</code> and a quarter are <code>JPY</code>, so under independence about one sixteenth match: the estimate is 625 and the real number is 2,500. Telling the planner about the dependency fixes the estimate:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">STATISTICS</span> sales_dep (dependencies) <span class="kw">ON</span> country, currency <span class="kw">FROM</span> sales;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> sales;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> sales <span class="kw">WHERE</span> country <span class="op">=</span> <span class="st">&#39;JP&#39;</span> <span class="kw">AND</span> currency <span class="op">=</span> <span class="st">&#39;JPY&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Seq Scan on sales  (cost=0.00..205.00 rows=2500 width=11) (actual rows=2500.00 loops=1)
+   Filter: ((country = &#39;JP&#39;::text) AND (currency = &#39;JPY&#39;::text))
+   Rows Removed by Filter: 7500
+(3 rows)</code></pre>
+<p>The plan did not change here because a sequential scan was right either way. The estimate matters once other choices depend on it, such as the join order above a filter like this one. Comparing <code>rows=</code> with <code>actual rows=</code> in <code>EXPLAIN ANALYZE</code> shows where the planner's model and the data disagree.</p>
+<p>Prepared statements are another source. After a few executions PostgreSQL may switch to a generic plan that does not look at the parameter value. With a very skewed column that plan can suit one value and not the other:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> jobs (</span>
+<span>    job_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    state   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> jobs</span>
+<span><span class="kw">SELECT</span> g, <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">1000</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;failed&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;done&#39;</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> jobs_state_idx <span class="kw">ON</span> jobs (state);</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> jobs;</span>
+<span></span>
+<span><span class="kw">PREPARE</span> jobs_in_state(TEXT) <span class="kw">AS</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> jobs <span class="kw">WHERE</span> state <span class="op">=</span> $<span class="dv">1</span>;</span>
+<span></span>
+<span><span class="kw">SET</span> plan_cache_mode <span class="op">=</span> force_generic_plan;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> jobs_in_state(<span class="st">&#39;done&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>               QUERY PLAN
+-----------------------------------------
+ Index Scan using jobs_state_idx on jobs
+   Index Cond: (state = $1)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">SET</span> plan_cache_mode <span class="op">=</span> force_custom_plan;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> jobs_in_state(<span class="st">&#39;done&#39;</span>);</span>
+<span></span>
+<span><span class="kw">RESET</span> plan_cache_mode;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>            QUERY PLAN
+----------------------------------
+ Seq Scan on jobs
+   Filter: (state = &#39;done&#39;::text)
+(2 rows)</code></pre>
+<p>With the generic plan, a query for the 99,900 <code>done</code> rows goes through an index. With the actual value known, the planner chooses a sequential scan. <code>plan_cache_mode</code> is a debugging switch and a setting you can use per session, as shown. The usual fix is accurate statistics, or <code>force_custom_plan</code> for the statements that need it.</p>
+<h2 id="what-the-planner-cannot-see-into">What the planner cannot see into</h2>
+<p>A plain SQL function can be inlined: its body is substituted into the query and then optimized with it. A PL/pgSQL function is a black box that the planner can only call:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> with_tax_sql(n <span class="dt">NUMERIC</span>) RETURNS <span class="dt">NUMERIC</span></span>
+<span>LANGUAGE sql IMMUTABLE <span class="kw">AS</span> <span class="st">&#39;SELECT n * 1.2&#39;</span>;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">FUNCTION</span> with_tax_plpgsql(n <span class="dt">NUMERIC</span>) RETURNS <span class="dt">NUMERIC</span></span>
+<span>LANGUAGE plpgsql IMMUTABLE <span class="kw">AS</span> $$ <span class="cf">BEGIN</span> <span class="kw">RETURN</span> n <span class="op">*</span> <span class="fl">1.2</span>; <span class="cf">END</span> $$;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (VERBOSE, COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> with_tax_sql(total) <span class="kw">FROM</span> orders;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>        QUERY PLAN
+---------------------------
+ Seq Scan on public.orders
+   Output: (total * 1.2)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (VERBOSE, COSTS <span class="kw">OFF</span>) <span class="kw">SELECT</span> with_tax_plpgsql(total) <span class="kw">FROM</span> orders;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>            QUERY PLAN
+-----------------------------------
+ Seq Scan on public.orders
+   Output: with_tax_plpgsql(total)
+(2 rows)</code></pre>
+<p>In the second plan the planner has no idea what the function does, so it cannot use an index on <code>total * 1.2</code>, estimate its selectivity or move it around. Row-by-row procedural code, cursors and trigger side effects work the same way: they are outside the declarative model, and the planner optimizes around them instead of through them.</p>
+<p>When the planner chooses badly, the usual levers are statistics, constraints, indexes and cost settings such as <code>random_page_cost</code>. PostgreSQL has no query hints in core; the <code>pg_hint_plan</code> extension provides them if you really need to force a plan.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Describe what you want first and look at the plan second. Reordering predicates, wrapping a filter in a subquery and <code>IN</code> versus <code>OR</code> change nothing, and <code>EXPLAIN</code> shows it.</li>
+<li>Check an optimization by comparing plans, not by trusting the rewrite. Some rewrites that look equivalent produce different plans, and some that look different produce the same one.</li>
+<li>When a plan is wrong, look at <code>rows=</code> against <code>actual rows=</code> first. The usual causes are stale statistics, correlated columns and generic plans.</li>
+<li>Declare constraints and keep functions inlinable. Both give the planner more to work with.</li>
+</ul>
+<p>That is the last of the 31 days.</p>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day31.pdf" download>Download PDF · Day 31</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../30/">← Day 30</a>
+  <a href="../../">All 31 days</a>
+  <span></span>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/31/</span>
+</footer>
+
+</body>
+</html>

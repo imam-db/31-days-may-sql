@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 17: String Parsing in SQL · #31DaysMaySQL</title>
+<meta name="description" content="Pull domains, paths, query parameters, list items, log fields and version numbers out of text with PostgreSQL&#x27;s string and regex functions, including the edge cases that break the obvious pattern.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 17: String Parsing in SQL">
+<meta property="og:description" content="Pull domains, paths, query parameters, list items, log fields and version numbers out of text with PostgreSQL&#x27;s string and regex functions, including the edge cases that break the obvious pattern.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../16/">← Day 16</a><a href="../18/">Day 18 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 17</p>
+  <h1>String Parsing in SQL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>The monitoring system logs every API request, and one column holds the full URL, for example <code>https://api.shop.com/v2/orders/12345?source=mobile&amp;utm=email</code>. Product asks how many orders per day come from the mobile app. The answer is in that string: the path says it is an order, the <code>source</code> parameter says where from.</p>
+<p>You can pull the rows into Python and parse them there, or you can do it where the data already is. SQL has enough string functions to handle most of this, and it keeps the parsing next to the data, so only the result leaves the database. The examples run on PostgreSQL 18; the last section lists the equivalents in other databases.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> request_logs (</span>
+<span>    log_id        BIGINT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    logged_at     <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    url           TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    user_agent    TEXT,</span>
+<span>    response_time <span class="dt">INT</span>,</span>
+<span>    status_code   <span class="dt">INT</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> request_logs (logged_at, url, user_agent, response_time, status_code) <span class="kw">VALUES</span></span>
+<span>(<span class="st">&#39;2024-06-10 09:15:22&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/orders/12345?source=mobile</span><span class="ch">&amp;utm</span><span class="st">=email&#39;</span>,  <span class="st">&#39;Mobile/iOS&#39;</span>,     <span class="dv">142</span>, <span class="dv">200</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:15:24&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/products/laptop-pro?ref=homepage&#39;</span>,      <span class="st">&#39;Chrome/120&#39;</span>,      <span class="dv">88</span>, <span class="dv">200</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:15:31&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/orders/12346?source=web</span><span class="ch">&amp;utm</span><span class="st">=organic&#39;</span>,   <span class="st">&#39;Chrome/120&#39;</span>,     <span class="dv">156</span>, <span class="dv">201</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:16:02&#39;</span>, <span class="st">&#39;https://cdn.shop.com/images/products/laptop-pro.jpg&#39;</span>,           <span class="st">&#39;Mobile/Android&#39;</span>,  <span class="dv">23</span>, <span class="dv">200</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:16:15&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/users/me?include=orders,addresses&#39;</span>,     <span class="st">&#39;Mobile/iOS&#39;</span>,      <span class="dv">67</span>, <span class="dv">200</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:16:45&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/orders/12347?source=mobile</span><span class="ch">&amp;utm</span><span class="st">=push&#39;</span>,   <span class="st">&#39;Mobile/Android&#39;</span>, <span class="dv">198</span>, <span class="dv">200</span>),</span>
+<span>(<span class="st">&#39;2024-06-11 08:02:10&#39;</span>, <span class="st">&#39;https://api.shop.com/v2/orders/12348?resource=app</span><span class="ch">&amp;source</span><span class="st">=mobile&#39;</span>, <span class="st">&#39;Mobile/iOS&#39;</span>,    <span class="dv">120</span>, <span class="dv">200</span>);</span></code></pre>
+<p>The last row has a parameter called <code>resource</code>. It looks irrelevant now and will matter in a moment.</p>
+<h2 id="the-functions-you-will-use-most">The functions you will use most</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Function</th>
+<th>What it does</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>split_part(str, delim, n)</code></td>
+<td>n-th piece, counting from 1; a negative n counts from the end (PostgreSQL 14+)</td>
+<td><code>split_part('a/b/c', '/', 2)</code> is <code>b</code></td>
+</tr>
+<tr class="even">
+<td><code>position(sub IN str)</code></td>
+<td>where a substring starts, 0 if absent</td>
+<td><code>position('@' IN 'a@b.com')</code> is <code>2</code></td>
+</tr>
+<tr class="odd">
+<td><code>substring(str FROM pattern)</code></td>
+<td>first match of a regex, or its first capture group</td>
+<td><code>substring('id=42' FROM '\d+')</code> is <code>42</code></td>
+</tr>
+<tr class="even">
+<td><code>regexp_match(str, pattern)</code></td>
+<td>array of the capture groups of the first match, <code>NULL</code> if none</td>
+<td><code>regexp_match('id=42', 'id=(\d+)')</code> is <code>{42}</code></td>
+</tr>
+<tr class="odd">
+<td><code>regexp_replace(str, pattern, repl, flags)</code></td>
+<td>replace matches; the <code>g</code> flag replaces all of them</td>
+<td><code>regexp_replace('a1b', '\d', '', 'g')</code> is <code>ab</code></td>
+</tr>
+<tr class="even">
+<td><code>string_to_array(str, delim)</code></td>
+<td>split into an array</td>
+<td><code>string_to_array('a,b', ',')</code> is <code>{a,b}</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>split_part</code> covers most fixed-format cases. Reach for a regex when the position of a piece depends on what surrounds it.</p>
+<h2 id="domain-and-path">Domain and path</h2>
+<p>The domain sits between <code>://</code> and the next <code>/</code>, so two <code>split_part</code> calls are enough: the inner one drops the protocol, the outer one keeps what is before the first slash.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> split_part(split_part(url, <span class="st">&#39;://&#39;</span>, <span class="dv">2</span>), <span class="st">&#39;/&#39;</span>, <span class="dv">1</span>) <span class="kw">AS</span> <span class="kw">domain</span>,</span>
+<span>       <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> requests</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="kw">domain</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> requests <span class="kw">DESC</span>, <span class="kw">domain</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    domain    | requests
+--------------+----------
+ api.shop.com |        6
+ cdn.shop.com |        1
+(2 rows)</code></pre>
+<p>The path is everything from the first <code>/</code> after the domain up to <code>?</code>. A regex says that more directly than a chain of splits:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> url,</span>
+<span>       (regexp_match(url, <span class="st">&#39;://[^/]+(/[^?#]*)&#39;</span>))[<span class="dv">1</span>] <span class="kw">AS</span> path</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                               url                               |              path
+-----------------------------------------------------------------+---------------------------------
+ https://api.shop.com/v2/orders/12345?source=mobile&amp;utm=email    | /v2/orders/12345
+ https://api.shop.com/v2/products/laptop-pro?ref=homepage        | /v2/products/laptop-pro
+ https://api.shop.com/v2/orders/12346?source=web&amp;utm=organic     | /v2/orders/12346
+ https://cdn.shop.com/images/products/laptop-pro.jpg             | /images/products/laptop-pro.jpg
+ https://api.shop.com/v2/users/me?include=orders,addresses       | /v2/users/me
+ https://api.shop.com/v2/orders/12347?source=mobile&amp;utm=push     | /v2/orders/12347
+ https://api.shop.com/v2/orders/12348?resource=app&amp;source=mobile | /v2/orders/12348
+(7 rows)</code></pre>
+<p><code>regexp_match</code> returns an array with one element per capture group, and <code>[1]</code> takes the first. <code>[^?#]*</code> stops at a query string or a fragment, whichever comes first.</p>
+<p>Once you have the path, <code>split_part</code> with a negative position gives the last segment, which is the file name for CDN requests:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> split_part((regexp_match(url, <span class="st">&#39;://[^/]+(/[^?#]*)&#39;</span>))[<span class="dv">1</span>], <span class="st">&#39;/&#39;</span>, <span class="op">-</span><span class="dv">1</span>) <span class="kw">AS</span> last_segment</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">WHERE</span> url <span class="kw">LIKE</span> <span class="st">&#39;https://cdn.%&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  last_segment
+----------------
+ laptop-pro.jpg
+(1 row)</code></pre>
+<h2 id="query-parameters">Query parameters</h2>
+<p>To read <code>source</code>, capture everything after <code>source=</code> up to the next <code>&amp;</code>. The obvious pattern is <code>source=([^&amp;]+)</code>. Here is what it does on the row with the <code>resource</code> parameter:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> url,</span>
+<span>       (regexp_match(url, <span class="st">&#39;source=([^&amp;]+)&#39;</span>))[<span class="dv">1</span>] <span class="kw">AS</span> naive,</span>
+<span>       (regexp_match(url, <span class="st">&#39;[?&amp;]source=([^&amp;#]*)&#39;</span>))[<span class="dv">1</span>] <span class="kw">AS</span> anchored</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">WHERE</span> log_id <span class="op">=</span> <span class="dv">7</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                               url                               | naive | anchored
+-----------------------------------------------------------------+-------+----------
+ https://api.shop.com/v2/orders/12348?resource=app&amp;source=mobile | app   | mobile
+(1 row)</code></pre>
+<p>The text <code>source=</code> also occurs inside <code>resource=</code>, and <code>regexp_match</code> returns the first match, so the naive pattern reports <code>app</code>. Requiring the parameter name to follow a <code>?</code> or <code>&amp;</code> fixes it. <code>[^&amp;#]*</code> also stops at a <code>#fragment</code>.</p>
+<p>The business question, orders per day and source, with the anchored pattern:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> logged_at:<span class="ch">:date</span> <span class="kw">AS</span> <span class="dt">day</span>,</span>
+<span>       (regexp_match(url, <span class="st">&#39;[?&amp;]source=([^&amp;#]*)&#39;</span>))[<span class="dv">1</span>] <span class="kw">AS</span> <span class="kw">source</span>,</span>
+<span>       <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> orders</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">WHERE</span> url ~ <span class="st">&#39;/orders/\d+&#39;</span></span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    day     | source | orders
+------------+--------+--------
+ 2024-06-10 | mobile |      2
+ 2024-06-10 | web    |      1
+ 2024-06-11 | mobile |      1
+(3 rows)</code></pre>
+<p><code>~</code> is PostgreSQL's regex match operator. The <code>WHERE</code> clause keeps only order URLs, so <code>/users/me?include=orders,addresses</code> is not counted. Extracting the order id itself is the same idea, with a cast:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> (regexp_match(url, <span class="st">&#39;/orders/(\d+)&#39;</span>))[<span class="dv">1</span>]:<span class="ch">:INT</span> <span class="kw">AS</span> order_id</span>
+<span><span class="kw">FROM</span> request_logs</span>
+<span><span class="kw">WHERE</span> url ~ <span class="st">&#39;/orders/\d+&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> order_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> order_id
+----------
+    12345
+    12346
+    12347
+    12348
+(4 rows)</code></pre>
+<p>Two limits of doing this with regexes. Values in a URL can be percent-encoded (<code>laptop%20pro</code>), and PostgreSQL has no built-in decoder for that. And a hand-written pattern knows nothing about the full URL grammar. For a handful of known parameters it is fine; for arbitrary URLs, parse them once in the application when you ingest them.</p>
+<h3 id="parse-once-not-on-every-query">Parse once, not on every query</h3>
+<p>A regex in a <code>WHERE</code> or <code>GROUP BY</code> runs on every row of every query and cannot use an ordinary index. If you filter on <code>source</code> often, store it as a generated column and index that:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> request_logs</span>
+<span>    <span class="kw">ADD</span> <span class="kw">COLUMN</span> <span class="kw">source</span> TEXT</span>
+<span>    <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> ((regexp_match(url, <span class="st">&#39;[?&amp;]source=([^&amp;#]*)&#39;</span>))[<span class="dv">1</span>]) STORED;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> request_logs_source_idx <span class="kw">ON</span> request_logs (<span class="kw">source</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> log_id, <span class="kw">source</span> <span class="kw">FROM</span> request_logs <span class="kw">WHERE</span> <span class="kw">source</span> <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> log_id | source
+--------+--------
+      1 | mobile
+      3 | web
+      6 | mobile
+      7 | mobile
+(4 rows)</code></pre>
+<p>PostgreSQL computes the value when the row is written. <code>regexp_match</code> is immutable, which is what a generated column requires.</p>
+<h2 id="splitting-a-list-stored-in-one-column">Splitting a list stored in one column</h2>
+<p>Sometimes several values are packed into one column. <code>string_to_array</code> splits the text into an array and <code>unnest</code> turns each array element into a row:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> user_interests (</span>
+<span>    user_id   <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    username  <span class="dt">VARCHAR</span>(<span class="dv">50</span>),</span>
+<span>    interests TEXT</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> user_interests <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;alice&#39;</span>,   <span class="st">&#39;tech,music,sports&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;bob&#39;</span>,     <span class="st">&#39;cooking,gardening&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;charlie&#39;</span>, <span class="st">&#39;tech,gaming,music&#39;</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="st">&#39;diana&#39;</span>,   <span class="st">&#39;travel,photography,cooking,music&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> user_id, username, unnest(string_to_array(interests, <span class="st">&#39;,&#39;</span>)) <span class="kw">AS</span> interest</span>
+<span><span class="kw">FROM</span> user_interests</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_id, interest;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id | username |  interest
+---------+----------+-------------
+       1 | alice    | music
+       1 | alice    | sports
+       1 | alice    | tech
+       2 | bob      | cooking
+       2 | bob      | gardening
+       3 | charlie  | gaming
+       3 | charlie  | music
+       3 | charlie  | tech
+       4 | diana    | cooking
+       4 | diana    | music
+       4 | diana    | photography
+       4 | diana    | travel
+(12 rows)</code></pre>
+<p>With the interests as rows, counting how many users share each one is a plain <code>GROUP BY</code>. Since PostgreSQL 14 there is also <code>string_to_table</code>, which does the split and the unnest in one call (<code>FROM user_interests, string_to_table(interests, ',') AS interest</code>).</p>
+<p>Two edge cases to know about. An empty string becomes an empty array, so that user produces no rows at all instead of one row with an empty value. And the split does not trim: <code>'a, b'</code> gives <code>a</code> and <code>b</code> with a leading space.</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> string_to_array(<span class="st">&#39;&#39;</span>, <span class="st">&#39;,&#39;</span>) <span class="kw">AS</span> empty_input,</span>
+<span>       string_to_array(<span class="st">&#39;a, b,,c&#39;</span>, <span class="st">&#39;,&#39;</span>) <span class="kw">AS</span> spaces_and_gaps,</span>
+<span>       string_to_array(<span class="kw">NULL</span>, <span class="st">&#39;,&#39;</span>) <span class="kw">IS</span> <span class="kw">NULL</span> <span class="kw">AS</span> null_input;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> empty_input | spaces_and_gaps | null_input
+-------------+-----------------+------------
+ {}          | {a,&quot; b&quot;,&quot;&quot;,c}   | t
+(1 row)</code></pre>
+<p>Apply <code>trim</code> to each element if the data has spaces after the commas. Two adjacent delimiters produce an empty string element (<code>""</code> in the array output above).</p>
+<h2 id="parsing-log-lines">Parsing log lines</h2>
+<p>Lines like <code>user=alice action=login ip=192.168.1.10</code> are key-value pairs in free text. Anchor each key with <code>\m</code> (the start of a word in PostgreSQL regexes) so that a key such as <code>ip=</code> cannot match inside the tail of a longer key:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> raw_logs (</span>
+<span>    log_id  BIGINT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    line    TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> raw_logs (line) <span class="kw">VALUES</span></span>
+<span>(<span class="st">&#39;2024-06-10 09:15:22 [INFO]  user=alice action=login ip=192.168.1.10&#39;</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:15:24 [WARN]  user=bob action=failed_login ip=192.168.1.11 reason=bad_password&#39;</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:15:31 [ERROR] user=charlie action=db_query duration=2400&#39;</span>),</span>
+<span>(<span class="st">&#39;2024-06-10 09:15:45 [INFO]  user=diana action=logout ip=192.168.1.12&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> substring(line <span class="kw">FROM</span> <span class="dv">1</span> <span class="cf">FOR</span> <span class="dv">19</span>)                    <span class="kw">AS</span> log_time,</span>
+<span>       (regexp_match(line, <span class="st">&#39;\[(\w+)\]&#39;</span>))[<span class="dv">1</span>]             <span class="kw">AS</span> log_level,</span>
+<span>       (regexp_match(line, <span class="st">&#39;\muser=(\w+)&#39;</span>))[<span class="dv">1</span>]          <span class="kw">AS</span> username,</span>
+<span>       (regexp_match(line, <span class="st">&#39;\maction=(\w+)&#39;</span>))[<span class="dv">1</span>]        <span class="kw">AS</span> action,</span>
+<span>       (regexp_match(line, <span class="st">&#39;\mip=([\d.]+)&#39;</span>))[<span class="dv">1</span>]         <span class="kw">AS</span> ip_address,</span>
+<span>       (regexp_match(line, <span class="st">&#39;\mduration=(\d+)&#39;</span>))[<span class="dv">1</span>]:<span class="ch">:INT</span> <span class="kw">AS</span> duration_ms</span>
+<span><span class="kw">FROM</span> raw_logs</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> log_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>      log_time       | log_level | username |    action    |  ip_address  | duration_ms
+---------------------+-----------+----------+--------------+--------------+-------------
+ 2024-06-10 09:15:22 | INFO      | alice    | login        | 192.168.1.10 |
+ 2024-06-10 09:15:24 | WARN      | bob      | failed_login | 192.168.1.11 |
+ 2024-06-10 09:15:31 | ERROR     | charlie  | db_query     |              |        2400
+ 2024-06-10 09:15:45 | INFO      | diana    | logout       | 192.168.1.12 |
+(4 rows)</code></pre>
+<p>Charlie's line has no <code>ip=</code>, so <code>regexp_match</code> returns <code>NULL</code>, and casting a <code>NULL</code> gives <code>NULL</code>. A missing optional field becomes a <code>NULL</code> instead of an error, and a field that appears on only some lines (<code>duration</code>, <code>reason</code>) needs no special handling.</p>
+<p><code>\m</code> is PostgreSQL's own syntax. Perl-style engines, which most other databases use, write the word boundary as <code>\b</code>.</p>
+<h2 id="version-numbers">Version numbers</h2>
+<p>Version strings sort wrongly as text, because <code>'2.10.0'</code> is smaller than <code>'2.9.7'</code> character by character. The numeric parts have to be compared as numbers.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> deployments (</span>
+<span>    deploy_id   <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    service     <span class="dt">VARCHAR</span>(<span class="dv">50</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    version     <span class="dt">VARCHAR</span>(<span class="dv">30</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    deployed_at <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> deployments (service, version, deployed_at) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;api&#39;</span>,      <span class="st">&#39;2.1.4&#39;</span>,         <span class="st">&#39;2024-05-01 10:00&#39;</span>),</span>
+<span>    (<span class="st">&#39;api&#39;</span>,      <span class="st">&#39;2.10.0&#39;</span>,        <span class="st">&#39;2024-05-15 14:30&#39;</span>),</span>
+<span>    (<span class="st">&#39;api&#39;</span>,      <span class="st">&#39;2.9.7&#39;</span>,         <span class="st">&#39;2024-05-10 09:15&#39;</span>),</span>
+<span>    (<span class="st">&#39;api&#39;</span>,      <span class="st">&#39;3.0.0-beta.2&#39;</span>,  <span class="st">&#39;2024-06-01 16:00&#39;</span>),</span>
+<span>    (<span class="st">&#39;frontend&#39;</span>, <span class="st">&#39;1.5.2&#39;</span>,         <span class="st">&#39;2024-05-20 11:00&#39;</span>),</span>
+<span>    (<span class="st">&#39;frontend&#39;</span>, <span class="st">&#39;1.6.0-rc.1&#39;</span>,    <span class="st">&#39;2024-05-25 14:00&#39;</span>),</span>
+<span>    (<span class="st">&#39;frontend&#39;</span>, <span class="st">&#39;1.6.0&#39;</span>,         <span class="st">&#39;2024-06-05 09:30&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> version <span class="kw">AS</span> by_text <span class="kw">FROM</span> deployments <span class="kw">WHERE</span> service <span class="op">=</span> <span class="st">&#39;api&#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> version;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   by_text
+--------------
+ 2.1.4
+ 2.10.0
+ 2.9.7
+ 3.0.0-beta.2
+(4 rows)</code></pre>
+<p>Splitting the core part (before any <code>-</code>) into an <code>INT[]</code> gives a sort key, because PostgreSQL compares arrays element by element. The suffix after the first <code>-</code> is the prerelease tag, and a version without one is a stable release, which sorts after its prereleases:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> service, version,</span>
+<span>       string_to_array(split_part(version, <span class="st">&#39;-&#39;</span>, <span class="dv">1</span>), <span class="st">&#39;.&#39;</span>):<span class="ch">:INT</span>[] <span class="kw">AS</span> core,</span>
+<span>       substring(version <span class="kw">FROM</span> <span class="st">&#39;-(.*)$&#39;</span>)                         <span class="kw">AS</span> prerelease</span>
+<span><span class="kw">FROM</span> deployments</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> service,</span>
+<span>         string_to_array(split_part(version, <span class="st">&#39;-&#39;</span>, <span class="dv">1</span>), <span class="st">&#39;.&#39;</span>):<span class="ch">:INT</span>[],</span>
+<span>         version <span class="kw">NOT</span> <span class="kw">LIKE</span> <span class="st">&#39;%-%&#39;</span>,        <span class="co">-- false (prerelease) sorts before true (stable)</span></span>
+<span>         version;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> service  |   version    |   core   | prerelease
+----------+--------------+----------+------------
+ api      | 2.1.4        | {2,1,4}  |
+ api      | 2.9.7        | {2,9,7}  |
+ api      | 2.10.0       | {2,10,0} |
+ api      | 3.0.0-beta.2 | {3,0,0}  | beta.2
+ frontend | 1.5.2        | {1,5,2}  |
+ frontend | 1.6.0-rc.1   | {1,6,0}  | rc.1
+ frontend | 1.6.0        | {1,6,0}  |
+(7 rows)</code></pre>
+<p><code>2.10.0</code> now follows <code>2.9.7</code>, <code>3.0.0-beta.2</code> comes last for the API, and <code>1.6.0-rc.1</code> precedes <code>1.6.0</code>. Take the prerelease tag with <code>substring(... FROM '-(.*)$')</code> rather than <code>split_part(version, '-', 2)</code>, because the latter cuts a tag like <code>rc-1</code> down to <code>rc</code>.</p>
+<p>This is a good sort for the common cases, not a complete implementation of the Semantic Versioning rules. Among prereleases the final <code>version</code> tie-breaker compares text, so <code>beta.10</code> would sort before <code>beta.2</code>, and build metadata after <code>+</code> is not handled. If you need the full rules, store the parsed parts in separate columns when you ingest the data.</p>
+<h2 id="cleaning-inconsistent-text">Cleaning inconsistent text</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> messy_contacts (</span>
+<span>    contact_id  <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name        <span class="dt">VARCHAR</span>(<span class="dv">100</span>),</span>
+<span>    email       <span class="dt">VARCHAR</span>(<span class="dv">100</span>),</span>
+<span>    phone       <span class="dt">VARCHAR</span>(<span class="dv">50</span>)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> messy_contacts (name, email, phone) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;  alice WONG  &#39;</span>,  <span class="st">&#39; Alice@Shop.COM &#39;</span>,    <span class="st">&#39;(555) 123-4567&#39;</span>),</span>
+<span>    (<span class="st">&#39;Bob Smith&#39;</span>,       <span class="st">&#39;bob.smith@shop.com&#39;</span>,  <span class="st">&#39;+1-555-234-5678&#39;</span>),</span>
+<span>    (<span class="st">&#39;charlie BROWN&#39;</span>,   <span class="st">&#39;CHARLIE@SHOP.COM&#39;</span>,    <span class="st">&#39;555.345.6789&#39;</span>),</span>
+<span>    (<span class="kw">NULL</span>,              <span class="st">&#39;diana@shop.com&#39;</span>,      <span class="st">&#39;15554567890&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> contact_id,</span>
+<span>       <span class="fu">initcap</span>(<span class="fu">trim</span>(name))                                    <span class="kw">AS</span> clean_name,</span>
+<span>       <span class="fu">lower</span>(<span class="fu">trim</span>(email))                                     <span class="kw">AS</span> clean_email,</span>
+<span>       <span class="kw">right</span>(<span class="fu">regexp_replace</span>(phone, <span class="st">&#39;\D&#39;</span>, <span class="st">&#39;&#39;</span>, <span class="st">&#39;g&#39;</span>), <span class="dv">10</span>)        <span class="kw">AS</span> clean_phone</span>
+<span><span class="kw">FROM</span> messy_contacts</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> contact_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> contact_id |  clean_name   |    clean_email     | clean_phone
+------------+---------------+--------------------+-------------
+          1 | Alice Wong    | alice@shop.com     | 5551234567
+          2 | Bob Smith     | bob.smith@shop.com | 5552345678
+          3 | Charlie Brown | charlie@shop.com   | 5553456789
+          4 |               | diana@shop.com     | 5554567890
+(4 rows)</code></pre>
+<p><code>regexp_replace(phone, '\D', '', 'g')</code> deletes every non-digit, and <code>right(..., 10)</code> then drops a leading country code. That second step assumes all numbers are 10-digit North American numbers, so check it against your own data first. <code>initcap</code> capitalizes the first letter after every non-letter and lowercases the rest, so it turns <code>McDonald</code> into <code>Mcdonald</code>. Treat it as a first pass for names, not a final answer. A <code>NULL</code> name stays <code>NULL</code> through every function.</p>
+<h2 id="building-strings">Building strings</h2>
+<p>The reverse direction is also common: assembling text from rows. <code>string_agg</code> joins the values of a group, and with <code>ORDER BY</code> inside the call the order is under your control:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> user_events (</span>
+<span>    user_id     <span class="dt">INT</span>,</span>
+<span>    action      <span class="dt">VARCHAR</span>(<span class="dv">50</span>),</span>
+<span>    occurred_at <span class="dt">TIMESTAMP</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> user_events <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;landing&#39;</span>,        <span class="st">&#39;2024-06-10 10:00&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;signup&#39;</span>,         <span class="st">&#39;2024-06-10 10:05&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;email_verify&#39;</span>,   <span class="st">&#39;2024-06-10 10:10&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;first_purchase&#39;</span>, <span class="st">&#39;2024-06-10 10:30&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;landing&#39;</span>,        <span class="st">&#39;2024-06-10 11:00&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;product_view&#39;</span>,   <span class="st">&#39;2024-06-10 11:02&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;cart&#39;</span>,           <span class="st">&#39;2024-06-10 11:05&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;abandon&#39;</span>,        <span class="st">&#39;2024-06-10 11:15&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;landing&#39;</span>,        <span class="st">&#39;2024-06-10 12:00&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;search&#39;</span>,         <span class="st">&#39;2024-06-10 12:05&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;product_view&#39;</span>,   <span class="st">&#39;2024-06-10 12:10&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;cart&#39;</span>,           <span class="st">&#39;2024-06-10 12:15&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;checkout&#39;</span>,       <span class="st">&#39;2024-06-10 12:20&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> user_id,</span>
+<span>       string_agg(action, <span class="st">&#39; -&gt; &#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> occurred_at) <span class="kw">AS</span> user_journey</span>
+<span><span class="kw">FROM</span> user_events</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> user_id</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id |                     user_journey
+---------+-------------------------------------------------------
+       1 | landing -&gt; signup -&gt; email_verify -&gt; first_purchase
+       2 | landing -&gt; product_view -&gt; cart -&gt; abandon
+       3 | landing -&gt; search -&gt; product_view -&gt; cart -&gt; checkout
+(3 rows)</code></pre>
+<p>For a URL built from columns, <code>concat_ws</code> joins with a separator and skips <code>NULL</code> arguments, where <code>||</code> turns the whole result <code>NULL</code> as soon as one part is <code>NULL</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;https://api.shop.com/v2/users/&#39;</span> <span class="op">||</span> <span class="dv">101</span> <span class="op">||</span> <span class="st">&#39;/orders?status=&#39;</span> <span class="op">||</span> <span class="st">&#39;active&#39;</span>           <span class="kw">AS</span> with_pipes,</span>
+<span>       <span class="st">&#39;https://api.shop.com/v2/users/&#39;</span> <span class="op">||</span> <span class="dv">101</span> <span class="op">||</span> <span class="st">&#39;/orders?status=&#39;</span> <span class="op">||</span> <span class="kw">NULL</span>:<span class="ch">:TEXT</span>         <span class="kw">AS</span> pipes_with_null,</span>
+<span>       concat_ws(<span class="st">&#39;&amp;&#39;</span>, <span class="st">&#39;status=active&#39;</span>, <span class="kw">NULL</span>, <span class="st">&#39;from=&#39;</span> <span class="op">||</span> <span class="fu">to_char</span>(<span class="dt">DATE</span> <span class="st">&#39;2024-06-01&#39;</span>, <span class="st">&#39;YYYY-MM-DD&#39;</span>)) <span class="kw">AS</span> query_string;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                       with_pipes                       | pipes_with_null |         query_string
+--------------------------------------------------------+-----------------+-------------------------------
+ https://api.shop.com/v2/users/101/orders?status=active |                 | status=active&amp;from=2024-06-01
+(1 row)</code></pre>
+<h2 id="equivalents-in-other-databases">Equivalents in other databases</h2>
+<p>Names differ. These are the usual ones for the functions above:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Task</th>
+<th>PostgreSQL</th>
+<th>MySQL 8</th>
+<th>SQL Server</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Concatenate with a separator</td>
+<td><code>concat_ws()</code></td>
+<td><code>CONCAT_WS()</code></td>
+<td><code>CONCAT_WS()</code> (2017+)</td>
+</tr>
+<tr class="even">
+<td>n-th piece of a delimited string</td>
+<td><code>split_part()</code></td>
+<td><code>SUBSTRING_INDEX()</code>, nested twice</td>
+<td>no direct function; <code>STRING_SPLIT()</code> returns rows</td>
+</tr>
+<tr class="odd">
+<td>Position of a substring</td>
+<td><code>position()</code></td>
+<td><code>LOCATE()</code></td>
+<td><code>CHARINDEX()</code></td>
+</tr>
+<tr class="even">
+<td>Regex replace</td>
+<td><code>regexp_replace()</code></td>
+<td><code>REGEXP_REPLACE()</code></td>
+<td>check your version's documentation</td>
+</tr>
+<tr class="odd">
+<td>String to rows</td>
+<td><code>unnest(string_to_array())</code>, <code>string_to_table()</code></td>
+<td>recursive CTE or <code>JSON_TABLE</code></td>
+<td><code>STRING_SPLIT()</code></td>
+</tr>
+</tbody>
+</table>
+<p>In MySQL the n-th piece is <code>SUBSTRING_INDEX(SUBSTRING_INDEX(str, delim, n), delim, -1)</code>. Also in MySQL, <code>||</code> is a logical OR unless the <code>PIPES_AS_CONCAT</code> mode is on, so use <code>CONCAT()</code> there.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Use <code>split_part</code> for fixed-format pieces and <code>regexp_match</code> when context decides where a piece starts.</li>
+<li>Anchor a regex on the delimiter before the name (<code>[?&amp;]source=</code>), or <code>source=</code> will match inside <code>resource=</code>.</li>
+<li>Parse once into a generated column if you filter on the value often.</li>
+<li><code>string_to_array</code> plus <code>unnest</code> turns a packed list into rows; empty strings produce no rows and nothing is trimmed.</li>
+<li>Percent-encoded URLs and the full version-numbering rules are better handled in the application at ingestion time.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day17.pdf" download>Download PDF · Day 17</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../16/">← Day 16</a>
+  <a href="../../">All 31 days</a>
+  <a href="../18/">Day 18 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/17/</span>
+</footer>
+
+</body>
+</html>

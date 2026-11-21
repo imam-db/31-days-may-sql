@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 22: NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL · #31DaysMaySQL</title>
+<meta name="description" content="One NULL in the subquery makes NOT IN return zero rows. Why that happens, how NOT EXISTS and LEFT JOIN avoid it, and what PostgreSQL&#x27;s planner does with each.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 22: NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL">
+<meta property="og:description" content="One NULL in the subquery makes NOT IN return zero rows. Why that happens, how NOT EXISTS and LEFT JOIN avoid it, and what PostgreSQL&#x27;s planner does with each.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../21/">← Day 21</a><a href="../23/">Day 23 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 22</p>
+  <h1>NOT IN vs NOT EXISTS vs LEFT JOIN IS NULL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>"Which customers have never placed an order?" comes up in almost every reporting job, and there are three usual ways to write it:</p>
+<pre class="code"><code><span><span class="co">-- 1. NOT IN</span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> customer_id <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders);</span>
+<span></span>
+<span><span class="co">-- 2. NOT EXISTS</span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span>);</span>
+<span></span>
+<span><span class="co">-- 3. LEFT JOIN ... IS NULL</span></span>
+<span><span class="kw">SELECT</span> c.<span class="op">*</span> <span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> o.customer_id <span class="kw">IS</span> <span class="kw">NULL</span>;</span></code></pre>
+<p>On clean data all three return the same rows. Add a single order whose <code>customer_id</code> is <code>NULL</code> and the first one returns nothing, with no error and no warning. The other two keep working.</p>
+<p>The examples below run on PostgreSQL 18. The <code>NOT IN</code> behaviour comes from the SQL standard, so MySQL, SQL Server and BigQuery give the same empty result. The query plans near the end are PostgreSQL's.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         <span class="dt">VARCHAR</span>(<span class="dv">100</span>) <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span>,              <span class="co">-- nullable on purpose</span></span>
+<span>    total        <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>), (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>), (<span class="dv">3</span>, <span class="st">&#39;Charlie&#39;</span>), (<span class="dv">4</span>, <span class="st">&#39;Diana&#39;</span>), (<span class="dv">5</span>, <span class="st">&#39;Eve&#39;</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">101</span>, <span class="dv">1</span>,  <span class="fl">99.00</span>),</span>
+<span>    (<span class="dv">102</span>, <span class="dv">1</span>, <span class="fl">149.50</span>),</span>
+<span>    (<span class="dv">103</span>, <span class="dv">3</span>, <span class="fl">250.00</span>),</span>
+<span>    (<span class="dv">104</span>, <span class="dv">4</span>,  <span class="fl">75.00</span>);</span></code></pre>
+<p>Bob (2) and Eve (5) have no orders, so the correct answer is two rows.</p>
+<h2 id="clean-data-all-three-agree">Clean data: all three agree</h2>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, name</span>
+<span><span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> customer_id <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span>
+<span></span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span>
+<span></span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> o.customer_id <span class="kw">IS</span> <span class="kw">NULL</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<p>Each of the three returns:</p>
+<pre class="out" aria-label="Query result"><code> customer_id | name
+-------------+------
+           2 | Bob
+           5 | Eve
+(2 rows)</code></pre>
+<h2 id="one-null-order">One NULL order</h2>
+<p>A guest checkout, a half-finished migration or a bad import leaves an order without a customer:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">VALUES</span> (<span class="dv">105</span>, <span class="kw">NULL</span>, <span class="fl">200.00</span>);</span></code></pre>
+<p>Run the <code>NOT IN</code> query again:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, name</span>
+<span><span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> customer_id <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | name
+-------------+------
+(0 rows)</code></pre>
+<p>Bob and Eve are gone. <code>NOT EXISTS</code> and the <code>LEFT JOIN</code> version still return both of them:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span>
+<span></span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> o.customer_id <span class="kw">IS</span> <span class="kw">NULL</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | name
+-------------+------
+           2 | Bob
+           5 | Eve
+(2 rows)</code></pre>
+<p>In a report this is easy to miss. The query still runs, it just says "no inactive customers", and that reads like good news.</p>
+<h2 id="why-not-in-returns-nothing">Why NOT IN returns nothing</h2>
+<p><code>x NOT IN (a, b, c)</code> is shorthand for <code>x &lt;&gt; a AND x &lt;&gt; b AND x &lt;&gt; c</code>. The subquery now returns <code>1, 1, 3, 4, NULL</code>, so for Bob the condition is:</p>
+<pre class="code"><code><span><span class="dv">2</span> <span class="op">&lt;&gt;</span> <span class="dv">1</span> <span class="kw">AND</span> <span class="dv">2</span> <span class="op">&lt;&gt;</span> <span class="dv">1</span> <span class="kw">AND</span> <span class="dv">2</span> <span class="op">&lt;&gt;</span> <span class="dv">3</span> <span class="kw">AND</span> <span class="dv">2</span> <span class="op">&lt;&gt;</span> <span class="dv">4</span> <span class="kw">AND</span> <span class="dv">2</span> <span class="op">&lt;&gt;</span> <span class="kw">NULL</span></span></code></pre>
+<p>The first four comparisons are true. The last one is <code>UNKNOWN</code>, because comparing anything with <code>NULL</code> gives <code>UNKNOWN</code>. <code>TRUE AND UNKNOWN</code> is <code>UNKNOWN</code>, and <code>WHERE</code> keeps a row only when the condition is <code>TRUE</code>. So Bob is dropped, and so is everyone else.</p>
+<p>Put differently: once the list contains a <code>NULL</code>, <code>NOT IN</code> can be false or unknown, but never true. You can see it without any tables:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="dv">2</span> <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">3</span>, <span class="kw">NULL</span>) <span class="kw">AS</span> bob,</span>
+<span>       <span class="dv">1</span> <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">3</span>, <span class="kw">NULL</span>) <span class="kw">AS</span> alice;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> bob | alice
+-----+-------
+     | f
+(1 row)</code></pre>
+<p>The empty cell is <code>NULL</code>. For Alice the answer is a plain <code>false</code>, because <code>1 &lt;&gt; 1</code> already fails. For Bob it is unknown, and unknown is filtered out.</p>
+<h2 id="why-not-exists-and-left-join-are-not-affected">Why NOT EXISTS and LEFT JOIN are not affected</h2>
+<p><code>NOT EXISTS</code> asks a different question for each customer: is there at least one order row where <code>o.customer_id = c.customer_id</code>? For the guest order that comparison is <code>UNKNOWN</code>, which counts as "not a match". The <code>NULL</code> row never matches anyone, so it cannot hide anyone either.</p>
+<p><code>LEFT JOIN</code> uses the same join condition. Customers with no matching order still come out of the join, with <code>NULL</code> in every <code>orders</code> column, and <code>WHERE o.customer_id IS NULL</code> keeps exactly those rows.</p>
+<h3 id="which-column-to-test-after-a-left-join">Which column to test after a LEFT JOIN</h3>
+<p>Two choices are always safe:</p>
+<ul>
+<li><strong>The join column</strong>, here <code>o.customer_id</code>. A row that matched through <code>o.customer_id = c.customer_id</code> cannot have <code>NULL</code> in that column, because <code>NULL</code> never equals anything.</li>
+<li><strong>A <code>NOT NULL</code> column</strong> of the right table, such as the primary key <code>o.order_id</code>.</li>
+</ul>
+<p>The one to avoid is a nullable column that is not part of the join. Add an optional coupon code and test that instead:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ADD</span> <span class="kw">COLUMN</span> coupon_code TEXT;  <span class="co">-- no order has one yet</span></span>
+<span></span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> o.coupon_code <span class="kw">IS</span> <span class="kw">NULL</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id |  name
+-------------+---------
+           1 | Alice
+           1 | Alice
+           2 | Bob
+           3 | Charlie
+           4 | Diana
+           5 | Eve
+(6 rows)</code></pre>
+<p>Every real order has an empty coupon, so every customer looks like a non-buyer, and Alice shows up twice. The query is valid and the answer is wrong.</p>
+<h2 id="fixing-not-in">Fixing NOT IN</h2>
+<p>If you keep <code>NOT IN</code>, filter the <code>NULL</code>s out of the subquery:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> customer_id, name</span>
+<span><span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> customer_id <span class="kw">NOT</span> <span class="kw">IN</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> customer_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> customer_id | name
+-------------+------
+           2 | Bob
+           5 | Eve
+(2 rows)</code></pre>
+<p>This works, but every <code>NOT IN</code> against a nullable column needs that extra line, and nothing tells you when it is missing. Writing <code>NOT EXISTS</code> from the start removes the problem instead of patching it.</p>
+<h2 id="what-postgresql-does-with-each">What PostgreSQL does with each</h2>
+<p>Correct results are the main reason to prefer <code>NOT EXISTS</code>, but the plans differ too. <code>NOT EXISTS</code> becomes an anti-join: PostgreSQL builds a hash of one side and keeps the customers that find no partner.</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Hash Right Anti Join
+   Hash Cond: (o.customer_id = c.customer_id)
+   -&gt;  Seq Scan on orders o
+   -&gt;  Hash
+         -&gt;  Seq Scan on customers c
+(5 rows)</code></pre>
+<p><code>LEFT JOIN ... WHERE o.customer_id IS NULL</code> gets the same plan. PostgreSQL recognises the pattern because the <code>IS NULL</code> test is on a column from the join condition. Test <code>o.order_id</code> instead and the rows are the same, but the plan is an ordinary outer join followed by a filter:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id, c.name</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id</span>
+<span><span class="kw">WHERE</span> o.order_id <span class="kw">IS</span> <span class="kw">NULL</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+----------------------------------------------
+ Hash Right Join
+   Hash Cond: (o.customer_id = c.customer_id)
+   Filter: (o.order_id IS NULL)
+   -&gt;  Seq Scan on orders o
+   -&gt;  Hash
+         -&gt;  Seq Scan on customers c
+(6 rows)</code></pre>
+<p>On five customers this does not matter. On large tables the anti-join can stop at the first match per customer, while the outer join produces every matching row and discards them afterwards.</p>
+<p><code>NOT IN</code> with a subquery is never turned into an anti-join in PostgreSQL, not even when the column is declared <code>NOT NULL</code>. It runs as a subplan. When the subquery's result fits in <code>work_mem</code>, that subplan is hashed and reasonably fast:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> customer_id, name</span>
+<span><span class="kw">FROM</span> customers</span>
+<span><span class="kw">WHERE</span> customer_id <span class="kw">NOT</span> <span class="kw">IN</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                          QUERY PLAN
+---------------------------------------------------------------
+ Seq Scan on customers
+   Filter: (NOT (ANY (customer_id = (hashed SubPlan 1).col1)))
+   SubPlan 1
+     -&gt;  Seq Scan on orders
+           Filter: (customer_id IS NOT NULL)
+(5 rows)</code></pre>
+<p>When it does not fit, PostgreSQL falls back to a plain subplan that goes through the subquery's rows again for every outer row. With 200,000 customers and 400,000 orders, at the default <code>work_mem</code> of 4MB:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_customers <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span> g <span class="kw">AS</span> <span class="kw">id</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_orders (<span class="kw">id</span> <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>, customer_id <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>);</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_orders</span>
+<span><span class="kw">SELECT</span> g, (g <span class="op">*</span> <span class="dv">7</span>) % <span class="dv">150000</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">400000</span>) g;</span>
+<span></span>
+<span><span class="kw">ANALYZE</span> big_customers;</span>
+<span><span class="kw">ANALYZE</span> big_orders;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_customers</span>
+<span><span class="kw">WHERE</span> <span class="kw">id</span> <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> big_orders);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                  QUERY PLAN
+-----------------------------------------------
+ Seq Scan on big_customers
+   Filter: (NOT (ANY (id = (SubPlan 1).col1)))
+   SubPlan 1
+     -&gt;  Materialize
+           -&gt;  Seq Scan on big_orders
+(5 rows)</code></pre>
+<p><code>customer_id</code> is <code>NOT NULL</code> here and it is still not an anti-join. That plan checks each of the 200,000 customers against up to 400,000 materialised rows. The <code>NOT EXISTS</code> version of the same query is a single hash anti-join:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> big_orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.<span class="kw">id</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>              QUERY PLAN
+--------------------------------------
+ Hash Anti Join
+   Hash Cond: (c.id = o.customer_id)
+   -&gt;  Seq Scan on big_customers c
+   -&gt;  Hash
+         -&gt;  Seq Scan on big_orders o
+(5 rows)</code></pre>
+<p>Other engines handle this differently. Oracle, for example, has a null-aware anti-join for <code>NOT IN</code>. In PostgreSQL, <code>NOT EXISTS</code> is the form the planner knows how to optimise.</p>
+<h2 id="not-exists-or-left-join">NOT EXISTS or LEFT JOIN?</h2>
+<p>Both are correct and both become anti-joins when written as above. I default to <code>NOT EXISTS</code>:</p>
+<ul>
+<li>It reads like the question: customers for whom no order exists.</li>
+<li>There is no <code>IS NULL</code> column to pick, so the coupon-code mistake cannot happen.</li>
+<li>Extra conditions ("no order in the last 90 days") go inside the subquery and stay there.</li>
+</ul>
+<p><code>LEFT JOIN</code> is the natural form when the anti-join is part of a larger query that already joins <code>orders</code> for other columns.</p>
+<h2 id="two-cases-that-look-similar-but-are-fine">Two cases that look similar but are fine</h2>
+<p><code>NOT IN</code> with a list you typed yourself is safe, as long as you do not type <code>NULL</code> into it:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (event_type TEXT);</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> <span class="kw">VALUES</span> (<span class="st">&#39;login&#39;</span>), (<span class="st">&#39;logout&#39;</span>), (<span class="st">&#39;purchase&#39;</span>), (<span class="kw">NULL</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> event_type <span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">WHERE</span> event_type <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="st">&#39;login&#39;</span>, <span class="st">&#39;logout&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_type
+------------
+ purchase
+(1 row)</code></pre>
+<p>The row with a <code>NULL</code> event type is not returned either, since <code>NULL NOT IN (...)</code> is unknown. If you want it, ask for it with <code>OR event_type IS NULL</code>.</p>
+<p><code>IN</code> with a <code>NULL</code> in the list does not empty the result. <code>IN</code> is a chain of <code>OR</code>s, and <code>TRUE OR UNKNOWN</code> is still <code>TRUE</code>, so real matches survive:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> event_type <span class="kw">FROM</span> <span class="kw">events</span></span>
+<span><span class="kw">WHERE</span> event_type <span class="kw">IN</span> (<span class="st">&#39;login&#39;</span>, <span class="kw">NULL</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> event_type
+------------
+ login
+(1 row)</code></pre>
+<p>The <code>NULL</code> in the list never matches anything, including the <code>NULL</code> row. If you need <code>NULL</code> to equal <code>NULL</code>, that is <code>IS NOT DISTINCT FROM</code> (<code>&lt;=&gt;</code> in MySQL), which is a different tool for a different problem.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>NOT IN (subquery)</code> returns no rows as soon as the subquery returns one <code>NULL</code>, and it does so without an error.</li>
+<li><code>NOT EXISTS</code> is not affected by <code>NULL</code>s and is the form PostgreSQL turns into an anti-join. Use it by default.</li>
+<li>After a <code>LEFT JOIN</code>, test the join column or a <code>NOT NULL</code> column for <code>IS NULL</code>, never a nullable column outside the join.</li>
+<li><code>NOT IN</code> with a literal list is fine. If you keep <code>NOT IN</code> with a subquery, add <code>WHERE ... IS NOT NULL</code> to it.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day22.pdf" download>Download PDF · Day 22</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../21/">← Day 21</a>
+  <a href="../../">All 31 days</a>
+  <a href="../23/">Day 23 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/22/</span>
+</footer>
+
+</body>
+</html>

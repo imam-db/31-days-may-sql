@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 27: Partial Indexes: Index Only the Rows You Query · #31DaysMaySQL</title>
+<meta name="description" content="A partial index covers only the rows that match a WHERE condition. Sizes and plans in PostgreSQL 18, when the planner can use one and when it cannot, partial unique indexes, and what other databases offer.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 27: Partial Indexes: Index Only the Rows You Query">
+<meta property="og:description" content="A partial index covers only the rows that match a WHERE condition. Sizes and plans in PostgreSQL 18, when the planner can use one and when it cannot, partial unique indexes, and what other databases offer.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../26/">← Day 26</a><a href="../28/">Day 28 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 27</p>
+  <h1>Partial Indexes: Index Only the Rows You Query</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>Support looks at failed orders all day. The <code>orders</code> table has a million rows, and 0.48% of them have <code>status = 'failed'</code>. An index on <code>status</code> makes the query fast, but it also indexes the 920,000 completed orders that nobody searches by status. Those entries take disk and memory, and every insert has to maintain them.</p>
+<p>A partial index has a <code>WHERE</code> clause and contains only the rows that satisfy it. If you want failed orders, index failed orders.</p>
+<p>The examples run on PostgreSQL 18. SQL Server calls the same feature a filtered index, SQLite supports it too, and MySQL has nothing equivalent. The last section covers that.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     BIGINT <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    status       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    total        <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    created_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders (customer_id, status, total, created_at)</span>
+<span><span class="kw">SELECT</span> g % <span class="dv">20000</span>,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">10000</span> <span class="op">&lt;</span> <span class="dv">9200</span> <span class="cf">THEN</span> <span class="st">&#39;completed&#39;</span></span>
+<span>            <span class="cf">WHEN</span> g % <span class="dv">10000</span> <span class="op">&lt;</span> <span class="dv">9950</span> <span class="cf">THEN</span> <span class="st">&#39;pending&#39;</span></span>
+<span>            <span class="cf">WHEN</span> g % <span class="dv">10000</span> <span class="op">&lt;</span> <span class="dv">9998</span> <span class="cf">THEN</span> <span class="st">&#39;failed&#39;</span></span>
+<span>            <span class="cf">ELSE</span> <span class="st">&#39;disputed&#39;</span></span>
+<span>       <span class="cf">END</span>,</span>
+<span>       (g <span class="op">*</span> <span class="dv">37</span>) % <span class="dv">500</span>,</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-01-01&#39;</span> <span class="op">+</span> g <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">&#39;30 seconds&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) g;</span>
+<span></span>
+<span><span class="co">-- keeps the plans below free of parallel workers, which depend on server settings</span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">SET</span> (parallel_workers <span class="op">=</span> <span class="dv">0</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> status, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> orders</span>
+<span><span class="kw">FROM</span> orders</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> status</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>  status   | orders
+-----------+--------
+ completed | 920000
+ pending   |  75000
+ failed    |   4800
+ disputed  |    200
+(4 rows)</code></pre>
+<h2 id="a-first-partial-index">A first partial index</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_failed_created</span>
+<span><span class="kw">ON</span> orders (created_at)</span>
+<span><span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span>;</span>
+<span></span>
+<span>VACUUM <span class="kw">ANALYZE</span> orders;</span></code></pre>
+<p>The index is sorted by <code>created_at</code>, and only rows with <code>status = 'failed'</code> are in it. For comparison, here is the same index without the condition:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_created_all <span class="kw">ON</span> orders (created_at);</span>
+<span></span>
+<span><span class="kw">SELECT</span> indexrelid:<span class="ch">:regclass</span> <span class="kw">AS</span> index_name,</span>
+<span>       pg_size_pretty(pg_relation_size(indexrelid)) <span class="kw">AS</span> <span class="kw">size</span></span>
+<span><span class="kw">FROM</span> pg_index</span>
+<span><span class="kw">WHERE</span> indrelid <span class="op">=</span> <span class="st">&#39;orders&#39;</span>:<span class="ch">:regclass</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> pg_relation_size(indexrelid), indexrelid:<span class="ch">:regclass</span>:<span class="ch">:text</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>        index_name         |  size
+---------------------------+--------
+ idx_orders_failed_created | 128 kB
+ idx_orders_created_all    | 21 MB
+ orders_pkey               | 21 MB
+(3 rows)</code></pre>
+<p>The partial index holds 4,800 entries instead of a million and is around 170 times smaller than the full one, which is close to the 0.48% of the table it covers. Smaller means more of it stays in memory, scans are shorter, and inserts of rows that are not <code>failed</code> do no index work at all. (The primary key is listed for scale.)</p>
+<h2 id="when-the-planner-uses-it">When the planner uses it</h2>
+<p>PostgreSQL uses a partial index only when it can prove that the query's <code>WHERE</code> clause implies the index's <code>WHERE</code>. Every row the query can return must be in the index. Start with queries where that is obvious:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+------------------------------------------------------
+ Index Scan using idx_orders_failed_created on orders
+(1 row)</code></pre>
+<p>The plan has no <code>Index Cond</code> line: the whole partial index is the set of failed orders, so it is scanned from start to end. Extra conditions are fine, as long as the index condition is still implied:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span> <span class="kw">AND</span> total <span class="op">&gt;</span> <span class="dv">100</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+------------------------------------------------------
+ Index Scan using idx_orders_failed_created on orders
+   Filter: (total &gt; &#39;100&#39;::numeric)
+(2 rows)</code></pre>
+<p>The extra condition is checked as a filter on each row. Sorting and limiting use the index order, which the first column <code>created_at</code> provides:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span><span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">50</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+---------------------------------------------------------------------
+ Limit
+   -&gt;  Index Scan Backward using idx_orders_failed_created on orders
+(2 rows)</code></pre>
+<p>Even with the full <code>idx_orders_created_all</code> available, the planner takes the small one, because it covers exactly the rows this query wants. The planner can also see through a one-element array, which I expected to defeat it:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="kw">ANY</span> (<span class="st">&#39;{failed}&#39;</span>:<span class="ch">:text</span>[]);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+------------------------------------------------------
+ Index Scan using idx_orders_failed_created on orders
+(1 row)</code></pre>
+<h3 id="queries-that-cannot-use-it">Queries that cannot use it</h3>
+<p>A different value, or a condition that is broader than the index condition, gets a sequential scan:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;pending&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>              QUERY PLAN
+--------------------------------------
+ Seq Scan on orders
+   Filter: (status = &#39;pending&#39;::text)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">IN</span> (<span class="st">&#39;failed&#39;</span>, <span class="st">&#39;disputed&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                       QUERY PLAN
+--------------------------------------------------------
+ Seq Scan on orders
+   Filter: (status = ANY (&#39;{failed,disputed}&#39;::text[]))
+(2 rows)</code></pre>
+<p>The second is the common surprise. The index knows nothing about disputed orders, so it cannot answer a query that asks for them too. The same happens with <code>status &lt;&gt; 'completed'</code>: PostgreSQL does not derive "this includes failed" from it. If you want both, either index both statuses (<code>WHERE status IN ('failed', 'disputed')</code>, and then the query has to use a condition that implies that) or have two indexes.</p>
+<h3 id="parameters">Parameters</h3>
+<p>A query written with a parameter (<code>WHERE status = $1</code>) is another way to lose the index. A plan built before the value is known has to work for every value, and a partial index only works for one. PostgreSQL normally plans each of the first few executions of a prepared statement with the actual value, so the index is used. If it switches to a generic plan, or you force one:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tickets (</span>
+<span>    ticket_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    status     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tickets</span>
+<span><span class="kw">SELECT</span> g, <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">100</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;failed&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;ok&#39;</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_tickets_failed <span class="kw">ON</span> tickets (ticket_id) <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span>;</span>
+<span><span class="kw">ANALYZE</span> tickets;</span>
+<span></span>
+<span><span class="kw">PREPARE</span> find_tickets (text) <span class="kw">AS</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> tickets <span class="kw">WHERE</span> status <span class="op">=</span> $<span class="dv">1</span>;</span>
+<span><span class="kw">SET</span> plan_cache_mode <span class="op">=</span> force_generic_plan;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> find_tickets (<span class="st">&#39;failed&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>       QUERY PLAN
+-------------------------
+ Seq Scan on tickets
+   Filter: (status = $1)
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">SET</span> plan_cache_mode <span class="op">=</span> force_custom_plan;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>) <span class="kw">EXECUTE</span> find_tickets (<span class="st">&#39;failed&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                   QUERY PLAN
+------------------------------------------------
+ Index Scan using idx_tickets_failed on tickets
+(1 row)</code></pre>
+<p>The generic plan reads the whole table, and the custom plan, planned with <code>'failed'</code> in hand, uses the index. Drivers and ORMs that use server-side prepared statements can end up on generic plans, so in an application, check the plans of the queries that are supposed to use a partial index. SQL Server filtered indexes run into the same problem with parameterized queries, because a cached plan must be valid for every parameter value. If an application passes the status as a parameter, a literal in the SQL or an ordinary index serves it better.</p>
+<h2 id="partial-unique-indexes">Partial unique indexes</h2>
+<p>A unique index with a condition enforces uniqueness among the rows that match it. A customer can have one active subscription and any number of expired ones:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> subscriptions (</span>
+<span>    subscription_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id      <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    status           TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">UNIQUE</span> <span class="kw">INDEX</span> idx_one_active_subscription</span>
+<span><span class="kw">ON</span> subscriptions (customer_id)</span>
+<span><span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;active&#39;</span>;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> subscriptions <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="dv">7</span>, <span class="st">&#39;expired&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="dv">7</span>, <span class="st">&#39;expired&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="dv">7</span>, <span class="st">&#39;active&#39;</span>);</span></code></pre>
+<p>A second active subscription for the same customer is rejected:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> subscriptions <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="dv">7</span>, <span class="st">&#39;active&#39;</span>);</span>
+<span><span class="co">-- ERROR:  duplicate key value violates unique constraint &quot;idx_one_active_subscription&quot;</span></span>
+<span><span class="co">-- DETAIL:  Key (customer_id)=(7) already exists.</span></span></code></pre>
+<p>Once the first one expires, it is allowed:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> subscriptions <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;expired&#39;</span> <span class="kw">WHERE</span> subscription_id <span class="op">=</span> <span class="dv">3</span>;</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> subscriptions <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="dv">7</span>, <span class="st">&#39;active&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> subscriptions <span class="kw">ORDER</span> <span class="kw">BY</span> subscription_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> subscription_id | customer_id | status
+-----------------+-------------+---------
+               1 |           7 | expired
+               2 |           7 | expired
+               3 |           7 | expired
+               4 |           7 | active
+(4 rows)</code></pre>
+<p><code>INSERT ... ON CONFLICT</code> has to name the index condition as well, since a partial index is not a constraint in the usual sense. Without it PostgreSQL reports <code>there is no unique or exclusion constraint matching the ON CONFLICT specification</code>:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> subscriptions <span class="kw">VALUES</span> (<span class="dv">5</span>, <span class="dv">7</span>, <span class="st">&#39;active&#39;</span>)</span>
+<span><span class="kw">ON</span> CONFLICT (customer_id) <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;active&#39;</span> DO <span class="kw">NOTHING</span>;</span></code></pre>
+<p>The same pattern covers "one primary email per user" (<code>WHERE is_primary</code>) and "username unique among non-deleted users" (<code>WHERE deleted_at IS NULL</code>). The second one lets a new user take a soft-deleted user's name without a hard delete.</p>
+<h2 id="conditions-have-to-be-immutable">Conditions have to be immutable</h2>
+<p>The index condition is stored with the index and has to give the same answer for a row today and next year. Functions in it must be <code>IMMUTABLE</code>, so <code>now()</code> is out:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> orders (created_at)</span>
+<span><span class="kw">WHERE</span> created_at <span class="op">&gt;</span> now() <span class="op">-</span> <span class="dt">interval</span> <span class="st">&#39;90 days&#39;</span>;</span>
+<span><span class="co">-- ERROR:  functions in index predicate must be marked IMMUTABLE</span></span></code></pre>
+<p>A subquery or a reference to another table is not allowed in a predicate either. A "last 90 days" index therefore needs a literal date (<code>WHERE created_at &gt; '2024-06-01'</code>), and someone has to build a new index with a later date from time to time and drop the old one (<code>CREATE INDEX CONCURRENTLY</code> avoids blocking writes). A generated column cannot help, because it cannot depend on the current date either. A boolean flag column that a scheduled job maintains (<code>is_recent</code>) works, at the cost of that job's updates.</p>
+<p>Queries must also state the date in a way PostgreSQL can compare with the literal. <code>created_at &gt; '2024-07-01'</code> implies <code>created_at &gt; '2024-06-01'</code>, so it can use the index. <code>created_at &gt; $1</code> does not, for the same reason as the parameter example above.</p>
+<h2 id="keeping-an-eye-on-them">Keeping an eye on them</h2>
+<p>Size is easy to see; usage is in <code>pg_stat_user_indexes</code>:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> indexrelname <span class="kw">AS</span> index_name,</span>
+<span>       idx_scan     <span class="kw">AS</span> scans,</span>
+<span>       pg_size_pretty(pg_relation_size(indexrelid)) <span class="kw">AS</span> <span class="kw">size</span></span>
+<span><span class="kw">FROM</span> pg_stat_user_indexes</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;orders&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> idx_scan <span class="kw">DESC</span>;</span></code></pre>
+<p>An index that shows zero scans after a representative period (including month-end jobs) costs write time for nothing and is a candidate to drop. Every partial index is a promise that some queries use exactly that condition, so write the condition down where the queries live.</p>
+<p>On write cost, partial indexes help in one direction. A row that never matches the condition is never added to the index. When an update turns a matching row into a non-matching one (an order moves from <code>failed</code> to <code>completed</code>), the new row version is not inserted into the index, and the old entry is removed later by <code>VACUUM</code> like any other dead entry. When a row starts matching, it is inserted.</p>
+<h2 id="when-not-to-bother">When not to bother</h2>
+<p>A partial index pays off when the matching rows are a small part of the table and the same condition keeps showing up in queries. If the condition matches half of the table, the partial index is half the size of the full one and the planner would probably scan the table anyway. Whether a partial index is worth it comes down to the two sizes from the comparison above and how often the queries run. On a small table a full index is already small.</p>
+<h2 id="other-databases">Other databases</h2>
+<ul>
+<li><strong>SQL Server</strong>: filtered indexes, <code>CREATE INDEX ... ON t (col) WHERE status = 'failed'</code>. The condition is limited to simple comparison logic, so check the documentation for what a filter may contain.</li>
+<li><strong>SQLite</strong>: partial indexes since 3.8.0, with PostgreSQL's syntax.</li>
+<li><strong>Oracle</strong>: no partial index syntax. A function-based index that returns <code>NULL</code> for the rows you do not want gives the same effect, because a B-tree entry whose keys are all <code>NULL</code> is not stored: <code>CREATE INDEX ... ON orders (CASE WHEN status = 'failed' THEN created_at END)</code>. Queries have to use that same <code>CASE</code> expression.</li>
+<li><strong>MySQL</strong>: no partial indexes. A generated column and a normal index on it do not give the same savings: MySQL indexes <code>NULL</code>s, so every row still has an entry. An index on <code>(status, created_at)</code> is the workable substitute.</li>
+<li><strong>BigQuery</strong>: no B-tree indexes to filter. Partitioning and clustering do the pruning.</li>
+</ul>
+<p>For MySQL, the generated-column form is the closest thing and is good for making a condition queryable by name, not for making the index smaller:</p>
+<pre class="code"><code><span><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders</span>
+<span>    <span class="kw">ADD</span> <span class="kw">COLUMN</span> is_failed <span class="dt">BOOLEAN</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> (status <span class="op">=</span> <span class="st">&#39;failed&#39;</span>) STORED;</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_is_failed <span class="kw">ON</span> orders (is_failed, created_at);</span></code></pre>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A partial index holds only the rows that match its <code>WHERE</code>. For <code>status = 'failed'</code> on this table that was 4,800 entries and about 170 times less space than a full index on the same column.</li>
+<li>The planner uses it only when the query's condition implies the index condition. <code>= 'failed'</code> with extra filters qualifies, and <code>IN ('failed','disputed')</code>, <code>&lt;&gt; 'completed'</code> and a bare parameter do not.</li>
+<li>Partial unique indexes enforce rules such as one active subscription per customer. <code>ON CONFLICT</code> has to repeat the condition.</li>
+<li>Conditions must be immutable, so there is no <code>now()</code>. Rolling windows need a literal that you move forward.</li>
+<li>MySQL has no equivalent, and Oracle gets there with a function-based index that yields <code>NULL</code>.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day27.pdf" download>Download PDF · Day 27</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../26/">← Day 26</a>
+  <a href="../../">All 31 days</a>
+  <a href="../28/">Day 28 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/27/</span>
+</footer>
+
+</body>
+</html>

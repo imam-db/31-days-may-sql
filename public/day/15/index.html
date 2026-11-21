@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 15: Recursive CTE: Graph Traversal in SQL · #31DaysMaySQL</title>
+<meta name="description" content="Walk a tree or graph of unknown depth with WITH RECURSIVE: org charts, ancestors, dependency graphs, UNION versus UNION ALL, and stopping cycles with PostgreSQL&#x27;s CYCLE clause.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 15: Recursive CTE: Graph Traversal in SQL">
+<meta property="og:description" content="Walk a tree or graph of unknown depth with WITH RECURSIVE: org charts, ancestors, dependency graphs, UNION versus UNION ALL, and stopping cycles with PostgreSQL&#x27;s CYCLE clause.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../14/">← Day 14</a><a href="../16/">Day 16 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 15</p>
+  <h1>Recursive CTE: Graph Traversal in SQL</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>An org chart table has an <code>employee_id</code> and a <code>manager_id</code>, and nothing else about the hierarchy. You are asked for everyone who reports to the VP of Engineering, directly or through other managers. No column says how many levels sit between the VP and a given person, and nobody knows in advance how deep the chain goes.</p>
+<p>A recursive common table expression (<code>WITH RECURSIVE</code>, standard since SQL:1999) answers that: it starts from some rows, then keeps joining the table to the rows it found in the previous step until a step finds nothing new. The examples run on PostgreSQL 18.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> employees (</span>
+<span>    employee_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    title        TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    manager_id   <span class="dt">INT</span> <span class="kw">REFERENCES</span> employees (employee_id)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> employees <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>,  <span class="st">&#39;Sarah Chen&#39;</span>,     <span class="st">&#39;CEO&#39;</span>,                 <span class="kw">NULL</span>),</span>
+<span>    (<span class="dv">2</span>,  <span class="st">&#39;Marcus Johnson&#39;</span>, <span class="st">&#39;VP Engineering&#39;</span>,      <span class="dv">1</span>),</span>
+<span>    (<span class="dv">3</span>,  <span class="st">&#39;Lisa Park&#39;</span>,      <span class="st">&#39;VP Product&#39;</span>,          <span class="dv">1</span>),</span>
+<span>    (<span class="dv">4</span>,  <span class="st">&#39;James Wilson&#39;</span>,   <span class="st">&#39;Director Backend&#39;</span>,    <span class="dv">2</span>),</span>
+<span>    (<span class="dv">5</span>,  <span class="st">&#39;Anna Schmidt&#39;</span>,   <span class="st">&#39;Director Frontend&#39;</span>,   <span class="dv">2</span>),</span>
+<span>    (<span class="dv">6</span>,  <span class="st">&#39;David Kim&#39;</span>,      <span class="st">&#39;Director Data&#39;</span>,       <span class="dv">2</span>),</span>
+<span>    (<span class="dv">7</span>,  <span class="st">&#39;Rachel Green&#39;</span>,   <span class="st">&#39;Engineering Manager&#39;</span>, <span class="dv">4</span>),</span>
+<span>    (<span class="dv">8</span>,  <span class="st">&#39;Tom Baker&#39;</span>,      <span class="st">&#39;Engineering Manager&#39;</span>, <span class="dv">4</span>),</span>
+<span>    (<span class="dv">9</span>,  <span class="st">&#39;Nina Patel&#39;</span>,     <span class="st">&#39;Senior Engineer&#39;</span>,     <span class="dv">7</span>),</span>
+<span>    (<span class="dv">10</span>, <span class="st">&#39;Oscar Rivera&#39;</span>,   <span class="st">&#39;Senior Engineer&#39;</span>,     <span class="dv">7</span>),</span>
+<span>    (<span class="dv">11</span>, <span class="st">&#39;Emma Liu&#39;</span>,       <span class="st">&#39;Engineer&#39;</span>,            <span class="dv">8</span>),</span>
+<span>    (<span class="dv">12</span>, <span class="st">&#39;Alex Turner&#39;</span>,    <span class="st">&#39;Engineer&#39;</span>,            <span class="dv">5</span>),</span>
+<span>    (<span class="dv">13</span>, <span class="st">&#39;Sophie Martin&#39;</span>,  <span class="st">&#39;Product Manager&#39;</span>,     <span class="dv">3</span>),</span>
+<span>    (<span class="dv">14</span>, <span class="st">&#39;Ryan O</span><span class="ch">&#39;&#39;</span><span class="st">Brien&#39;</span>,  <span class="st">&#39;Data Engineer&#39;</span>,       <span class="dv">6</span>),</span>
+<span>    (<span class="dv">15</span>, <span class="st">&#39;Mia Zhang&#39;</span>,      <span class="st">&#39;Data Analyst&#39;</span>,        <span class="dv">6</span>);</span></code></pre>
+<p>Marcus Johnson (2) is the VP of Engineering. The chain below him has four levels: Marcus, three directors, managers and engineers under them, and senior engineers under the managers.</p>
+<h2 id="why-hard-coded-levels-fail">Why hard-coded levels fail</h2>
+<p>Without recursion you can fetch one level per query by nesting subqueries:</p>
+<pre class="code"><code><span><span class="co">-- direct reports of 2</span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> employees <span class="kw">WHERE</span> manager_id <span class="op">=</span> <span class="dv">2</span>;</span>
+<span></span>
+<span><span class="co">-- reports of the direct reports</span></span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> employees</span>
+<span><span class="kw">WHERE</span> manager_id <span class="kw">IN</span> (<span class="kw">SELECT</span> employee_id <span class="kw">FROM</span> employees <span class="kw">WHERE</span> manager_id <span class="op">=</span> <span class="dv">2</span>);</span>
+<span></span>
+<span><span class="co">-- one more level: another nested subquery, and so on</span></span></code></pre>
+<p>Each extra level needs another nested subquery, so the query has to be rewritten whenever the hierarchy gets deeper than the depth you wrote down.</p>
+<h2 id="how-a-recursive-cte-works">How a recursive CTE works</h2>
+<p>A recursive CTE has two parts joined by <code>UNION ALL</code>:</p>
+<ol type="1">
+<li>The anchor, a normal query that supplies the starting rows.</li>
+<li>The recursive step, a query that joins the table to the CTE itself.</li>
+</ol>
+<p>PostgreSQL runs the anchor once. It then runs the recursive step over only the rows produced by the previous round, adds the new rows to the result, and repeats until a round returns no rows. Each round therefore finds the next layer of the graph, which is why the order of rows without an <code>ORDER BY</code> looks like a breadth-first search. That order is an implementation detail and not something to rely on.</p>
+<h2 id="everyone-under-marcus">Everyone under Marcus</h2>
+<p>The anchor is Marcus himself, with depth 1. The recursive step finds the people whose manager is already in the result and adds one to the depth:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE org_tree <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, title, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">2</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, e.title, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> employees e</span>
+<span>    <span class="kw">JOIN</span> org_tree t <span class="kw">ON</span> e.manager_id <span class="op">=</span> t.employee_id</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> employee_id, name, title, <span class="fu">depth</span></span>
+<span><span class="kw">FROM</span> org_tree</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>, employee_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> employee_id |      name      |        title        | depth
+-------------+----------------+---------------------+-------
+           2 | Marcus Johnson | VP Engineering      |     1
+           4 | James Wilson   | Director Backend    |     2
+           5 | Anna Schmidt   | Director Frontend   |     2
+           6 | David Kim      | Director Data       |     2
+           7 | Rachel Green   | Engineering Manager |     3
+           8 | Tom Baker      | Engineering Manager |     3
+          12 | Alex Turner    | Engineer            |     3
+          14 | Ryan O&#39;Brien   | Data Engineer       |     3
+          15 | Mia Zhang      | Data Analyst        |     3
+           9 | Nina Patel     | Senior Engineer     |     4
+          10 | Oscar Rivera   | Senior Engineer     |     4
+          11 | Emma Liu       | Engineer            |     4
+(12 rows)</code></pre>
+<p>Twelve rows: Marcus at depth 1, his three directors at depth 2, five people at depth 3, and three at depth 4. Lisa Park, Sophie Martin and Sarah Chen are not in the result, since none of them sits below Marcus.</p>
+<h2 id="showing-the-tree">Showing the tree</h2>
+<p><code>ORDER BY depth</code> lists layers. To print the hierarchy as a tree, with each person directly under their manager, add <code>SEARCH DEPTH FIRST</code> (PostgreSQL 14 and later). It adds a column that sorts the rows in depth-first order, with siblings ordered by the column you name:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE org_tree <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, title, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">2</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, e.title, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> employees e</span>
+<span>    <span class="kw">JOIN</span> org_tree t <span class="kw">ON</span> e.manager_id <span class="op">=</span> t.employee_id</span>
+<span>)</span>
+<span>SEARCH <span class="fu">DEPTH</span> <span class="fu">FIRST</span> <span class="kw">BY</span> employee_id <span class="kw">SET</span> tree_order</span>
+<span><span class="kw">SELECT</span> REPEAT(<span class="st">&#39;  &#39;</span>, <span class="fu">depth</span> <span class="op">-</span> <span class="dv">1</span>) <span class="op">||</span> name <span class="kw">AS</span> org_chart, title</span>
+<span><span class="kw">FROM</span> org_tree</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> tree_order;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     org_chart      |        title
+--------------------+---------------------
+ Marcus Johnson     | VP Engineering
+   James Wilson     | Director Backend
+     Rachel Green   | Engineering Manager
+       Nina Patel   | Senior Engineer
+       Oscar Rivera | Senior Engineer
+     Tom Baker      | Engineering Manager
+       Emma Liu     | Engineer
+   Anna Schmidt     | Director Frontend
+     Alex Turner    | Engineer
+   David Kim        | Director Data
+     Ryan O&#39;Brien   | Data Engineer
+     Mia Zhang      | Data Analyst
+(12 rows)</code></pre>
+<p><code>SEARCH BREADTH FIRST BY ...</code> gives the layer-by-layer order instead. Without the clause you can build the same effect by carrying an array of ids in the recursion (<code>path || e.employee_id</code>) and sorting by it. The array also doubles as a breadcrumb: a text column that appends <code>' &gt; ' || e.name</code> at each step gives "Marcus Johnson &gt; James Wilson &gt; Rachel Green &gt; Nina Patel" for each row.</p>
+<h2 id="limiting-depth">Limiting depth</h2>
+<p>To stop two levels below Marcus, add a condition to the recursive step:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE org_tree <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">2</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> employees e</span>
+<span>    <span class="kw">JOIN</span> org_tree t <span class="kw">ON</span> e.manager_id <span class="op">=</span> t.employee_id</span>
+<span>    <span class="kw">WHERE</span> t.<span class="fu">depth</span> <span class="op">&lt;</span> <span class="dv">3</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> employee_id, name, <span class="fu">depth</span></span>
+<span><span class="kw">FROM</span> org_tree</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>, employee_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> employee_id |      name      | depth
+-------------+----------------+-------
+           2 | Marcus Johnson |     1
+           4 | James Wilson   |     2
+           5 | Anna Schmidt   |     2
+           6 | David Kim      |     2
+           7 | Rachel Green   |     3
+           8 | Tom Baker      |     3
+          12 | Alex Turner    |     3
+          14 | Ryan O&#39;Brien   |     3
+          15 | Mia Zhang      |     3
+(9 rows)</code></pre>
+<p>The check sits in the recursive step and stops rows from being expanded at depth 3. A filter in the outer <code>SELECT</code> would give the same rows, but only after the whole subtree had been built.</p>
+<h2 id="walking-up-the-tree">Walking up the tree</h2>
+<p>For the chain of command above a person, swap the join so that you move from a row to its manager. Here is the path from Nina Patel (9) to the CEO:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE chain <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, title, manager_id, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">9</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, e.title, e.manager_id, c.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> employees e</span>
+<span>    <span class="kw">JOIN</span> chain c <span class="kw">ON</span> e.employee_id <span class="op">=</span> c.manager_id</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">depth</span>, name, title</span>
+<span><span class="kw">FROM</span> chain</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> depth |      name      |        title
+-------+----------------+---------------------
+     1 | Nina Patel     | Senior Engineer
+     2 | Rachel Green   | Engineering Manager
+     3 | James Wilson   | Director Backend
+     4 | Marcus Johnson | VP Engineering
+     5 | Sarah Chen     | CEO
+(5 rows)</code></pre>
+<p>Going down, the join is <code>child.manager_id = cte.employee_id</code>. Going up, it is <code>parent.employee_id = cte.manager_id</code>. Walking up can only return one row per round in a tree, so it ends by itself when it reaches the CEO, whose <code>manager_id</code> is <code>NULL</code> and matches nothing.</p>
+<h2 id="totals-per-manager">Totals per manager</h2>
+<p>A recursive CTE can produce every (ancestor, descendant) pair, which is the same thing as a closure table, computed on the fly. Counting the pairs per manager gives the total team size, direct and indirect:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE reports <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> manager_id <span class="kw">AS</span> boss_id, employee_id</span>
+<span>    <span class="kw">FROM</span> employees</span>
+<span>    <span class="kw">WHERE</span> manager_id <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> r.boss_id, e.employee_id</span>
+<span>    <span class="kw">FROM</span> reports r</span>
+<span>    <span class="kw">JOIN</span> employees e <span class="kw">ON</span> e.manager_id <span class="op">=</span> r.employee_id</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> b.name, b.title, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> total_reports</span>
+<span><span class="kw">FROM</span> reports r</span>
+<span><span class="kw">JOIN</span> employees b <span class="kw">ON</span> b.employee_id <span class="op">=</span> r.boss_id</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> b.employee_id, b.name, b.title</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> total_reports <span class="kw">DESC</span>, b.name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>      name      |        title        | total_reports
+----------------+---------------------+---------------
+ Sarah Chen     | CEO                 |            14
+ Marcus Johnson | VP Engineering      |            11
+ James Wilson   | Director Backend    |             5
+ David Kim      | Director Data       |             2
+ Rachel Green   | Engineering Manager |             2
+ Anna Schmidt   | Director Frontend   |             1
+ Lisa Park      | VP Product          |             1
+ Tom Baker      | Engineering Manager |             1
+(8 rows)</code></pre>
+<p>Marcus has 11 people under him: three directors, five people at depth 3 and three at depth 4. Sarah has 14, which is everyone else in the company.</p>
+<h2 id="categories">Categories</h2>
+<p>The same shape fits any parent and child table. Here is a category tree, printed with indentation:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> categories (</span>
+<span>    category_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    parent_id    <span class="dt">INT</span> <span class="kw">REFERENCES</span> categories (category_id)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> categories <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Electronics&#39;</span>,    <span class="kw">NULL</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Computers&#39;</span>,      <span class="dv">1</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Laptops&#39;</span>,        <span class="dv">2</span>),</span>
+<span>    (<span class="dv">4</span>, <span class="st">&#39;Gaming Laptops&#39;</span>, <span class="dv">3</span>),</span>
+<span>    (<span class="dv">5</span>, <span class="st">&#39;Phones&#39;</span>,         <span class="dv">1</span>),</span>
+<span>    (<span class="dv">6</span>, <span class="st">&#39;Smartphones&#39;</span>,    <span class="dv">5</span>),</span>
+<span>    (<span class="dv">7</span>, <span class="st">&#39;Accessories&#39;</span>,    <span class="dv">1</span>);</span>
+<span></span>
+<span><span class="kw">WITH</span> RECURSIVE tree <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> category_id, name, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> categories</span>
+<span>    <span class="kw">WHERE</span> parent_id <span class="kw">IS</span> <span class="kw">NULL</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> c.category_id, c.name, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> categories c</span>
+<span>    <span class="kw">JOIN</span> tree t <span class="kw">ON</span> c.parent_id <span class="op">=</span> t.category_id</span>
+<span>)</span>
+<span>SEARCH <span class="fu">DEPTH</span> <span class="fu">FIRST</span> <span class="kw">BY</span> category_id <span class="kw">SET</span> tree_order</span>
+<span><span class="kw">SELECT</span> REPEAT(<span class="st">&#39;  &#39;</span>, <span class="fu">depth</span> <span class="op">-</span> <span class="dv">1</span>) <span class="op">||</span> name <span class="kw">AS</span> <span class="kw">category</span></span>
+<span><span class="kw">FROM</span> tree</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> tree_order;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>       category
+----------------------
+ Electronics
+   Computers
+     Laptops
+       Gaming Laptops
+   Phones
+     Smartphones
+   Accessories
+(7 rows)</code></pre>
+<p>Sorting by <code>category_id</code> alone would only look right if ids happened to be assigned in tree order. <code>SEARCH DEPTH FIRST</code> does not depend on that.</p>
+<h2 id="graphs-that-are-not-trees-union-versus-union-all">Graphs that are not trees: UNION versus UNION ALL</h2>
+<p>A package manager has dependencies, and a package can be reached by several routes (a diamond): the app uses <code>api</code> and <code>auth</code>, and both use <code>database</code>. This is a directed acyclic graph, and the tree assumption that every node has one parent does not hold. Add a direct edge from <code>app</code> to <code>database</code> as well:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> dependencies (</span>
+<span>    <span class="kw">package</span>     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    depends_on  TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (<span class="kw">package</span>, depends_on)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> dependencies <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;app&#39;</span>,   <span class="st">&#39;auth&#39;</span>),</span>
+<span>    (<span class="st">&#39;app&#39;</span>,   <span class="st">&#39;api&#39;</span>),</span>
+<span>    (<span class="st">&#39;app&#39;</span>,   <span class="st">&#39;database&#39;</span>),</span>
+<span>    (<span class="st">&#39;api&#39;</span>,   <span class="st">&#39;database&#39;</span>),</span>
+<span>    (<span class="st">&#39;api&#39;</span>,   <span class="st">&#39;cache&#39;</span>),</span>
+<span>    (<span class="st">&#39;auth&#39;</span>,  <span class="st">&#39;database&#39;</span>),</span>
+<span>    (<span class="st">&#39;auth&#39;</span>,  <span class="st">&#39;crypto&#39;</span>),</span>
+<span>    (<span class="st">&#39;cache&#39;</span>, <span class="st">&#39;redis-client&#39;</span>);</span></code></pre>
+<p>With <code>UNION ALL</code>, every route is a separate row. <code>database</code> is reached three times (directly, through <code>api</code>, through <code>auth</code>), and each copy would be expanded further if it had dependencies of its own:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE deps <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> depends_on <span class="kw">AS</span> <span class="kw">package</span></span>
+<span>    <span class="kw">FROM</span> dependencies</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">package</span> <span class="op">=</span> <span class="st">&#39;app&#39;</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> d.depends_on</span>
+<span>    <span class="kw">FROM</span> dependencies d</span>
+<span>    <span class="kw">JOIN</span> deps <span class="kw">ON</span> d.<span class="kw">package</span> <span class="op">=</span> deps.<span class="kw">package</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">package</span>, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> times_reached</span>
+<span><span class="kw">FROM</span> deps</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="kw">package</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">package</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   package    | times_reached
+--------------+---------------
+ api          |             1
+ auth         |             1
+ cache        |             1
+ crypto       |             1
+ database     |             3
+ redis-client |             1
+(6 rows)</code></pre>
+<p><code>UNION</code> removes rows that are already in the result, so each package appears once and is expanded once. PostgreSQL does accept <code>UNION</code> in a recursive CTE:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE deps <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> depends_on <span class="kw">AS</span> <span class="kw">package</span></span>
+<span>    <span class="kw">FROM</span> dependencies</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">package</span> <span class="op">=</span> <span class="st">&#39;app&#39;</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> d.depends_on</span>
+<span>    <span class="kw">FROM</span> dependencies d</span>
+<span>    <span class="kw">JOIN</span> deps <span class="kw">ON</span> d.<span class="kw">package</span> <span class="op">=</span> deps.<span class="kw">package</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">package</span></span>
+<span><span class="kw">FROM</span> deps</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">package</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   package
+--------------
+ api
+ auth
+ cache
+ crypto
+ database
+ redis-client
+(6 rows)</code></pre>
+<p><code>UNION</code> compares entire rows. If you add a <code>depth</code> column to the select list, the same package at different depths is no longer a duplicate, and the deduplication is gone:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE deps <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> depends_on <span class="kw">AS</span> <span class="kw">package</span>, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> dependencies</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">package</span> <span class="op">=</span> <span class="st">&#39;app&#39;</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> d.depends_on, deps.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> dependencies d</span>
+<span>    <span class="kw">JOIN</span> deps <span class="kw">ON</span> d.<span class="kw">package</span> <span class="op">=</span> deps.<span class="kw">package</span></span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">package</span>, <span class="fu">depth</span></span>
+<span><span class="kw">FROM</span> deps</span>
+<span><span class="kw">WHERE</span> <span class="kw">package</span> <span class="op">=</span> <span class="st">&#39;database&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> package  | depth
+----------+-------
+ database |     1
+ database |     2
+(2 rows)</code></pre>
+<p><code>database</code> shows up at depth 1 and at depth 2. If you need both deduplication and a distance, deduplicate first and take <code>MIN(depth)</code> afterwards, or accept the extra rows.</p>
+<p>How much this matters grows with the graph. In this ladder, every node of one layer links to both nodes of the next layer, so the number of routes doubles with each layer:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> ladder (src TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>, dst TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> ladder</span>
+<span><span class="kw">SELECT</span> a.x <span class="op">||</span> i, b.y <span class="op">||</span> (i <span class="op">+</span> <span class="dv">1</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">14</span>) <span class="kw">AS</span> i,</span>
+<span>     (<span class="kw">VALUES</span> (<span class="st">&#39;a&#39;</span>), (<span class="st">&#39;b&#39;</span>)) <span class="kw">AS</span> a(x),</span>
+<span>     (<span class="kw">VALUES</span> (<span class="st">&#39;a&#39;</span>), (<span class="st">&#39;b&#39;</span>)) <span class="kw">AS</span> b(y);</span>
+<span></span>
+<span><span class="kw">WITH</span> RECURSIVE walk <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="st">&#39;a1&#39;</span>:<span class="ch">:text</span> <span class="kw">AS</span> node</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> l.dst <span class="kw">FROM</span> ladder l <span class="kw">JOIN</span> walk w <span class="kw">ON</span> l.src <span class="op">=</span> w.node</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> rows_with_union_all <span class="kw">FROM</span> walk;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> rows_with_union_all
+---------------------
+               32767
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE walk <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="st">&#39;a1&#39;</span>:<span class="ch">:text</span> <span class="kw">AS</span> node</span>
+<span>    <span class="kw">UNION</span></span>
+<span>    <span class="kw">SELECT</span> l.dst <span class="kw">FROM</span> ladder l <span class="kw">JOIN</span> walk w <span class="kw">ON</span> l.src <span class="op">=</span> w.node</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> rows_with_union <span class="kw">FROM</span> walk;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> rows_with_union
+-----------------
+              29
+(1 row)</code></pre>
+<p>There are 29 distinct nodes and 32,767 routes to them. Fifteen layers is already a visible difference, and each extra layer doubles the first number. On a real dependency graph with hundreds of shared nodes, <code>UNION ALL</code> can run for a very long time or exhaust memory.</p>
+<p>Other databases differ here. SQL Server only allows <code>UNION ALL</code> in a recursive CTE. MySQL 8 and PostgreSQL accept both. For plain trees, use <code>UNION ALL</code>: it skips the deduplication work, and nothing can be duplicated anyway.</p>
+<h2 id="cycles">Cycles</h2>
+<p>In a tree, following <code>manager_id</code> always ends at the root. A data error breaks that. Suppose someone sets the CEO's manager to Emma Liu (11), who sits several levels below her. The table is a copy so the earlier examples stay valid:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> employees_loop <span class="kw">AS</span> <span class="kw">TABLE</span> employees;</span>
+<span></span>
+<span><span class="kw">UPDATE</span> employees_loop <span class="kw">SET</span> manager_id <span class="op">=</span> <span class="dv">11</span> <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">1</span>;</span></code></pre>
+<p>Walking down from Sarah now goes Sarah, Marcus, James, Tom, Emma, Sarah, Marcus and so on. A recursive CTE with <code>UNION ALL</code> and no stop condition never finishes. It keeps adding rows until the server runs out of memory or disk, because PostgreSQL has no iteration limit of its own.</p>
+<p>PostgreSQL 14 added the <code>CYCLE</code> clause for this. It records the values of the columns you name along each branch and marks a row when its values have already occurred earlier on the same branch. Marked rows are returned but not expanded:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE walk <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span>    <span class="kw">FROM</span> employees_loop</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">1</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, w.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> employees_loop e</span>
+<span>    <span class="kw">JOIN</span> walk w <span class="kw">ON</span> e.manager_id <span class="op">=</span> w.employee_id</span>
+<span>)</span>
+<span><span class="kw">CYCLE</span> employee_id <span class="kw">SET</span> is_cycle <span class="kw">USING</span> path</span>
+<span><span class="kw">SELECT</span> <span class="fu">depth</span>, name, is_cycle</span>
+<span><span class="kw">FROM</span> walk</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>, employee_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> depth |      name      | is_cycle
+-------+----------------+----------
+     1 | Sarah Chen     | f
+     2 | Marcus Johnson | f
+     2 | Lisa Park      | f
+     3 | James Wilson   | f
+     3 | Anna Schmidt   | f
+     3 | David Kim      | f
+     3 | Sophie Martin  | f
+     4 | Rachel Green   | f
+     4 | Tom Baker      | f
+     4 | Alex Turner    | f
+     4 | Ryan O&#39;Brien   | f
+     4 | Mia Zhang      | f
+     5 | Nina Patel     | f
+     5 | Oscar Rivera   | f
+     5 | Emma Liu       | f
+     6 | Sarah Chen     | t
+(16 rows)</code></pre>
+<p>The walk visits the whole company once, and then Sarah appears again at depth 6 with <code>is_cycle</code> true, which is where the loop closes. It stops there. This also gives you a way to report the problem instead of just surviving it.</p>
+<p>The same protection without the <code>CYCLE</code> clause, which is what you write on databases that lack it, is an array of visited ids and a condition that refuses to revisit one:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE walk <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, name, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span>, <span class="dt">ARRAY</span>[employee_id] <span class="kw">AS</span> visited</span>
+<span>    <span class="kw">FROM</span> employees_loop</span>
+<span>    <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">1</span></span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.name, w.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span>, w.visited <span class="op">||</span> e.employee_id</span>
+<span>    <span class="kw">FROM</span> employees_loop e</span>
+<span>    <span class="kw">JOIN</span> walk w <span class="kw">ON</span> e.manager_id <span class="op">=</span> w.employee_id</span>
+<span>    <span class="kw">WHERE</span> <span class="kw">NOT</span> e.employee_id <span class="op">=</span> <span class="kw">ANY</span> (w.visited)</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> people_reached, <span class="fu">MAX</span>(<span class="fu">depth</span>) <span class="kw">AS</span> deepest</span>
+<span><span class="kw">FROM</span> walk;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> people_reached | deepest
+----------------+---------
+             15 |       5
+(1 row)</code></pre>
+<p>Fifteen people, with the deepest at depth 5. Here the walk stops quietly before returning to Sarah, so nothing in the output shows that a cycle exists.</p>
+<p>To find existing cycles in a table, walk up from every employee with <code>CYCLE</code> and look at the rows it marks. Only members of a cycle ever get marked:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> RECURSIVE up <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, manager_id <span class="kw">FROM</span> employees_loop</span>
+<span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, e.manager_id</span>
+<span>    <span class="kw">FROM</span> employees_loop e</span>
+<span>    <span class="kw">JOIN</span> up <span class="kw">ON</span> e.employee_id <span class="op">=</span> up.manager_id</span>
+<span>)</span>
+<span><span class="kw">CYCLE</span> employee_id <span class="kw">SET</span> is_cycle <span class="kw">USING</span> path</span>
+<span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> e.employee_id, e.name</span>
+<span><span class="kw">FROM</span> up</span>
+<span><span class="kw">JOIN</span> employees e <span class="kw">ON</span> e.employee_id <span class="op">=</span> up.employee_id</span>
+<span><span class="kw">WHERE</span> up.is_cycle</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> e.employee_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> employee_id |      name
+-------------+----------------
+           1 | Sarah Chen
+           2 | Marcus Johnson
+           4 | James Wilson
+           8 | Tom Baker
+          11 | Emma Liu
+(5 rows)</code></pre>
+<p>Sarah, Marcus, James, Tom and Emma form the loop. Everyone else leads into it from outside but is not part of it.</p>
+<h2 id="what-to-check-on-real-tables">What to check on real tables</h2>
+<p>An index on the column the recursive step joins on (<code>manager_id</code>) decides whether each round reads a few rows or the whole table. On a generated table with 100,000 employees in a wide tree and only the primary key, every round is a hash join against a full scan of <code>big_employees</code>:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_employees <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span> g <span class="kw">AS</span> employee_id,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g <span class="op">=</span> <span class="dv">1</span> <span class="cf">THEN</span> <span class="kw">NULL</span> <span class="cf">ELSE</span> (g <span class="op">-</span> <span class="dv">2</span>) <span class="op">/</span> <span class="dv">5</span> <span class="op">+</span> <span class="dv">1</span> <span class="cf">END</span> <span class="kw">AS</span> manager_id</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) <span class="kw">AS</span> g;</span>
+<span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> big_employees <span class="kw">ADD</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (employee_id);</span>
+<span><span class="kw">ANALYZE</span> big_employees;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> RECURSIVE t <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span> <span class="kw">FROM</span> big_employees <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">2</span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> big_employees e <span class="kw">JOIN</span> t <span class="kw">ON</span> e.manager_id <span class="op">=</span> t.employee_id</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> t;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                               QUERY PLAN
+-------------------------------------------------------------------------
+ Aggregate
+   CTE t
+     -&gt;  Recursive Union
+           -&gt;  Index Only Scan using big_employees_pkey on big_employees
+                 Index Cond: (employee_id = 2)
+           -&gt;  Hash Join
+                 Hash Cond: (e.manager_id = t_1.employee_id)
+                 -&gt;  Seq Scan on big_employees e
+                 -&gt;  Hash
+                       -&gt;  WorkTable Scan on t t_1
+   -&gt;  CTE Scan on t
+(11 rows)</code></pre>
+<p>After indexing <code>manager_id</code>, each round looks up only the children of the rows from the previous round:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> big_employees (manager_id);</span>
+<span><span class="kw">ANALYZE</span> big_employees;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">WITH</span> RECURSIVE t <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> employee_id, <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span> <span class="kw">FROM</span> big_employees <span class="kw">WHERE</span> employee_id <span class="op">=</span> <span class="dv">2</span></span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    <span class="kw">SELECT</span> e.employee_id, t.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span>    <span class="kw">FROM</span> big_employees e <span class="kw">JOIN</span> t <span class="kw">ON</span> e.manager_id <span class="op">=</span> t.employee_id</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> t;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Aggregate
+   CTE t
+     -&gt;  Recursive Union
+           -&gt;  Index Only Scan using big_employees_pkey on big_employees
+                 Index Cond: (employee_id = 2)
+           -&gt;  Nested Loop
+                 -&gt;  WorkTable Scan on t t_1
+                 -&gt;  Index Scan using big_employees_manager_id_idx on big_employees e
+                       Index Cond: (manager_id = t_1.employee_id)
+   -&gt;  CTE Scan on t
+(10 rows)</code></pre>
+<p>Other databases put a limit on recursion that PostgreSQL does not. MySQL stops after <code>cte_max_recursion_depth</code> iterations (1000 by default) and SQL Server after <code>MAXRECURSION</code> (100 by default), both with an error. In PostgreSQL, a depth condition or <code>CYCLE</code> is the only protection. SQL Server and Oracle also omit the word <code>RECURSIVE</code>; the rest of the syntax is the same.</p>
+<p>If the hierarchy is read far more than it changes and you need subtree queries to be a single index lookup, store it differently: a closure table of (ancestor, descendant) pairs, a nested-set model, or PostgreSQL's <code>ltree</code> extension for materialised paths.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A recursive CTE is an anchor plus a recursive step joined by <code>UNION ALL</code>, repeated until a round adds nothing.</li>
+<li>Down the tree: <code>child.parent = cte.id</code>. Up the tree: <code>parent.id = cte.parent</code>.</li>
+<li>Use <code>SEARCH DEPTH FIRST</code> to order rows as a tree, and a <code>depth</code> column to limit or label levels.</li>
+<li>Trees do not need <code>UNION</code>. Graphs with shared nodes do, or the number of rows grows with the number of routes. A <code>depth</code> column in the select list defeats the deduplication.</li>
+<li>Bad data can create cycles. Use <code>CYCLE</code> (PostgreSQL 14 and later) or an array of visited ids.</li>
+<li>Index the join column of the recursive step.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day15.pdf" download>Download PDF · Day 15</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../14/">← Day 14</a>
+  <a href="../../">All 31 days</a>
+  <a href="../16/">Day 16 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/15/</span>
+</footer>
+
+</body>
+</html>

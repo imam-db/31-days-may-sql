@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 05: NULL in ORDER BY: Who Goes First? · #31DaysMaySQL</title>
+<meta name="description" content="Where NULLs land in a sorted result depends on the database. How that changes a top-3 query, a ranking and DISTINCT ON, how NULLS FIRST/LAST fixes it, and what it does to index use.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 05: NULL in ORDER BY: Who Goes First?">
+<meta property="og:description" content="Where NULLs land in a sorted result depends on the database. How that changes a top-3 query, a ranking and DISTINCT ON, how NULLS FIRST/LAST fixes it, and what it does to index use.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../04/">← Day 04</a><a href="../06/">Day 06 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 05</p>
+  <h1>NULL in ORDER BY: Who Goes First?</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A table where two players have no score yet:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> scores (</span>
+<span>    player  TEXT,</span>
+<span>    points  <span class="dt">INT</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> scores <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="dv">95</span>),</span>
+<span>    (<span class="st">&#39;Bob&#39;</span>,   <span class="kw">NULL</span>),</span>
+<span>    (<span class="st">&#39;Carol&#39;</span>, <span class="dv">87</span>),</span>
+<span>    (<span class="st">&#39;Dave&#39;</span>,  <span class="kw">NULL</span>),</span>
+<span>    (<span class="st">&#39;Eve&#39;</span>,   <span class="dv">72</span>),</span>
+<span>    (<span class="st">&#39;Frank&#39;</span>, <span class="dv">91</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> points, player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Eve    |     72
+ Carol  |     87
+ Frank  |     91
+ Alice  |     95
+ Bob    |
+ Dave   |
+(6 rows)</code></pre>
+<p>In PostgreSQL the <code>NULL</code>s are at the bottom. MySQL puts them at the top for the same query. SQL does not say where <code>NULL</code> sorts; it only requires that all <code>NULL</code>s end up together, at one end.</p>
+<h2 id="defaults-by-database">Defaults by database</h2>
+<p>PostgreSQL and Oracle treat <code>NULL</code> as larger than any value. MySQL, SQL Server, SQLite and BigQuery treat it as smaller.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Database</th>
+<th><code>ORDER BY x ASC</code></th>
+<th><code>ORDER BY x DESC</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>PostgreSQL, Oracle</td>
+<td><code>NULL</code>s last</td>
+<td><code>NULL</code>s first</td>
+</tr>
+<tr class="even">
+<td>MySQL, SQL Server, SQLite, BigQuery</td>
+<td><code>NULL</code>s first</td>
+<td><code>NULL</code>s last</td>
+</tr>
+</tbody>
+</table>
+<p>With <code>DESC</code> the same PostgreSQL data looks like this, which surprises people who expect "highest scores first":</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span>, player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Bob    |
+ Dave   |
+ Alice  |     95
+ Frank  |     91
+ Carol  |     87
+ Eve    |     72
+(6 rows)</code></pre>
+<p>On MySQL the same two queries give <code>Bob, Dave, Eve, Carol, Frank, Alice</code> and <code>Alice, Frank, Carol, Eve, Bob, Dave</code>.</p>
+<h2 id="nulls-first-and-nulls-last">NULLS FIRST and NULLS LAST</h2>
+<p>PostgreSQL, Oracle, SQLite (3.30 and later) and BigQuery let you say it explicitly, so the position no longer depends on the direction or the engine:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>, player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Alice  |     95
+ Frank  |     91
+ Carol  |     87
+ Eve    |     72
+ Bob    |
+ Dave   |
+(6 rows)</code></pre>
+<p>MySQL and SQL Server have no <code>NULLS FIRST</code> or <code>NULLS LAST</code>. A <code>CASE</code> expression sorted first does the same and works everywhere:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> points <span class="kw">IS</span> <span class="kw">NULL</span> <span class="cf">THEN</span> <span class="dv">1</span> <span class="cf">ELSE</span> <span class="dv">0</span> <span class="cf">END</span>,</span>
+<span>         points <span class="kw">DESC</span>,</span>
+<span>         player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Alice  |     95
+ Frank  |     91
+ Carol  |     87
+ Eve    |     72
+ Bob    |
+ Dave   |
+(6 rows)</code></pre>
+<p>The <code>CASE</code> is <code>0</code> for real values and <code>1</code> for <code>NULL</code>, so <code>NULL</code>s go to the bottom whatever the second sort key does. MySQL also accepts the shorter <code>ORDER BY points IS NULL, points DESC</code>. SQL Server does not allow a boolean expression in <code>ORDER BY</code>, so there you need the <code>CASE</code>.</p>
+<h2 id="where-it-hurts">Where it hurts</h2>
+<h3 id="top-n">Top N</h3>
+<p>"The three highest scores" reads correctly and is wrong in PostgreSQL:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Bob    |
+ Dave   |
+ Alice  |     95
+(3 rows)</code></pre>
+<p>Two players with no score take the first two places. The fix is either <code>NULLS LAST</code> or filtering the <code>NULL</code>s out with <code>WHERE points IS NOT NULL</code>.</p>
+<h3 id="rankings">Rankings</h3>
+<p>A window function's <code>ORDER BY</code> follows the same rules. Players without a score rank first in PostgreSQL:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points,</span>
+<span>       <span class="fu">RANK</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span>) <span class="kw">AS</span> <span class="fu">rank</span></span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">rank</span>, player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points | rank
+--------+--------+------
+ Bob    |        |    1
+ Dave   |        |    1
+ Alice  |     95 |    3
+ Frank  |     91 |    4
+ Carol  |     87 |    5
+ Eve    |     72 |    6
+(6 rows)</code></pre>
+<p>Alice, who has the best score, is third. With <code>NULLS LAST</code> the ranking is what you expect:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points,</span>
+<span>       <span class="fu">RANK</span>() <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>) <span class="kw">AS</span> <span class="fu">rank</span></span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">rank</span>, player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points | rank
+--------+--------+------
+ Alice  |     95 |    1
+ Frank  |     91 |    2
+ Carol  |     87 |    3
+ Eve    |     72 |    4
+ Bob    |        |    5
+ Dave   |        |    5
+(6 rows)</code></pre>
+<p>Whether the unscored players should be ranked at all is a separate question. Filtering them out or giving them a <code>NULL</code> rank may be better.</p>
+<h3 id="distinct-on">DISTINCT ON</h3>
+<p><code>DISTINCT ON</code> keeps the first row of each group according to <code>ORDER BY</code>. To get each player's latest score, you sort by date descending, and a <code>NULL</code> date sorts first:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> score_history (</span>
+<span>    player       TEXT,</span>
+<span>    points       <span class="dt">INT</span>,</span>
+<span>    recorded_at  <span class="dt">DATE</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> score_history <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="dv">70</span>, <span class="st">&#39;2025-01-01&#39;</span>),</span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="dv">80</span>, <span class="st">&#39;2025-02-01&#39;</span>),</span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="dv">60</span>, <span class="kw">NULL</span>),            <span class="co">-- date was never recorded</span></span>
+<span>    (<span class="st">&#39;Bob&#39;</span>,   <span class="dv">50</span>, <span class="st">&#39;2025-01-15&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> <span class="kw">ON</span> (player) player, points, recorded_at</span>
+<span><span class="kw">FROM</span> score_history</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> player, recorded_at <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points | recorded_at
+--------+--------+-------------
+ Alice  |     60 |
+ Bob    |     50 | 2025-01-15
+(2 rows)</code></pre>
+<p>Alice's "latest" row is the one with the missing date. Adding <code>NULLS LAST</code> returns the row you meant:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> <span class="kw">ON</span> (player) player, points, recorded_at</span>
+<span><span class="kw">FROM</span> score_history</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> player, recorded_at <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points | recorded_at
+--------+--------+-------------
+ Alice  |     80 | 2025-02-01
+ Bob    |     50 | 2025-01-15
+(2 rows)</code></pre>
+<h3 id="pagination">Pagination</h3>
+<p><code>LIMIT</code> and <code>OFFSET</code> only give consistent pages if the order is fully determined. Two things can break that: <code>NULL</code>s landing at different ends on different databases, and ties. Players with equal points have no defined order between them, so a row can show up on two pages or on none. Adding a unique column as the last sort key fixes the ties:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>, player</span>
+<span><span class="kw">LIMIT</span> <span class="dv">2</span> OFFSET <span class="dv">4</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Bob    |
+ Dave   |
+(2 rows)</code></pre>
+<h3 id="several-sort-columns">Several sort columns</h3>
+<p>Each column has its own <code>NULL</code> position. Take a team column that is sometimes empty too:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> team_scores (player TEXT, team TEXT, points <span class="dt">INT</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> team_scores <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;red&#39;</span>,  <span class="dv">95</span>),</span>
+<span>    (<span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;red&#39;</span>,  <span class="kw">NULL</span>),</span>
+<span>    (<span class="st">&#39;Carol&#39;</span>, <span class="kw">NULL</span>,   <span class="dv">87</span>),</span>
+<span>    (<span class="st">&#39;Dave&#39;</span>,  <span class="st">&#39;blue&#39;</span>, <span class="kw">NULL</span>),</span>
+<span>    (<span class="st">&#39;Eve&#39;</span>,   <span class="st">&#39;blue&#39;</span>, <span class="dv">72</span>),</span>
+<span>    (<span class="st">&#39;Frank&#39;</span>, <span class="kw">NULL</span>,   <span class="kw">NULL</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> player, team, points</span>
+<span><span class="kw">FROM</span> team_scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> team, points <span class="kw">DESC</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | team | points
+--------+------+--------
+ Dave   | blue |
+ Eve    | blue |     72
+ Bob    | red  |
+ Alice  | red  |     95
+ Frank  |      |
+ Carol  |      |     87
+(6 rows)</code></pre>
+<p>Teams without a name come last because the first key is ascending, but inside each team the unscored players come first because the second key is descending. Saying it for each key gives a consistent result:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, team, points</span>
+<span><span class="kw">FROM</span> team_scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> team <span class="kw">NULLS</span> <span class="fu">LAST</span>, points <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | team | points
+--------+------+--------
+ Eve    | blue |     72
+ Dave   | blue |
+ Alice  | red  |     95
+ Bob    | red  |
+ Carol  |      |     87
+ Frank  |      |
+(6 rows)</code></pre>
+<h2 id="nulls-first-and-indexes">NULLS FIRST and indexes</h2>
+<p>A B-tree index has its own <code>NULL</code> order. By default PostgreSQL stores an ascending index with <code>NULL</code>s last, and a backward scan of that index gives <code>DESC NULLS FIRST</code>. A query that asks for <code>NULL</code>s in the opposite position cannot be served from it. Building a table large enough for the planner to prefer the index:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_scores (<span class="kw">id</span> SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, points <span class="dt">INT</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_scores (points)</span>
+<span><span class="kw">SELECT</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="kw">NULL</span> <span class="cf">ELSE</span> (g <span class="op">*</span> <span class="dv">7919</span>) % <span class="dv">100000</span> <span class="cf">END</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) <span class="kw">AS</span> g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_scores_points <span class="kw">ON</span> big_scores (points);</span>
+<span><span class="kw">ANALYZE</span> big_scores;</span></code></pre>
+<p>The two orderings that match the index, ascending with <code>NULL</code>s last and descending with <code>NULL</code>s first, read the index and stop after ten rows:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_scores <span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                       QUERY PLAN
+--------------------------------------------------------
+ Limit
+   -&gt;  Index Scan using big_scores_points on big_scores
+(2 rows)</code></pre>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_scores <span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">DESC</span> <span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                           QUERY PLAN
+-----------------------------------------------------------------
+ Limit
+   -&gt;  Index Scan Backward using big_scores_points on big_scores
+(2 rows)</code></pre>
+<p>The two orderings that do not match need a sort of the whole table:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_scores <span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">NULLS</span> <span class="fu">FIRST</span> <span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>              QUERY PLAN
+--------------------------------------
+ Limit
+   -&gt;  Sort
+         Sort Key: points NULLS FIRST
+         -&gt;  Seq Scan on big_scores
+(4 rows)</code></pre>
+<p>If the query needs that order, create an index in the same order:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_scores_points_nf <span class="kw">ON</span> big_scores (points <span class="kw">NULLS</span> <span class="fu">FIRST</span>);</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_scores <span class="kw">ORDER</span> <span class="kw">BY</span> points <span class="kw">NULLS</span> <span class="fu">FIRST</span> <span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                        QUERY PLAN
+-----------------------------------------------------------
+ Limit
+   -&gt;  Index Scan using big_scores_points_nf on big_scores
+(2 rows)</code></pre>
+<p>That index also serves <code>ORDER BY points DESC NULLS LAST</code> when scanned backward. The extra index costs space and write time, so add it only for a query that needs it, or change the query to the order the existing index already provides.</p>
+<h2 id="avoiding-the-problem">Avoiding the problem</h2>
+<p>The most reliable fix is to keep <code>NULL</code> out of columns that are sorted: a <code>NOT NULL</code> constraint, or a default. Where a missing value is real, <code>COALESCE</code> in the <code>ORDER BY</code> is possible but changes the meaning:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> player, <span class="fu">COALESCE</span>(points, <span class="dv">0</span>) <span class="kw">AS</span> points</span>
+<span><span class="kw">FROM</span> scores</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">COALESCE</span>(points, <span class="dv">0</span>), player;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> player | points
+--------+--------
+ Bob    |      0
+ Dave   |      0
+ Eve    |     72
+ Carol  |     87
+ Frank  |     91
+ Alice  |     95
+(6 rows)</code></pre>
+<p>A player who did not play now looks the same as one who scored zero, and an expression in the <code>ORDER BY</code> cannot use a plain index on <code>points</code>. Usually <code>NULLS FIRST</code> or <code>NULLS LAST</code> says what you mean more directly.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>NULL</code> sorts as the largest value in PostgreSQL and Oracle, and as the smallest in MySQL, SQL Server, SQLite and BigQuery.</li>
+<li>With <code>ORDER BY ... DESC LIMIT n</code>, PostgreSQL returns the <code>NULL</code> rows first. Write <code>NULLS LAST</code>, or filter them out.</li>
+<li>Rankings, <code>DISTINCT ON</code> and pagination follow the same rule, so spell out <code>NULLS FIRST</code> or <code>NULLS LAST</code> and add a unique tie-breaker.</li>
+<li>MySQL and SQL Server need a <code>CASE</code> expression in <code>ORDER BY</code>.</li>
+<li>An index can serve only the <code>NULL</code> ordering it was built with, in either scan direction.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day05.pdf" download>Download PDF · Day 05</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../04/">← Day 04</a>
+  <a href="../../">All 31 days</a>
+  <a href="../06/">Day 06 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/05/</span>
+</footer>
+
+</body>
+</html>

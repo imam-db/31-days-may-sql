@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 14: Bitmasks: Many Flags in One Integer · #31DaysMaySQL</title>
+<meta name="description" content="Store a set of yes/no flags such as user permissions in one integer and read, grant, revoke and toggle them with bitwise operators, including what to watch for in PostgreSQL.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 14: Bitmasks: Many Flags in One Integer">
+<meta property="og:description" content="Store a set of yes/no flags such as user permissions in one integer and read, grant, revoke and toggle them with bitwise operators, including what to watch for in PostgreSQL.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../13/">← Day 13</a><a href="../15/">Day 15 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 14</p>
+  <h1>Bitmasks: Many Flags in One Integer</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A content system gives each user some of six permissions: read, write, delete, publish, manage users, view analytics. The textbook design is a junction table, one row per user per permission. It is correct and flexible, and it has costs: checking one permission is a join or a subquery, and finding users who can both publish and manage users means intersecting rows.</p>
+<p>A second design stores all six flags in one integer column, one bit per permission. Unix file modes work this way. A check is a bitwise <code>AND</code>, granting is an <code>OR</code>, and revoking is an <code>AND</code> with the complement. The examples run on PostgreSQL 18, and the later sections cover when this design is the wrong choice.</p>
+<h2 id="bit-positions">Bit positions</h2>
+<p>Each permission gets a power of two, so each one occupies its own bit. PostgreSQL can print the bits, which is easier than doing it in your head: casting an integer to <code>bit(6)</code> keeps the six lowest bits.</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> permission_flags (</span>
+<span>    flag_value  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    flag_name   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> permission_flags <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>,  <span class="st">&#39;read&#39;</span>),</span>
+<span>    (<span class="dv">2</span>,  <span class="st">&#39;write&#39;</span>),</span>
+<span>    (<span class="dv">4</span>,  <span class="st">&#39;delete&#39;</span>),</span>
+<span>    (<span class="dv">8</span>,  <span class="st">&#39;publish&#39;</span>),</span>
+<span>    (<span class="dv">16</span>, <span class="st">&#39;manage_users&#39;</span>),</span>
+<span>    (<span class="dv">32</span>, <span class="st">&#39;view_analytics&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> flag_value, flag_value:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits, flag_name</span>
+<span><span class="kw">FROM</span> permission_flags</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> flag_value;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> flag_value |  bits  |   flag_name
+------------+--------+----------------
+          1 | 000001 | read
+          2 | 000010 | write
+          4 | 000100 | delete
+          8 | 001000 | publish
+         16 | 010000 | manage_users
+         32 | 100000 | view_analytics
+(6 rows)</code></pre>
+<p>A user with read, write and publish has 1 + 2 + 8 = 11, binary <code>001011</code>. Because every flag is a different power of two, the sum is unambiguous: 11 can only be made from those three flags.</p>
+<p>The <code>users</code> table has a <code>CHECK</code> that rejects any bit outside the six defined flags (<code>permissions &amp; ~63</code> must be zero):</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span>    user_id      <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    username     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    permissions  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="dv">0</span> <span class="kw">CHECK</span> (permissions &amp; ~<span class="dv">63</span> <span class="op">=</span> <span class="dv">0</span>)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users (username, permissions) <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;alice&#39;</span>,   <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">16</span> <span class="op">+</span> <span class="dv">32</span>),</span>
+<span>    (<span class="st">&#39;bob&#39;</span>,     <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span>),</span>
+<span>    (<span class="st">&#39;charlie&#39;</span>, <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span> <span class="op">+</span> <span class="dv">8</span>),</span>
+<span>    (<span class="st">&#39;diana&#39;</span>,   <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;eve&#39;</span>,     <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">8</span>),</span>
+<span>    (<span class="st">&#39;frank&#39;</span>,   <span class="dv">0</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> user_id, username, permissions, permissions:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> user_id | username | permissions |  bits
+---------+----------+-------------+--------
+       1 | alice    |          63 | 111111
+       2 | bob      |           3 | 000011
+       3 | charlie  |          11 | 001011
+       4 | diana    |           1 | 000001
+       5 | eve      |          15 | 001111
+       6 | frank    |           0 | 000000
+(6 rows)</code></pre>
+<p>Frank is a new account with no permissions, which is worth having in the data because several queries below treat zero in a special way.</p>
+<h2 id="checking-permissions">Checking permissions</h2>
+<p><code>permissions &amp; 2</code> keeps only the write bit. The result is 2 if the user has it and 0 if not:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username, permissions</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">WHERE</span> permissions &amp; <span class="dv">2</span> <span class="op">=</span> <span class="dv">2</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions
+----------+-------------
+ alice    |          63
+ bob      |           3
+ charlie  |          11
+ eve      |          15
+(4 rows)</code></pre>
+<p>For several permissions at once, build the mask by adding the flags and compare the result with the full mask. Both write (2) and publish (8) means mask 10:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username, permissions</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">WHERE</span> permissions &amp; <span class="dv">10</span> <span class="op">=</span> <span class="dv">10</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions
+----------+-------------
+ alice    |          63
+ charlie  |          11
+ eve      |          15
+(3 rows)</code></pre>
+<p>Charlie has both (11 = 8 + 2 + 1), and so do Alice and Eve. For "either write or publish", the test is that the <code>AND</code> is not zero:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username, permissions</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">WHERE</span> permissions &amp; <span class="dv">10</span> <span class="op">&lt;&gt;</span> <span class="dv">0</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions
+----------+-------------
+ alice    |          63
+ bob      |           3
+ charlie  |          11
+ eve      |          15
+(4 rows)</code></pre>
+<p>The difference between <code>= mask</code> and <code>&lt;&gt; 0</code> is the one thing in this pattern that is easy to get backwards. Bob has write but not publish, so he is in the "either" result and not in the "both" result.</p>
+<h2 id="granting-revoking-toggling">Granting, revoking, toggling</h2>
+<p>Granting uses <code>OR</code>. Bob gets publish (8):</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users <span class="kw">SET</span> permissions <span class="op">=</span> permissions | <span class="dv">8</span> <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;bob&#39;</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> username, permissions, permissions:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;bob&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions |  bits
+----------+-------------+--------
+ bob      |          11 | 001011
+(1 row)</code></pre>
+<p>Bob goes from 3 (<code>000011</code>) to 11 (<code>001011</code>). Running it a second time changes nothing, because OR-ing a bit that is already set leaves it set.</p>
+<p>Revoking uses <code>AND</code> with the complement. <code>~2</code> flips every bit of 2, so only the write bit is zero, and the <code>AND</code> clears exactly that bit:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users <span class="kw">SET</span> permissions <span class="op">=</span> permissions &amp; ~<span class="dv">2</span> <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;charlie&#39;</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> username, permissions, permissions:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;charlie&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions |  bits
+----------+-------------+--------
+ charlie  |           9 | 001001
+(1 row)</code></pre>
+<p>Charlie goes from 11 to 9: read and publish remain, write is gone. This is also safe to repeat.</p>
+<p>Toggling flips a bit whatever its current state. PostgreSQL's bitwise XOR on integers is <code>#</code>. Eve loses delete (4):</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users <span class="kw">SET</span> permissions <span class="op">=</span> permissions # <span class="dv">4</span> <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;eve&#39;</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> username, permissions, permissions:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;eve&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions |  bits
+----------+-------------+--------
+ eve      |          11 | 001011
+(1 row)</code></pre>
+<p>Run the same statement again and Eve's 11 becomes 15, with delete back. After that, she stays at 15 for the rest of the article.</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users <span class="kw">SET</span> permissions <span class="op">=</span> permissions # <span class="dv">4</span> <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;eve&#39;</span>;</span></code></pre>
+<p>One trap here: in MySQL and SQL Server, <code>^</code> is XOR, but in PostgreSQL <code>^</code> is exponentiation. The query runs without error and returns something unrelated:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="dv">3</span> # <span class="dv">4</span> <span class="kw">AS</span> xor, <span class="dv">3</span> ^ <span class="dv">4</span> <span class="kw">AS</span> <span class="fu">power</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> xor | power
+-----+-------
+   7 |    81
+(1 row)</code></pre>
+<p>An <code>UPDATE ... SET permissions = permissions | 8</code> is also atomic. Two requests granting different permissions to the same user at the same time cannot overwrite each other, because the row is locked while the new value is computed from the current one. Reading the integer into application code, changing it and writing it back loses that.</p>
+<h2 id="showing-permissions-as-text">Showing permissions as text</h2>
+<p>For display, a <code>CASE</code> per bit with <code>CONCAT_WS</code> (which skips <code>NULL</code>s) works but repeats the flag list in every query. A join against <code>permission_flags</code> keeps the list in one place:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> u.username,</span>
+<span>       STRING_AGG(f.flag_name, <span class="st">&#39;, &#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> f.flag_value) <span class="kw">AS</span> permission_list</span>
+<span><span class="kw">FROM</span> users u</span>
+<span><span class="kw">JOIN</span> permission_flags f <span class="kw">ON</span> u.permissions &amp; f.flag_value <span class="op">=</span> f.flag_value</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> u.username</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> u.username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username |                      permission_list
+----------+------------------------------------------------------------
+ alice    | read, write, delete, publish, manage_users, view_analytics
+ bob      | read, write, publish
+ charlie  | read, publish
+ diana    | read
+ eve      | read, write, delete, publish
+(5 rows)</code></pre>
+<p>Frank is missing. With no flag matching, the join produces no rows for him. To keep users with zero permissions, move the test into a <code>LEFT JOIN</code> condition:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> u.username,</span>
+<span>       <span class="fu">COALESCE</span>(STRING_AGG(f.flag_name, <span class="st">&#39;, &#39;</span> <span class="kw">ORDER</span> <span class="kw">BY</span> f.flag_value), <span class="st">&#39;(none)&#39;</span>) <span class="kw">AS</span> permission_list</span>
+<span><span class="kw">FROM</span> users u</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> permission_flags f <span class="kw">ON</span> u.permissions &amp; f.flag_value <span class="op">=</span> f.flag_value</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> u.username</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> u.username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username |                      permission_list
+----------+------------------------------------------------------------
+ alice    | read, write, delete, publish, manage_users, view_analytics
+ bob      | read, write, publish
+ charlie  | read, publish
+ diana    | read
+ eve      | read, write, delete, publish
+ frank    | (none)
+(6 rows)</code></pre>
+<h2 id="roles-as-masks">Roles as masks</h2>
+<p>Roles are masks too. A role is the OR of its permissions, and a user's permissions can be built from roles:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">roles</span> (</span>
+<span>    role_name    TEXT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    permissions  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">CHECK</span> (permissions &amp; ~<span class="dv">63</span> <span class="op">=</span> <span class="dv">0</span>)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">roles</span> <span class="kw">VALUES</span></span>
+<span>    (<span class="st">&#39;viewer&#39;</span>,    <span class="dv">1</span>),</span>
+<span>    (<span class="st">&#39;editor&#39;</span>,    <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span> <span class="op">+</span> <span class="dv">8</span>),</span>
+<span>    (<span class="st">&#39;moderator&#39;</span>, <span class="dv">1</span> <span class="op">+</span> <span class="dv">2</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">8</span>),</span>
+<span>    (<span class="st">&#39;admin&#39;</span>,     <span class="dv">63</span>);</span></code></pre>
+<p>Giving Diana the editor role adds the role's bits to hers with <code>OR</code>. It does not remove anything she already has, which is different from setting her permissions equal to the role:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users</span>
+<span><span class="kw">SET</span> permissions <span class="op">=</span> permissions | (<span class="kw">SELECT</span> permissions <span class="kw">FROM</span> <span class="kw">roles</span> <span class="kw">WHERE</span> role_name <span class="op">=</span> <span class="st">&#39;editor&#39;</span>)</span>
+<span><span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;diana&#39;</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> username, permissions <span class="kw">FROM</span> users <span class="kw">WHERE</span> username <span class="op">=</span> <span class="st">&#39;diana&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions
+----------+-------------
+ diana    |          11
+(1 row)</code></pre>
+<p>Who holds at least editor-level access? The same <code>&amp; mask = mask</code> test, with the role's mask coming from the table:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> u.username</span>
+<span><span class="kw">FROM</span> users u</span>
+<span><span class="kw">JOIN</span> <span class="kw">roles</span> r <span class="kw">ON</span> r.role_name <span class="op">=</span> <span class="st">&#39;editor&#39;</span></span>
+<span>            <span class="kw">AND</span> u.permissions &amp; r.permissions <span class="op">=</span> r.permissions</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> u.username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username
+----------
+ alice
+ bob
+ diana
+ eve
+(4 rows)</code></pre>
+<p>Charlie is missing because he lost write earlier, even though he can still publish.</p>
+<h2 id="counting-set-bits">Counting set bits</h2>
+<p>PostgreSQL has <code>bit_count()</code> for bit strings (since version 14), so cast the integer to <code>bit(32)</code> first. The portable alternative adds up one shifted bit per flag, and both give the same numbers:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username, permissions,</span>
+<span>       bit_count(permissions:<span class="ch">:bit</span>(<span class="dv">32</span>)) <span class="kw">AS</span> flags_builtin,</span>
+<span>       (permissions <span class="op">&gt;&gt;</span> <span class="dv">0</span> &amp; <span class="dv">1</span>) <span class="op">+</span> (permissions <span class="op">&gt;&gt;</span> <span class="dv">1</span> &amp; <span class="dv">1</span>) <span class="op">+</span> (permissions <span class="op">&gt;&gt;</span> <span class="dv">2</span> &amp; <span class="dv">1</span>)</span>
+<span>     <span class="op">+</span> (permissions <span class="op">&gt;&gt;</span> <span class="dv">3</span> &amp; <span class="dv">1</span>) <span class="op">+</span> (permissions <span class="op">&gt;&gt;</span> <span class="dv">4</span> &amp; <span class="dv">1</span>) <span class="op">+</span> (permissions <span class="op">&gt;&gt;</span> <span class="dv">5</span> &amp; <span class="dv">1</span>) <span class="kw">AS</span> flags_manual</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> flags_builtin <span class="kw">DESC</span>, username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username | permissions | flags_builtin | flags_manual
+----------+-------------+---------------+--------------
+ alice    |          63 |             6 |            6
+ eve      |          15 |             4 |            4
+ bob      |          11 |             3 |            3
+ diana    |          11 |             3 |            3
+ charlie  |           9 |             2 |            2
+ frank    |           0 |             0 |            0
+(6 rows)</code></pre>
+<p>MySQL has <code>BIT_COUNT()</code> for integers directly.</p>
+<h2 id="everyday-queries">Everyday queries</h2>
+<p>Who cannot publish (a zero result of the <code>AND</code>):</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> username</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">WHERE</span> permissions &amp; <span class="dv">8</span> <span class="op">=</span> <span class="dv">0</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> username;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> username
+----------
+ frank
+(1 row)</code></pre>
+<p>How many users share each exact combination:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> permissions, permissions:<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> bits, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> user_count</span>
+<span><span class="kw">FROM</span> users</span>
+<span><span class="kw">GROUP</span> <span class="kw">BY</span> permissions</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> user_count <span class="kw">DESC</span>, permissions;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> permissions |  bits  | user_count
+-------------+--------+------------
+          11 | 001011 |          2
+           0 | 000000 |          1
+           9 | 001001 |          1
+          15 | 001111 |          1
+          63 | 111111 |          1
+(5 rows)</code></pre>
+<p>Comparing two users, which flags Alice has that Eve lacks, the reverse, and the shared ones:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> (a.permissions &amp; ~e.permissions):<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> alice_only,</span>
+<span>       (e.permissions &amp; ~a.permissions):<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> eve_only,</span>
+<span>       (a.permissions &amp;  e.permissions):<span class="ch">:bit</span>(<span class="dv">6</span>) <span class="kw">AS</span> <span class="kw">shared</span></span>
+<span><span class="kw">FROM</span> users a, users e</span>
+<span><span class="kw">WHERE</span> a.username <span class="op">=</span> <span class="st">&#39;alice&#39;</span> <span class="kw">AND</span> e.username <span class="op">=</span> <span class="st">&#39;eve&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> alice_only | eve_only | shared
+------------+----------+--------
+ 110000     | 000000   | 001111
+(1 row)</code></pre>
+<h2 id="what-the-check-constraint-buys">What the CHECK constraint buys</h2>
+<p>The <code>CHECK (permissions &amp; ~63 = 0)</code> stops typos from creating bits that mean nothing. For example, a stray 64 would later make <code>permissions = 63</code> comparisons fail for an "admin":</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> users (username, permissions) <span class="kw">VALUES</span> (<span class="st">&#39;mallory&#39;</span>, <span class="dv">64</span>);</span></code></pre>
+<pre class="text"><code>ERROR:  new row for relation &quot;users&quot; violates check constraint &quot;users_permissions_check&quot;
+DETAIL:  Failing row contains (7, mallory, 64).</code></pre>
+<p>A junction table gets the same protection from a foreign key to a permissions table. A bitmask has no foreign key, so the constraint above is the substitute. Adding a seventh flag means updating the constraint as well.</p>
+<h2 id="size-limits">Size limits</h2>
+<p><code>INT</code> is a signed 32-bit integer, so only 31 bits are usable as positive flags. The 32nd bit is the sign:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">30</span> <span class="kw">AS</span> bit_30, <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">31</span> <span class="kw">AS</span> bit_31_as_int, <span class="dv">1</span>:<span class="ch">:bigint</span> <span class="op">&lt;&lt;</span> <span class="dv">31</span> <span class="kw">AS</span> bit_31_as_bigint;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   bit_30   | bit_31_as_int | bit_31_as_bigint
+------------+---------------+------------------
+ 1073741824 |   -2147483648 |       2147483648
+(1 row)</code></pre>
+<p>With more than 31 flags use <code>BIGINT</code> (63 usable bits), and past that use PostgreSQL's <code>bit varying</code> type or a different design.</p>
+<h2 id="indexes">Indexes</h2>
+<p>A B-tree index on the permissions column cannot help <code>permissions &amp; 32 = 32</code>, because the index is ordered by the whole number and the condition looks inside it. With 200,000 users, about 1 in 200 of whom has view_analytics, the plan is a full scan despite an index on <code>permissions</code>:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_users <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span> g <span class="kw">AS</span> user_id,</span>
+<span>       <span class="dv">1</span> <span class="op">+</span> (g % <span class="dv">2</span>) <span class="op">*</span> <span class="dv">2</span> <span class="op">+</span> <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">200</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="dv">32</span> <span class="cf">ELSE</span> <span class="dv">0</span> <span class="cf">END</span> <span class="kw">AS</span> permissions</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) <span class="kw">AS</span> g;</span>
+<span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> big_users <span class="kw">ADD</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (user_id);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> big_users (permissions);</span>
+<span><span class="kw">ANALYZE</span> big_users;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> user_id <span class="kw">FROM</span> big_users <span class="kw">WHERE</span> permissions &amp; <span class="dv">32</span> <span class="op">=</span> <span class="dv">32</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>             QUERY PLAN
+-------------------------------------
+ Seq Scan on big_users
+   Filter: ((permissions &amp; 32) = 32)
+(2 rows)</code></pre>
+<p>If one specific flag is queried often, a partial index on exactly that condition does work, because the planner can match the query's condition to the index's predicate:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_users_analytics <span class="kw">ON</span> big_users (user_id) <span class="kw">WHERE</span> permissions &amp; <span class="dv">32</span> <span class="op">=</span> <span class="dv">32</span>;</span>
+<span><span class="kw">ANALYZE</span> big_users;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> user_id <span class="kw">FROM</span> big_users <span class="kw">WHERE</span> permissions &amp; <span class="dv">32</span> <span class="op">=</span> <span class="dv">32</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                       QUERY PLAN
+--------------------------------------------------------
+ Index Only Scan using big_users_analytics on big_users
+(1 row)</code></pre>
+<p>This is one index per flag you need to search on, so the junction table's single index on <code>(permission, user_id)</code> scales better when "who has permission X" is the main question.</p>
+<h2 id="operators-across-databases">Operators across databases</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Operation</th>
+<th>PostgreSQL</th>
+<th>MySQL</th>
+<th>SQL Server</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>AND</td>
+<td><code>&amp;</code></td>
+<td><code>&amp;</code></td>
+<td><code>&amp;</code></td>
+</tr>
+<tr class="even">
+<td>NOT</td>
+<td><code>~</code></td>
+<td><code>~</code></td>
+<td><code>~</code></td>
+</tr>
+<tr class="odd">
+<td>XOR</td>
+<td><code>#</code></td>
+<td><code>^</code></td>
+<td><code>^</code></td>
+</tr>
+<tr class="even">
+<td>Shift</td>
+<td><code>&lt;&lt;</code> <code>&gt;&gt;</code></td>
+<td><code>&lt;&lt;</code> <code>&gt;&gt;</code></td>
+<td><code>LEFT_SHIFT</code>, <code>RIGHT_SHIFT</code> (2022 and later)</td>
+</tr>
+<tr class="odd">
+<td>Bit count</td>
+<td><code>bit_count</code> on bit strings</td>
+<td><code>BIT_COUNT</code></td>
+<td><code>BIT_COUNT</code> (2022 and later)</td>
+</tr>
+</tbody>
+</table>
+<p>OR is <code>|</code> in all three. BigQuery also has <code>&amp;</code>, <code>|</code>, <code>^</code>, <code>~</code>, <code>&lt;&lt;</code> and <code>&gt;&gt;</code> as operators on integers. Its <code>BIT_AND</code> and <code>BIT_OR</code> are aggregate functions over a column, which are something else. Parenthesising <code>(a &amp; b) = c</code> costs nothing and makes the intent clear to readers.</p>
+<h2 id="when-not-to-use-a-bitmask">When not to use a bitmask</h2>
+<p>A bitmask fits when the set of flags is small, fixed and checked together, and you are happy to change code to add a flag. It is a poor fit when:</p>
+<ul>
+<li>The flags change often or are defined by users, since each change touches code and constraints.</li>
+<li>You need to know who granted what and when. A junction table can carry <code>granted_by</code> and <code>granted_at</code> columns; one integer cannot.</li>
+<li>You need referential integrity or human-readable queries in reports, where the junction table is plainly easier.</li>
+<li>You need more than 63 flags.</li>
+</ul>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>One bit per flag: check with <code>permissions &amp; mask = mask</code>, grant with <code>|</code>, revoke with <code>&amp; ~mask</code>, toggle with <code>#</code> in PostgreSQL.</li>
+<li><code>= mask</code> means all of the flags, <code>&lt;&gt; 0</code> means any of them.</li>
+<li><code>^</code> is XOR in MySQL and SQL Server but exponentiation in PostgreSQL.</li>
+<li>Add a <code>CHECK</code> that rejects undefined bits, use <code>BIGINT</code> past 31 flags, and expect a full scan unless you add a partial index for a specific flag.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day14.pdf" download>Download PDF · Day 14</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../13/">← Day 13</a>
+  <a href="../../">All 31 days</a>
+  <a href="../15/">Day 15 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/14/</span>
+</footer>
+
+</body>
+</html>

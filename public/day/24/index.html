@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 24: The Cost of Correlated Subqueries · #31DaysMaySQL</title>
+<meta name="description" content="A correlated scalar subquery in the SELECT list runs once per outer row, and PostgreSQL does not turn it into a join. When that is fine, when it is not, and the grouped-join, LATERAL and window-function rewrites.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 24: The Cost of Correlated Subqueries">
+<meta property="og:description" content="A correlated scalar subquery in the SELECT list runs once per outer row, and PostgreSQL does not turn it into a join. When that is fine, when it is not, and the grouped-join, LATERAL and window-function rewrites.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../23/">← Day 23</a><a href="../25/">Day 25 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 24</p>
+  <h1>The Cost of Correlated Subqueries</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A customer report with a few scalar subqueries is easy to write and easy to read:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span></span>
+<span>    c.customer_id,</span>
+<span>    c.name,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)        <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> order_count,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">max</span>(created_at) <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> last_order,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">sum</span>(total)      <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> lifetime_revenue</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<p>Each subquery refers to <code>c.customer_id</code> from the outer query, which makes it correlated. A correlated subquery cannot be evaluated once and reused, because its result depends on the outer row. This query has three of them, so every customer that passes the <code>WHERE</code> triggers three separate lookups in <code>orders</code>.</p>
+<p>This article runs on PostgreSQL 18, and what it says about the planner is about PostgreSQL. SQL Server and Oracle have optimizers that unnest many correlated subqueries into joins on their own. PostgreSQL does not do that for scalar subqueries, as the plans below show.</p>
+<h2 id="the-data">The data</h2>
+<p>100,000 customers, a million orders (ten per customer on average), and 30,000 support tickets used later in the article:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    name         TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    signup_date  <span class="dt">DATE</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers (customer_id),</span>
+<span>    total        <span class="dt">NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    status       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    created_at   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> tickets (</span>
+<span>    ticket_id    <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    customer_id  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">REFERENCES</span> customers (customer_id),</span>
+<span>    status       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> customers</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;customer &#39;</span> <span class="op">||</span> g, <span class="dt">DATE</span> <span class="st">&#39;2020-01-01&#39;</span> <span class="op">+</span> (g % <span class="dv">2000</span>)</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders</span>
+<span><span class="kw">SELECT</span> g,</span>
+<span>       <span class="dv">1</span> <span class="op">+</span> (g:<span class="ch">:bigint</span> <span class="op">*</span> <span class="dv">7919</span>) % <span class="dv">100000</span>,</span>
+<span>       ((g:<span class="ch">:bigint</span> <span class="op">*</span> <span class="dv">7919</span>) % <span class="dv">9973</span>) <span class="op">/</span> <span class="fl">100.0</span>,</span>
+<span>       <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">97</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;disputed&#39;</span></span>
+<span>            <span class="cf">ELSE</span> (<span class="dt">ARRAY</span>[<span class="st">&#39;paid&#39;</span>,<span class="st">&#39;paid&#39;</span>,<span class="st">&#39;paid&#39;</span>,<span class="st">&#39;pending&#39;</span>,<span class="st">&#39;refunded&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> (g <span class="op">+</span> g <span class="op">/</span> <span class="dv">7</span>) % <span class="dv">5</span>]</span>
+<span>       <span class="cf">END</span>,</span>
+<span>       <span class="dt">TIMESTAMP</span> <span class="st">&#39;2022-01-01&#39;</span> <span class="op">+</span> (g % <span class="dv">1500</span>) <span class="op">*</span> <span class="dt">INTERVAL</span> <span class="st">&#39;1 day&#39;</span></span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> tickets</span>
+<span><span class="kw">SELECT</span> g,</span>
+<span>       <span class="dv">1</span> <span class="op">+</span> (g:<span class="ch">:bigint</span> <span class="op">*</span> <span class="dv">31</span>) % <span class="dv">100000</span>,</span>
+<span>       (<span class="dt">ARRAY</span>[<span class="st">&#39;open&#39;</span>,<span class="st">&#39;closed&#39;</span>,<span class="st">&#39;closed&#39;</span>,<span class="st">&#39;closed&#39;</span>])[<span class="dv">1</span> <span class="op">+</span> g % <span class="dv">4</span>]</span>
+<span><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">30000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_customer  <span class="kw">ON</span> orders  (customer_id);</span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_tickets_customer <span class="kw">ON</span> tickets (customer_id);</span>
+<span></span>
+<span>VACUUM <span class="kw">ANALYZE</span> customers;</span>
+<span>VACUUM <span class="kw">ANALYZE</span> orders;</span>
+<span>VACUUM <span class="kw">ANALYZE</span> tickets;</span></code></pre>
+<p>26,900 of the customers signed up after 2024-01-01. The report query goes into a view so the variants below can be compared against each other:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">VIEW</span> stats_subplans <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span></span>
+<span>    c.customer_id,</span>
+<span>    c.name,</span>
+<span>    c.signup_date,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)        <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> order_count,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">max</span>(created_at) <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> last_order,</span>
+<span>    (<span class="kw">SELECT</span> <span class="fu">sum</span>(total)      <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> lifetime_revenue</span>
+<span><span class="kw">FROM</span> customers c;</span></code></pre>
+<h2 id="what-the-plan-shows">What the plan shows</h2>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans <span class="kw">WHERE</span> signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+---------------------------------------------------------------------
+ Seq Scan on customers c
+   Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Index Only Scan using idx_orders_customer on orders o
+                 Index Cond: (customer_id = c.customer_id)
+   SubPlan 2
+     -&gt;  Aggregate
+           -&gt;  Bitmap Heap Scan on orders o_1
+                 Recheck Cond: (customer_id = c.customer_id)
+                 -&gt;  Bitmap Index Scan on idx_orders_customer
+                       Index Cond: (customer_id = c.customer_id)
+   SubPlan 3
+     -&gt;  Aggregate
+           -&gt;  Bitmap Heap Scan on orders o_2
+                 Recheck Cond: (customer_id = c.customer_id)
+                 -&gt;  Bitmap Index Scan on idx_orders_customer
+                       Index Cond: (customer_id = c.customer_id)
+(18 rows)</code></pre>
+<p>There is one scan of <code>customers</code> and three <code>SubPlan</code> nodes underneath it. Each subplan is a complete small query, planned once and executed once per qualifying customer. <code>EXPLAIN ANALYZE</code> on a single subquery makes the multiplication visible in the <code>loops</code> counter:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id,</span>
+<span>       (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> order_count</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------
+ Seq Scan on customers c (actual rows=26900.00 loops=1)
+   Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+   Rows Removed by Filter: 73100
+   SubPlan 1
+     -&gt;  Aggregate (actual rows=1.00 loops=26900)
+           -&gt;  Index Only Scan using idx_orders_customer on orders o (actual rows=10.00 loops=26900)
+                 Index Cond: (customer_id = c.customer_id)
+                 Heap Fetches: 0
+                 Index Searches: 26900
+(9 rows)</code></pre>
+<p><code>loops=26900</code>: the aggregate ran 26,900 times, once per customer, and each run did one index search. With the index on <code>orders (customer_id)</code> that is cheap per customer, and for 26,900 customers it is still thousands of small index probes rather than one big scan. Whether that is a problem depends on how many outer rows reach the subquery and how expensive one probe is.</p>
+<h3 id="without-the-index">Without the index</h3>
+<p>The expensive version is the one where the correlation column has no index. A copy of <code>orders</code> without one:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders_noidx <span class="kw">AS</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders;</span>
+<span><span class="kw">ANALYZE</span> orders_noidx;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id,</span>
+<span>       (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> orders_noidx o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id) <span class="kw">AS</span> order_count</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                      QUERY PLAN
+-------------------------------------------------------
+ Seq Scan on customers c
+   Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Seq Scan on orders_noidx o
+                 Filter: (customer_id = c.customer_id)
+(6 rows)</code></pre>
+<p>Now each of the 26,900 executions scans the whole million-row table, around 27 billion row visits in total. I did not run it. This is the shape behind reports of a query that "was fine in development and never finished in production": the plan is the same and the outer table grew. Check that the correlated column is indexed before anything else.</p>
+<h2 id="rewrite-1-aggregate-once-then-join">Rewrite 1: aggregate once, then join</h2>
+<p>The standard fix is to aggregate <code>orders</code> once and join the result:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">VIEW</span> stats_join <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span></span>
+<span>    c.customer_id,</span>
+<span>    c.name,</span>
+<span>    c.signup_date,</span>
+<span>    <span class="fu">COALESCE</span>(o.order_count, <span class="dv">0</span>) <span class="kw">AS</span> order_count,</span>
+<span>    o.last_order,</span>
+<span>    o.lifetime_revenue</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id,</span>
+<span>           <span class="fu">count</span>(<span class="op">*</span>)        <span class="kw">AS</span> order_count,</span>
+<span>           <span class="fu">max</span>(created_at) <span class="kw">AS</span> last_order,</span>
+<span>           <span class="fu">sum</span>(total)      <span class="kw">AS</span> lifetime_revenue</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">GROUP</span> <span class="kw">BY</span> customer_id</span>
+<span>) o <span class="kw">ON</span> o.customer_id <span class="op">=</span> c.customer_id;</span></code></pre>
+<p>The two forms differ for customers without orders. A scalar <code>count(*)</code> returns 0 there, but through a <code>LEFT JOIN</code> the column would be <code>NULL</code>, hence the <code>COALESCE</code> on the count. <code>sum</code> and <code>max</code> are <code>NULL</code> in both forms, so they get no <code>COALESCE</code>: wrapping the revenue in <code>COALESCE(..., 0)</code> would change the output of the report. In this data every customer has ten orders, so the comparison further down cannot show the difference, but it exists.</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_join <span class="kw">WHERE</span> signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+------------------------------------------------------------
+ Hash Right Join
+   Hash Cond: (orders.customer_id = c.customer_id)
+   -&gt;  GroupAggregate
+         Group Key: orders.customer_id
+         -&gt;  Index Scan using idx_orders_customer on orders
+   -&gt;  Hash
+         -&gt;  Seq Scan on customers c
+               Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+(8 rows)</code></pre>
+<p><code>orders</code> is aggregated once, in a single pass over the <code>customer_id</code> index, and joined to the customers that passed the filter. No subplans, no per-customer probes.</p>
+<p>That does not make it faster in every case. The grouped subquery cannot see the customer filter: it aggregates all million orders even when only a few customers are wanted. Take the customers who signed up on a single day, 50 of them:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_join <span class="kw">WHERE</span> signup_date <span class="op">=</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+------------------------------------------------------------
+ Merge Left Join
+   Merge Cond: (c.customer_id = orders.customer_id)
+   -&gt;  Sort
+         Sort Key: c.customer_id
+         -&gt;  Seq Scan on customers c
+               Filter: (signup_date = &#39;2024-01-01&#39;::date)
+   -&gt;  GroupAggregate
+         Group Key: orders.customer_id
+         -&gt;  Index Scan using idx_orders_customer on orders
+(9 rows)</code></pre>
+<p>The plan still aggregates the whole <code>orders</code> table, while the three-subquery version does 150 index probes for the same 50 customers:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans <span class="kw">WHERE</span> signup_date <span class="op">=</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+---------------------------------------------------------------------
+ Seq Scan on customers c
+   Filter: (signup_date = &#39;2024-01-01&#39;::date)
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Index Only Scan using idx_orders_customer on orders o
+                 Index Cond: (customer_id = c.customer_id)
+   SubPlan 2
+     -&gt;  Aggregate
+           -&gt;  Bitmap Heap Scan on orders o_1
+                 Recheck Cond: (customer_id = c.customer_id)
+                 -&gt;  Bitmap Index Scan on idx_orders_customer
+                       Index Cond: (customer_id = c.customer_id)
+   SubPlan 3
+     -&gt;  Aggregate
+           -&gt;  Bitmap Heap Scan on orders o_2
+                 Recheck Cond: (customer_id = c.customer_id)
+                 -&gt;  Bitmap Index Scan on idx_orders_customer
+                       Index Cond: (customer_id = c.customer_id)
+(18 rows)</code></pre>
+<p>A filter on the join column itself is different. PostgreSQL knows <code>c.customer_id = 5</code> implies <code>orders.customer_id = 5</code>, and pushes it into the grouped subquery:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_join <span class="kw">WHERE</span> customer_id <span class="op">=</span> <span class="dv">5</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+------------------------------------------------------------
+ Nested Loop Left Join
+   -&gt;  Index Scan using customers_pkey on customers c
+         Index Cond: (customer_id = 5)
+   -&gt;  GroupAggregate
+         -&gt;  Bitmap Heap Scan on orders
+               Recheck Cond: (customer_id = 5)
+               -&gt;  Bitmap Index Scan on idx_orders_customer
+                     Index Cond: (customer_id = 5)
+(8 rows)</code></pre>
+<p>So the rule is about the number of outer rows. A few outer rows and an index on the correlated column favor the subqueries, or a <code>LATERAL</code> join. Most of the outer table and a large <code>orders</code> favor one pass and a hash aggregate. In my own runs on a laptop with this data, the three-subquery version, the grouped join and the <code>LATERAL</code> version below all finished over the full customer table within the same few seconds, so the gap was much smaller than headline speedups suggest. It grows with the number of probes that miss the cache and with the number of subqueries.</p>
+<h2 id="rewrite-2-lateral-one-probe-for-three-columns">Rewrite 2: LATERAL, one probe for three columns</h2>
+<p>If you keep the per-customer lookup but want one probe instead of three, put the three aggregates in one <code>LATERAL</code> subquery:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">VIEW</span> stats_lateral <span class="kw">AS</span></span>
+<span><span class="kw">SELECT</span></span>
+<span>    c.customer_id,</span>
+<span>    c.name,</span>
+<span>    c.signup_date,</span>
+<span>    o.order_count,</span>
+<span>    o.last_order,</span>
+<span>    o.lifetime_revenue</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">LEFT</span> <span class="kw">JOIN</span> LATERAL (</span>
+<span>    <span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>)        <span class="kw">AS</span> order_count,</span>
+<span>           <span class="fu">max</span>(created_at) <span class="kw">AS</span> last_order,</span>
+<span>           <span class="fu">sum</span>(total)      <span class="kw">AS</span> lifetime_revenue</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>    <span class="kw">WHERE</span> customer_id <span class="op">=</span> c.customer_id</span>
+<span>) o <span class="kw">ON</span> <span class="kw">TRUE</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_lateral <span class="kw">WHERE</span> signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                          QUERY PLAN
+---------------------------------------------------------------
+ Nested Loop Left Join
+   -&gt;  Seq Scan on customers c
+         Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+   -&gt;  Aggregate
+         -&gt;  Bitmap Heap Scan on orders
+               Recheck Cond: (customer_id = c.customer_id)
+               -&gt;  Bitmap Index Scan on idx_orders_customer
+                     Index Cond: (customer_id = c.customer_id)
+(8 rows)</code></pre>
+<p>It is still a nested loop with one index lookup per customer, but orders are fetched once per customer and all three aggregates are computed from the same rows. An aggregate without <code>GROUP BY</code> always returns exactly one row, even for a customer with no orders, so there is no <code>COALESCE</code> to forget and <code>LEFT JOIN ... ON TRUE</code> behaves like the scalar subqueries. <code>LATERAL</code> exists in PostgreSQL (9.3 and later), MySQL (8.0.14 and later) and Oracle (12c and later); SQL Server writes the same idea as <code>CROSS APPLY</code> or <code>OUTER APPLY</code>.</p>
+<p>All three views return the same rows. <code>EXCEPT</code> treats two <code>NULL</code>s as equal, so comparing in both directions shows any difference:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> differing_rows</span>
+<span><span class="kw">FROM</span> (</span>
+<span>    (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans <span class="kw">EXCEPT</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_join)</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_join <span class="kw">EXCEPT</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans)</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans <span class="kw">EXCEPT</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_lateral)</span>
+<span>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span>    (<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_lateral <span class="kw">EXCEPT</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> stats_subplans)</span>
+<span>) d;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> differing_rows
+----------------
+              0
+(1 row)</code></pre>
+<h2 id="what-postgresql-does-turn-into-a-join">What PostgreSQL does turn into a join</h2>
+<p><code>EXISTS</code> and <code>IN</code> with a subquery are different from scalar subqueries. PostgreSQL pulls them up into a semi-join (and <code>NOT EXISTS</code> into an anti-join, see Day 22), which can start from either table:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> c.customer_id</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.signup_date <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span></span>
+<span>  <span class="kw">AND</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+-------------------------------------------------------------
+ Nested Loop Semi Join
+   -&gt;  Seq Scan on customers c
+         Filter: (signup_date &gt; &#39;2024-01-01&#39;::date)
+   -&gt;  Index Only Scan using idx_orders_customer on orders o
+         Index Cond: (customer_id = c.customer_id)
+(5 rows)</code></pre>
+<p>There is no <code>SubPlan</code> here and no per-row restart. A correlated <code>EXISTS</code> is usually fine as written. A correlated scalar aggregate in the <code>SELECT</code> list or in a comparison is the one that stays a subplan.</p>
+<h2 id="comparing-a-row-with-its-group-window-functions">Comparing a row with its group: window functions</h2>
+<p>The same applies in <code>WHERE</code>. "Orders larger than the customer's average order" is natural to write as a correlated subquery:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> orders o</span>
+<span><span class="kw">WHERE</span> total <span class="op">&gt;</span> (<span class="kw">SELECT</span> <span class="fu">avg</span>(total) <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">=</span> o.customer_id);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                           QUERY PLAN
+-----------------------------------------------------------------
+ Seq Scan on orders o
+   Filter: (total &gt; (SubPlan 1))
+   SubPlan 1
+     -&gt;  Aggregate
+           -&gt;  Bitmap Heap Scan on orders
+                 Recheck Cond: (customer_id = o.customer_id)
+                 -&gt;  Bitmap Index Scan on idx_orders_customer
+                       Index Cond: (customer_id = o.customer_id)
+(8 rows)</code></pre>
+<p>That is one index probe per order, a million of them for the whole table. A window function computes every customer's average in one pass:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="op">*</span>, <span class="fu">avg</span>(total) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id) <span class="kw">AS</span> customer_avg</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>) t</span>
+<span><span class="kw">WHERE</span> total <span class="op">&gt;</span> customer_avg;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                         QUERY PLAN
+------------------------------------------------------------
+ Subquery Scan on t
+   Filter: (t.total &gt; t.customer_avg)
+   -&gt;  WindowAgg
+         Window: w1 AS (PARTITION BY orders.customer_id)
+         -&gt;  Index Scan using idx_orders_customer on orders
+(5 rows)</code></pre>
+<p>Both give the same rows. A check on the first 100 customers, so the correlated version finishes quickly:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> above_avg_correlated</span>
+<span><span class="kw">FROM</span> orders o</span>
+<span><span class="kw">WHERE</span> o.customer_id <span class="op">&lt;=</span> <span class="dv">100</span></span>
+<span>  <span class="kw">AND</span> total <span class="op">&gt;</span> (<span class="kw">SELECT</span> <span class="fu">avg</span>(total) <span class="kw">FROM</span> orders <span class="kw">WHERE</span> customer_id <span class="op">=</span> o.customer_id);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> above_avg_correlated
+----------------------
+                  500
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> above_avg_window</span>
+<span><span class="kw">FROM</span> (</span>
+<span>    <span class="kw">SELECT</span> <span class="op">*</span>, <span class="fu">avg</span>(total) <span class="kw">OVER</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> customer_id) <span class="kw">AS</span> customer_avg</span>
+<span>    <span class="kw">FROM</span> orders</span>
+<span>) t</span>
+<span><span class="kw">WHERE</span> customer_id <span class="op">&lt;=</span> <span class="dv">100</span></span>
+<span>  <span class="kw">AND</span> total <span class="op">&gt;</span> customer_avg;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> above_avg_window
+------------------
+              500
+(1 row)</code></pre>
+<p>Filtering on the partition column outside the subquery works because PostgreSQL pushes that condition below the window function. A filter on any other column cannot be pushed down that way, since it would change which rows each average is computed from. A join against a grouped <code>avg(total)</code> is the third way to write it and is just as good.</p>
+<h2 id="exists-combined-with-or">EXISTS combined with OR</h2>
+<p>Two <code>EXISTS</code> conditions joined by <code>OR</code> cannot become two semi-joins, because a row that passes through either one has to stay. PostgreSQL still has a way out: it can turn each <code>EXISTS</code> into a hashed subplan, built once for the whole query.</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders  o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> o.status <span class="op">=</span> <span class="st">&#39;disputed&#39;</span>)</span>
+<span>   <span class="kw">OR</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> tickets t <span class="kw">WHERE</span> t.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> t.status <span class="op">=</span> <span class="st">&#39;open&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                 QUERY PLAN
+------------------------------------------------------------------------------------------------------------
+ Seq Scan on customers c
+   Filter: ((ANY (customer_id = (hashed SubPlan 2).col1)) OR (ANY (customer_id = (hashed SubPlan 4).col1)))
+   SubPlan 2
+     -&gt;  Gather
+           Workers Planned: 2
+           -&gt;  Parallel Seq Scan on orders o
+                 Filter: (status = &#39;disputed&#39;::text)
+   SubPlan 4
+     -&gt;  Seq Scan on tickets t
+           Filter: (status = &#39;open&#39;::text)
+(10 rows)</code></pre>
+<p>Both <code>SubPlan</code> nodes are marked <code>hashed</code>, so each table is scanned once and probed from a hash table. That is not per-row evaluation. It does mean the plan scans all disputed orders and all open tickets however few customers you ask for, and the plan can turn into a true per-row subplan when the hash would not fit in <code>work_mem</code> or the planner expects very few outer rows. Writing the <code>UNION</code> version makes the choice explicit:</p>
+<pre class="code"><code><span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span></span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.customer_id <span class="kw">IN</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders  <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;disputed&#39;</span></span>
+<span>    <span class="kw">UNION</span></span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> tickets <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;open&#39;</span></span>
+<span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                             QUERY PLAN
+---------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (c.customer_id = orders.customer_id)
+   -&gt;  Seq Scan on customers c
+   -&gt;  Hash
+         -&gt;  HashAggregate
+               Group Key: orders.customer_id
+               -&gt;  Append
+                     -&gt;  Gather
+                           Workers Planned: 2
+                           -&gt;  Parallel Seq Scan on orders
+                                 Filter: (status = &#39;disputed&#39;::text)
+                     -&gt;  Seq Scan on tickets
+                           Filter: (status = &#39;open&#39;::text)
+(13 rows)</code></pre>
+<p>The two forms return the same customers:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> with_exists_or</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> orders  o <span class="kw">WHERE</span> o.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> o.status <span class="op">=</span> <span class="st">&#39;disputed&#39;</span>)</span>
+<span>   <span class="kw">OR</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> tickets t <span class="kw">WHERE</span> t.customer_id <span class="op">=</span> c.customer_id <span class="kw">AND</span> t.status <span class="op">=</span> <span class="st">&#39;open&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> with_exists_or
+----------------
+          17034
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> with_union</span>
+<span><span class="kw">FROM</span> customers c</span>
+<span><span class="kw">WHERE</span> c.customer_id <span class="kw">IN</span> (</span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> orders  <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;disputed&#39;</span></span>
+<span>    <span class="kw">UNION</span></span>
+<span>    <span class="kw">SELECT</span> customer_id <span class="kw">FROM</span> tickets <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;open&#39;</span></span>
+<span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code> with_union
+------------
+      17034
+(1 row)</code></pre>
+<p>I would not call the <code>UNION</code> form better here. Both scan each table once. It is the form to try when <code>EXPLAIN</code> shows the first plan degrading into a per-row subplan.</p>
+<h2 id="finding-these-in-a-real-database">Finding these in a real database</h2>
+<p>Look for the pattern in two places. In a plan, a <code>SubPlan</code> node (not marked <code>hashed</code>) under a scan or filter, with <code>loops</code> far above 1 on <code>EXPLAIN (ANALYZE)</code>, is a per-row subquery. Across the workload, <code>pg_stat_statements</code> shows which statements spend the time:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> calls,</span>
+<span>       <span class="fu">round</span>(total_exec_time) <span class="kw">AS</span> total_ms,</span>
+<span>       <span class="fu">round</span>(mean_exec_time)  <span class="kw">AS</span> mean_ms,</span>
+<span>       <span class="kw">rows</span>,</span>
+<span>       <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">80</span>)        <span class="kw">AS</span> <span class="kw">query</span></span>
+<span><span class="kw">FROM</span> pg_stat_statements</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> total_exec_time <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre>
+<p>Take the top statements, run <code>EXPLAIN (ANALYZE)</code> on a production-sized copy, and look at the loop counts of the subplans.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A correlated scalar subquery in <code>SELECT</code> or <code>WHERE</code> is executed once per outer row in PostgreSQL. <code>EXPLAIN</code> shows it as <code>SubPlan</code>, and <code>loops</code> on <code>EXPLAIN ANALYZE</code> shows how many times it ran.</li>
+<li>Cost is the number of outer rows times the cost of one probe. An index on the correlated column keeps the probe cheap; without it each probe scans the table.</li>
+<li>For a few outer rows with an index, leave the subqueries alone. If several subqueries read the same table, merge them into one <code>LATERAL</code> subquery.</li>
+<li>When most of the outer table is needed, aggregate once and join. Remember that <code>LEFT JOIN</code> gives <code>NULL</code> where a scalar <code>count(*)</code> gave 0.</li>
+<li>To compare rows with a group value, use a window function or a grouped join.</li>
+<li><code>EXISTS</code> and <code>IN</code> are handled as semi-joins and need no rewrite.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day24.pdf" download>Download PDF · Day 24</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../23/">← Day 23</a>
+  <a href="../../">All 31 days</a>
+  <a href="../25/">Day 25 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/24/</span>
+</footer>
+
+</body>
+</html>

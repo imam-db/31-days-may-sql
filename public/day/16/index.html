@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 16: Interval Overlaps: Scheduling Conflict Detection · #31DaysMaySQL</title>
+<meta name="description" content="One condition, start &lt; other_end AND end &gt; other_start, finds every overlap. How to use it for booking checks and conflict reports, why LEAD misses long bookings, and how PostgreSQL range types can forbid overlaps outright.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 16: Interval Overlaps: Scheduling Conflict Detection">
+<meta property="og:description" content="One condition, start &lt; other_end AND end &gt; other_start, finds every overlap. How to use it for booking checks and conflict reports, why LEAD misses long bookings, and how PostgreSQL range types can forbid overlaps outright.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../15/">← Day 15</a><a href="../17/">Day 17 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 16</p>
+  <h1>Interval Overlaps: Scheduling Conflict Detection</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A user wants Conference Room A from 14:00 to 15:30. Before confirming, you need to know whether an existing booking overlaps that slot. The check is one <code>WHERE</code> clause, and most first attempts get it wrong in some corner.</p>
+<p>The queries run on PostgreSQL 18. The overlap condition itself is plain comparison logic and works in any SQL database. The <code>OVERLAPS</code> operator, range types and exclusion constraints near the end are PostgreSQL features.</p>
+<h2 id="the-seven-cases">The seven cases</h2>
+<p>Two intervals can be positioned against each other in these ways:</p>
+<pre class="text"><code>1. New starts inside existing        2. New ends inside existing
+   Existing:  |---------|               Existing:       |---------|
+   New:            |---------|          New:       |---------|
+
+3. New contains existing             4. Existing contains new
+   Existing:    |-----|                 Existing:  |---------|
+   New:       |---------|               New:          |---|
+
+5. Same interval                     6. New entirely before existing
+   Existing:  |---------|               Existing:            |---------|
+   New:       |---------|               New:       |-----|
+
+7. New entirely after existing
+   Existing:  |---------|
+   New:                    |---------|</code></pre>
+<p>Cases 1 to 5 are overlaps, 6 and 7 are not. A <code>WHERE</code> clause has to accept the first five and reject the last two.</p>
+<h2 id="the-data">The data</h2>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> room_bookings (</span>
+<span>    booking_id   <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    room_id      <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    booked_by    <span class="dt">VARCHAR</span>(<span class="dv">100</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    start_time   <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    end_time     <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    description  <span class="dt">VARCHAR</span>(<span class="dv">200</span>),</span>
+<span>    <span class="kw">CHECK</span> (end_time <span class="op">&gt;</span> start_time)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> room_bookings (room_id, booked_by, start_time, end_time, description) <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>,   <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="st">&#39;2024-06-10 10:00&#39;</span>, <span class="st">&#39;Sprint Planning&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Bob&#39;</span>,     <span class="st">&#39;2024-06-10 10:00&#39;</span>, <span class="st">&#39;2024-06-10 11:30&#39;</span>, <span class="st">&#39;Design Review&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Charlie&#39;</span>, <span class="st">&#39;2024-06-10 13:00&#39;</span>, <span class="st">&#39;2024-06-10 14:30&#39;</span>, <span class="st">&#39;Client Call&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Diana&#39;</span>,   <span class="st">&#39;2024-06-10 14:00&#39;</span>, <span class="st">&#39;2024-06-10 15:30&#39;</span>, <span class="st">&#39;Team Standup&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Eve&#39;</span>,     <span class="st">&#39;2024-06-10 16:00&#39;</span>, <span class="st">&#39;2024-06-10 17:00&#39;</span>, <span class="st">&#39;Interview&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Frank&#39;</span>,   <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="st">&#39;2024-06-10 12:00&#39;</span>, <span class="st">&#39;Workshop&#39;</span>);</span></code></pre>
+<p>Charlie (13:00 to 14:30) and Diana (14:00 to 15:30) overlap by 30 minutes, which is a real conflict. Alice and Bob only share the 10:00 boundary, so they do not overlap: Alice's meeting ends at the moment Bob's starts.</p>
+<h2 id="why-listing-the-cases-goes-wrong">Why listing the cases goes wrong</h2>
+<p>The usual approach is one condition per case. People tend to cover the two partial overlaps (cases 1 and 2) and forget that the new interval can contain an existing one entirely (case 3):</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> booking_id, booked_by</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span></span>
+<span>  <span class="kw">AND</span> (   (<span class="st">&#39;2024-06-10 12:00&#39;</span> <span class="op">&gt;=</span> start_time <span class="kw">AND</span> <span class="st">&#39;2024-06-10 12:00&#39;</span> <span class="op">&lt;</span>  end_time)   <span class="co">-- new start is inside existing</span></span>
+<span>       <span class="kw">OR</span> (<span class="st">&#39;2024-06-10 18:00&#39;</span> <span class="op">&gt;</span>  start_time <span class="kw">AND</span> <span class="st">&#39;2024-06-10 18:00&#39;</span> <span class="op">&lt;=</span> end_time))  <span class="co">-- new end is inside existing</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> booking_id;</span></code></pre>
+<p>Asking about 12:00 to 18:00, which covers Charlie, Diana and Eve completely, returns nothing:</p>
+<pre class="out" aria-label="Query result"><code> booking_id | booked_by
+------------+-----------
+(0 rows)</code></pre>
+<p>Neither the start nor the end of the new slot falls inside any existing booking, so both clauses are false. The query reports a free room that has three meetings in it.</p>
+<h2 id="invert-the-question">Invert the question</h2>
+<p>Two intervals do not overlap in exactly two situations:</p>
+<ul>
+<li>the existing one ends before or when the new one starts: <code>end_time &lt;= new_start</code></li>
+<li>the existing one starts at or after the new one ends: <code>start_time &gt;= new_end</code></li>
+</ul>
+<p>Negate the OR of those two (De Morgan) and you get the condition for an overlap:</p>
+<pre class="code"><code><span>start_time <span class="op">&lt;</span> new_end <span class="kw">AND</span> end_time <span class="op">&gt;</span> new_start</span></code></pre>
+<p>It covers all five overlapping cases without listing them. Take case 4, where the existing booking contains the new one: its start is before the new end and its end is after the new start, so it matches.</p>
+<h2 id="using-it">Using it</h2>
+<h3 id="can-i-book-1200-to-1800">Can I book 12:00 to 18:00?</h3>
+<p>Same question as before, now with the condition above:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> booking_id, booked_by, start_time:<span class="ch">:time</span> <span class="kw">AS</span> starts, end_time:<span class="ch">:time</span> <span class="kw">AS</span> ends</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span></span>
+<span>  <span class="kw">AND</span> start_time <span class="op">&lt;</span> <span class="st">&#39;2024-06-10 18:00&#39;</span>   <span class="co">-- existing starts before the new one ends</span></span>
+<span>  <span class="kw">AND</span> end_time   <span class="op">&gt;</span> <span class="st">&#39;2024-06-10 12:00&#39;</span>   <span class="co">-- existing ends after the new one starts</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> start_time;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> booking_id | booked_by |  starts  |   ends
+------------+-----------+----------+----------
+          3 | Charlie   | 13:00:00 | 14:30:00
+          4 | Diana     | 14:00:00 | 15:30:00
+          5 | Eve       | 16:00:00 | 17:00:00
+(3 rows)</code></pre>
+<p>All three are found. An empty result means the slot is free.</p>
+<h3 id="moving-an-existing-booking">Moving an existing booking</h3>
+<p>When someone edits a booking, it must not be compared with itself. Can booking 4 (Diana) move to 15:00 to 16:30?</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> booking_id, booked_by, start_time:<span class="ch">:time</span> <span class="kw">AS</span> starts, end_time:<span class="ch">:time</span> <span class="kw">AS</span> ends</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span></span>
+<span>  <span class="kw">AND</span> booking_id <span class="op">&lt;&gt;</span> <span class="dv">4</span></span>
+<span>  <span class="kw">AND</span> start_time <span class="op">&lt;</span> <span class="st">&#39;2024-06-10 16:30&#39;</span></span>
+<span>  <span class="kw">AND</span> end_time   <span class="op">&gt;</span> <span class="st">&#39;2024-06-10 15:00&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> start_time;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> booking_id | booked_by |  starts  |   ends
+------------+-----------+----------+----------
+          5 | Eve       | 16:00:00 | 17:00:00
+(1 row)</code></pre>
+<p>Eve's interview starts at 16:00, so the move is refused. Without <code>booking_id &lt;&gt; 4</code>, Diana's current slot would also match.</p>
+<h3 id="all-conflicts-already-in-the-table">All conflicts already in the table</h3>
+<p>To audit existing data, join the table to itself. <code>a.booking_id &lt; b.booking_id</code> keeps each pair once instead of twice:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> a.booking_id <span class="kw">AS</span> booking_a, a.booked_by <span class="kw">AS</span> person_a,</span>
+<span>       b.booking_id <span class="kw">AS</span> booking_b, b.booked_by <span class="kw">AS</span> person_b,</span>
+<span>       <span class="fu">least</span>(a.end_time, b.end_time) <span class="op">-</span> <span class="fu">greatest</span>(a.start_time, b.start_time) <span class="kw">AS</span> overlap</span>
+<span><span class="kw">FROM</span> room_bookings a</span>
+<span><span class="kw">JOIN</span> room_bookings b</span>
+<span>  <span class="kw">ON</span>  a.room_id <span class="op">=</span> b.room_id</span>
+<span>  <span class="kw">AND</span> a.booking_id <span class="op">&lt;</span> b.booking_id</span>
+<span>  <span class="kw">AND</span> a.start_time <span class="op">&lt;</span> b.end_time</span>
+<span>  <span class="kw">AND</span> a.end_time   <span class="op">&gt;</span> b.start_time</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> a.booking_id, b.booking_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> booking_a | person_a | booking_b | person_b | overlap
+-----------+----------+-----------+----------+----------
+         3 | Charlie  |         4 | Diana    | 00:30:00
+(1 row)</code></pre>
+<p>The length of the overlap is <code>least(ends) - greatest(starts)</code>, here the 30 minutes between 14:00 and 14:30.</p>
+<h2 id="touching-boundaries">Touching boundaries</h2>
+<p>Whether 09:00 to 10:00 and 10:00 to 11:00 conflict is a business rule. Time slots are normally treated as half-open: the start is included, the end is not, so 10:00 belongs only to the second slot. The strict <code>&lt;</code> and <code>&gt;</code> above implement exactly that. If both endpoints count (closed intervals), the operators become <code>&lt;=</code> and <code>&gt;=</code>.</p>
+<p>The difference shows up when you ask for 10:00 to 11:00 in room 1, where Alice ends at 10:00 and Bob starts at 10:00:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="st">&#39;half-open&#39;</span> <span class="kw">AS</span> <span class="kw">rule</span>, booked_by</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> start_time <span class="op">&lt;</span> <span class="st">&#39;2024-06-10 11:00&#39;</span> <span class="kw">AND</span> end_time <span class="op">&gt;</span> <span class="st">&#39;2024-06-10 10:00&#39;</span></span>
+<span><span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;closed&#39;</span>, booked_by</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> start_time <span class="op">&lt;=</span> <span class="st">&#39;2024-06-10 11:00&#39;</span> <span class="kw">AND</span> end_time <span class="op">&gt;=</span> <span class="st">&#39;2024-06-10 10:00&#39;</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>   rule    | booked_by
+-----------+-----------
+ closed    | Alice
+ closed    | Bob
+ half-open | Bob
+(3 rows)</code></pre>
+<p>With closed intervals Alice blocks the slot even though her meeting is over at 10:00. For rooms, shifts and most bookings, half-open is the right choice. Closed intervals fit things like whole-day dates, where an end of <code>06-10</code> really means "through the end of the 10th".</p>
+<h2 id="speed">Speed</h2>
+<p>The self-join compares every pair in a room. With 10,000 bookings in one room that is 10,000 × 9,999 / 2, about 50 million comparisons, and the cost grows with the square of the room's bookings. A single availability check is a different job: it only needs the rows around one time slot, and how fast that is depends on the index.</p>
+<p>A B-tree on <code>(room_id, start_time)</code> helps with only one half of the condition. To see it, generate 200,000 one-hour bookings across 20 rooms:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> big_bookings (</span>
+<span>    booking_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    room_id     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    start_time  <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    end_time    <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> big_bookings</span>
+<span><span class="kw">SELECT</span> g, <span class="dv">1</span> <span class="op">+</span> g % <span class="dv">20</span>, ts, ts <span class="op">+</span> <span class="dt">interval</span> <span class="st">&#39;1 hour&#39;</span></span>
+<span><span class="kw">FROM</span> (<span class="kw">SELECT</span> g, <span class="dt">timestamp</span> <span class="st">&#39;2024-01-01&#39;</span> <span class="op">+</span> (g <span class="op">/</span> <span class="dv">20</span>) <span class="op">*</span> <span class="dt">interval</span> <span class="st">&#39;90 minutes&#39;</span> <span class="kw">AS</span> ts</span>
+<span>      <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) g) s;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_bookings_start_idx <span class="kw">ON</span> big_bookings (room_id, start_time);</span>
+<span><span class="kw">ANALYZE</span> big_bookings;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">5</span></span>
+<span>  <span class="kw">AND</span> start_time <span class="op">&lt;</span> <span class="st">&#39;2024-03-01 15:30&#39;</span></span>
+<span>  <span class="kw">AND</span> end_time   <span class="op">&gt;</span> <span class="st">&#39;2024-03-01 14:00&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                QUERY PLAN
+-----------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_bookings
+   Recheck Cond: ((room_id = 5) AND (start_time &lt; &#39;2024-03-01 15:30:00&#39;::timestamp without time zone))
+   Filter: (end_time &gt; &#39;2024-03-01 14:00:00&#39;::timestamp without time zone)
+   -&gt;  Bitmap Index Scan on big_bookings_start_idx
+         Index Cond: ((room_id = 5) AND (start_time &lt; &#39;2024-03-01 15:30:00&#39;::timestamp without time zone))
+(5 rows)</code></pre>
+<p>The index can only say "starts before 15:30", which is every booking of room 5 from January 1st up to that day. The <code>end_time</code> condition is applied afterwards as a filter. A GiST index on the interval as a range lets PostgreSQL search both ends at once. <code>btree_gist</code> is needed so that the plain integer <code>room_id</code> can be part of a GiST index:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> EXTENSION <span class="cf">IF</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> btree_gist;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> big_bookings_range_idx</span>
+<span>    <span class="kw">ON</span> big_bookings <span class="kw">USING</span> gist (room_id, tsrange(start_time, end_time));</span>
+<span><span class="kw">DROP</span> <span class="kw">INDEX</span> big_bookings_start_idx;</span>
+<span><span class="kw">ANALYZE</span> big_bookings;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (COSTS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> big_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">5</span></span>
+<span>  <span class="kw">AND</span> tsrange(start_time, end_time) &amp;&amp; tsrange(<span class="st">&#39;2024-03-01 14:00&#39;</span>, <span class="st">&#39;2024-03-01 15:30&#39;</span>);</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_bookings
+   Recheck Cond: ((room_id = 5) AND (tsrange(start_time, end_time) &amp;&amp; &#39;[&quot;2024-03-01 14:00:00&quot;,&quot;2024-03-01 15:30:00&quot;)&#39;::tsrange))
+   -&gt;  Bitmap Index Scan on big_bookings_range_idx
+         Index Cond: ((room_id = 5) AND (tsrange(start_time, end_time) &amp;&amp; &#39;[&quot;2024-03-01 14:00:00&quot;,&quot;2024-03-01 15:30:00&quot;)&#39;::tsrange))
+(4 rows)</code></pre>
+<p>Both conditions now sit in the <code>Index Cond</code>. <code>&amp;&amp;</code> is the range "overlaps" operator, and <code>tsrange(a, b)</code> is the half-open range <code>[a, b)</code>, so it gives the same answer as the explicit <code>&lt;</code> and <code>&gt;</code> condition. The two queries return the same two bookings for this slot.</p>
+<h2 id="finding-every-conflict-in-one-pass-running-maximum">Finding every conflict in one pass: running maximum</h2>
+<p>For an audit of a whole table there is a cheaper approach than the self-join: sort each room by start time and compare each booking with the latest end time seen so far. The tempting shortcut is <code>LEAD</code>, which compares each booking only with the next one. It works on the sample data and is wrong in general. Room 3 has one all-day booking with three short meetings inside it:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> room_bookings (room_id, booked_by, start_time, end_time, description) <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Gina&#39;</span>, <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="st">&#39;2024-06-10 17:00&#39;</span>, <span class="st">&#39;Offsite&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Hugo&#39;</span>, <span class="st">&#39;2024-06-10 10:00&#39;</span>, <span class="st">&#39;2024-06-10 11:00&#39;</span>, <span class="st">&#39;Interview A&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Ivy&#39;</span>,  <span class="st">&#39;2024-06-10 13:00&#39;</span>, <span class="st">&#39;2024-06-10 14:00&#39;</span>, <span class="st">&#39;Interview B&#39;</span>),</span>
+<span>    (<span class="dv">3</span>, <span class="st">&#39;Jon&#39;</span>,  <span class="st">&#39;2024-06-10 15:00&#39;</span>, <span class="st">&#39;2024-06-10 16:00&#39;</span>, <span class="st">&#39;Interview C&#39;</span>);</span></code></pre>
+<p>The self-join finds Gina's three conflicts:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> a.booked_by <span class="kw">AS</span> person_a, b.booked_by <span class="kw">AS</span> person_b</span>
+<span><span class="kw">FROM</span> room_bookings a</span>
+<span><span class="kw">JOIN</span> room_bookings b</span>
+<span>  <span class="kw">ON</span>  a.room_id <span class="op">=</span> b.room_id</span>
+<span>  <span class="kw">AND</span> a.booking_id <span class="op">&lt;</span> b.booking_id</span>
+<span>  <span class="kw">AND</span> a.start_time <span class="op">&lt;</span> b.end_time</span>
+<span>  <span class="kw">AND</span> a.end_time   <span class="op">&gt;</span> b.start_time</span>
+<span><span class="kw">WHERE</span> a.room_id <span class="op">=</span> <span class="dv">3</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> a.booking_id, b.booking_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> person_a | person_b
+----------+----------
+ Gina     | Hugo
+ Gina     | Ivy
+ Gina     | Jon
+(3 rows)</code></pre>
+<p>Now the <code>LEAD</code> version, which compares each booking's end with the next booking's start:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ordered <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> booking_id, room_id, booked_by, end_time,</span>
+<span>           <span class="fu">LEAD</span>(booked_by)  <span class="kw">OVER</span> w <span class="kw">AS</span> next_person,</span>
+<span>           <span class="fu">LEAD</span>(start_time) <span class="kw">OVER</span> w <span class="kw">AS</span> next_start</span>
+<span>    <span class="kw">FROM</span> room_bookings</span>
+<span>    WINDOW w <span class="kw">AS</span> (<span class="kw">PARTITION</span> <span class="kw">BY</span> room_id <span class="kw">ORDER</span> <span class="kw">BY</span> start_time, booking_id)</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> room_id, booked_by, next_person</span>
+<span><span class="kw">FROM</span> ordered</span>
+<span><span class="kw">WHERE</span> end_time <span class="op">&gt;</span> next_start</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> room_id, next_start;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> room_id | booked_by | next_person
+---------+-----------+-------------
+       1 | Charlie   | Diana
+       3 | Gina      | Hugo
+(2 rows)</code></pre>
+<p>Ivy and Jon are missing. Hugo's meeting ends at 11:00, and the next booking (Ivy, 13:00) starts later, so the check passes even though Gina's booking is still running. A booking can overlap anything that started earlier, not just its immediate predecessor.</p>
+<p>The fix is to compare each booking's start with the maximum end time of all earlier bookings in the room. <code>ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING</code> leaves the current row out of the maximum:</p>
+<pre class="code"><code><span><span class="kw">WITH</span> ordered <span class="kw">AS</span> (</span>
+<span>    <span class="kw">SELECT</span> booking_id, room_id, booked_by, start_time,</span>
+<span>           <span class="fu">max</span>(end_time) <span class="kw">OVER</span> (</span>
+<span>               <span class="kw">PARTITION</span> <span class="kw">BY</span> room_id</span>
+<span>               <span class="kw">ORDER</span> <span class="kw">BY</span> start_time, booking_id</span>
+<span>               <span class="kw">ROWS</span> <span class="kw">BETWEEN</span> <span class="kw">UNBOUNDED</span> <span class="kw">PRECEDING</span> <span class="kw">AND</span> <span class="dv">1</span> <span class="kw">PRECEDING</span></span>
+<span>           ) <span class="kw">AS</span> busy_until</span>
+<span>    <span class="kw">FROM</span> room_bookings</span>
+<span>)</span>
+<span><span class="kw">SELECT</span> room_id, booked_by, start_time:<span class="ch">:time</span> <span class="kw">AS</span> starts, busy_until:<span class="ch">:time</span> <span class="kw">AS</span> busy_until</span>
+<span><span class="kw">FROM</span> ordered</span>
+<span><span class="kw">WHERE</span> start_time <span class="op">&lt;</span> busy_until</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> room_id, start_time;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> room_id | booked_by |  starts  | busy_until
+---------+-----------+----------+------------
+       1 | Diana     | 14:00:00 | 14:30:00
+       3 | Hugo      | 10:00:00 | 17:00:00
+       3 | Ivy       | 13:00:00 | 17:00:00
+       3 | Jon       | 15:00:00 | 17:00:00
+(4 rows)</code></pre>
+<p>Each row is a booking that starts while something earlier in the same room is still running. Gina is not listed because nothing runs before her. Diana, Hugo, Ivy and Jon are exactly the later members of the four conflicting pairs found by the self-join (Charlie-Diana, and Gina with each of the three). This takes one sort and one pass per room instead of comparing every pair.</p>
+<p>The result is a list of bookings that have a conflict, not the partner each one conflicts with. When you need the partner, run the self-join on the flagged rooms. Ordering by <code>booking_id</code> as well as <code>start_time</code> makes bookings that start at the same moment sort the same way every time.</p>
+<h2 id="overlaps">OVERLAPS</h2>
+<p>PostgreSQL has the standard SQL <code>OVERLAPS</code> operator for two <code>(start, end)</code> pairs:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> booking_id, booked_by</span>
+<span><span class="kw">FROM</span> room_bookings</span>
+<span><span class="kw">WHERE</span> room_id <span class="op">=</span> <span class="dv">1</span></span>
+<span>  <span class="kw">AND</span> (start_time, end_time) <span class="kw">OVERLAPS</span> (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 14:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 15:30&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> booking_id;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> booking_id | booked_by
+------------+-----------
+          3 | Charlie
+          4 | Diana
+(2 rows)</code></pre>
+<p>It treats the periods as half-open, so touching periods do not overlap. Two details differ from the hand-written condition. A period whose start equals its end counts as a single instant, and an instant at the start of another period does overlap it. And if the two values of a pair are given in reverse order, PostgreSQL swaps them instead of rejecting them:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 10:00&#39;</span>)</span>
+<span>           <span class="kw">OVERLAPS</span> (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 10:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 11:00&#39;</span>) <span class="kw">AS</span> touching,</span>
+<span>       (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 09:00&#39;</span>)</span>
+<span>           <span class="kw">OVERLAPS</span> (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 09:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 11:00&#39;</span>) <span class="kw">AS</span> instant_at_start,</span>
+<span>       (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 11:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 09:00&#39;</span>)</span>
+<span>           <span class="kw">OVERLAPS</span> (<span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 10:00&#39;</span>, <span class="dt">TIMESTAMP</span> <span class="st">&#39;2024-06-10 10:30&#39;</span>) <span class="kw">AS</span> reversed;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> touching | instant_at_start | reversed
+----------+------------------+----------
+ f        | t                | t
+(1 row)</code></pre>
+<p><code>CHECK (end_time &gt; start_time)</code> in the table rules out the instant case. <code>OVERLAPS</code> cannot use a GiST range index like the one above, so for large tables the explicit condition or <code>&amp;&amp;</code> on a range is the better tool.</p>
+<h2 id="range-types-and-exclusion-constraints">Range types and exclusion constraints</h2>
+<p>Everything so far finds conflicts after they exist. PostgreSQL can refuse them instead. Store the interval as a range and add an exclusion constraint:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> room_bookings_v2 (</span>
+<span>    booking_id  <span class="dt">INT</span> <span class="kw">GENERATED</span> ALWAYS <span class="kw">AS</span> IDENTITY <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    room_id     <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    booked_by   <span class="dt">VARCHAR</span>(<span class="dv">100</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    during      TSRANGE <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    EXCLUDE <span class="kw">USING</span> gist (room_id <span class="kw">WITH</span> <span class="op">=</span>, during <span class="kw">WITH</span> &amp;&amp;)</span>
+<span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> room_bookings_v2 (room_id, booked_by, during) <span class="kw">VALUES</span></span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;[2024-06-10 09:00, 2024-06-10 10:00)&#39;</span>),</span>
+<span>    (<span class="dv">1</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;[2024-06-10 10:00, 2024-06-10 11:30)&#39;</span>),</span>
+<span>    (<span class="dv">2</span>, <span class="st">&#39;Frank&#39;</span>, <span class="st">&#39;[2024-06-10 09:30, 2024-06-10 10:30)&#39;</span>);</span></code></pre>
+<p>The constraint reads: no two rows may have equal <code>room_id</code> and overlapping <code>during</code>. Bob's booking starts exactly where Alice's ends, and the half-open range <code>[...)</code> makes that legal. Frank is in a different room, so his overlapping time is also fine.</p>
+<p>An insert that really overlaps is rejected by the database, whichever application sends it:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> room_bookings_v2 (room_id, booked_by, during)</span>
+<span><span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;Carol&#39;</span>, <span class="st">&#39;[2024-06-10 09:30, 2024-06-10 10:30)&#39;</span>);</span></code></pre>
+<pre class="text"><code>ERROR:  conflicting key value violates exclusion constraint &quot;room_bookings_v2_room_id_during_excl&quot;
+DETAIL:  Key (room_id, during)=(1, [&quot;2024-06-10 09:30:00&quot;,&quot;2024-06-10 10:30:00&quot;)) conflicts with existing key (room_id, during)=(1, [&quot;2024-06-10 09:00:00&quot;,&quot;2024-06-10 10:00:00&quot;)).</code></pre>
+<p>This is also the safe way to prevent double bookings. The application-side pattern "run the overlap query, insert if it is empty" has a race: two sessions can both see an empty result and both insert. The constraint is enforced by the database, which makes one of the two inserts fail. The index behind it is the same kind of GiST index as in the Speed section, so the check stays cheap on large tables.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Two intervals overlap when <code>a_start &lt; b_end AND a_end &gt; b_start</code>. Write it once instead of listing cases.</li>
+<li>Decide whether touching ends conflict. Half-open (strict <code>&lt;</code> and <code>&gt;</code>) is right for time slots.</li>
+<li>For a single availability check, a GiST index on <code>tsrange(start, end)</code> serves both ends of the condition; a B-tree on the start column serves only one.</li>
+<li>To scan a whole table, use a running <code>max(end_time)</code> over the earlier rows, not <code>LEAD</code>, which misses a long booking that spans several short ones.</li>
+<li>To prevent overlaps instead of detecting them, use a range column with <code>EXCLUDE USING gist</code>.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day16.pdf" download>Download PDF · Day 16</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../15/">← Day 15</a>
+  <a href="../../">All 31 days</a>
+  <a href="../17/">Day 17 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/16/</span>
+</footer>
+
+</body>
+</html>

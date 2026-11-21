@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 28: Why DELETE Does Not Shrink a PostgreSQL Table: MVCC, VACUUM and Bloat · #31DaysMaySQL</title>
+<meta name="description" content="DELETE and UPDATE leave dead row versions behind. What VACUUM, VACUUM FULL and autovacuum do with them, what a long transaction does to cleanup, and how to measure bloat.">
+<meta name="author" content="Imam Hambali">
+<meta property="og:title" content="Day 28: Why DELETE Does Not Shrink a PostgreSQL Table: MVCC, VACUUM and Bloat">
+<meta property="og:description" content="DELETE and UPDATE leave dead row versions behind. What VACUUM, VACUUM FULL and autovacuum do with them, what a long transaction does to cleanup, and how to measure bloat.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23060D0A'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' text-anchor='middle' fill='%2339FF8F'%3E31%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../day.css">
+</head>
+<body>
+
+<nav class="top wrap" aria-label="Series">
+  <a href="../../">← All 31 days</a>
+  <span class="pn"><a href="../27/">← Day 27</a><a href="../29/">Day 29 →</a></span>
+</nav>
+
+<header class="wrap">
+  <p class="eyebrow">#31DaysMaySQL · Day 28</p>
+  <h1>Why DELETE Does Not Shrink a PostgreSQL Table: MVCC, VACUUM and Bloat</h1>
+  <p class="byline">Imam Hambali · May 2026</p>
+</header>
+
+<main class="wrap article">
+<p>A common first encounter with PostgreSQL maintenance goes like this. You delete half the rows of a big table, check its size, and it is exactly the same. You run <code>VACUUM</code>, and the size is still the same. You run <code>VACUUM FULL</code>, the table finally shrinks, and every query on it waits while that runs.</p>
+<p>None of this is a bug. It follows from how PostgreSQL keeps readers and writers from blocking each other, and once you see the mechanism the rest of the maintenance advice (autovacuum settings, long transactions, <code>fillfactor</code>, <code>REINDEX</code>) stops looking like a list of unrelated tricks.</p>
+<p>Everything here is PostgreSQL-specific. InnoDB in MySQL also keeps old row versions for concurrent readers, but it stores them in undo logs instead of leaving them in the table, so the symptoms differ. The examples run on PostgreSQL 18. The demo tables are created with <code>autovacuum_enabled = off</code> so the background worker does not clean up in the middle of an experiment; you would not do that in production.</p>
+<h2 id="what-delete-and-update-do-to-a-row">What DELETE and UPDATE do to a row</h2>
+<p>A <code>DELETE</code> does not erase anything. It stamps the row version with the ID of the deleting transaction, and the version stays in the table until no running transaction could still need to see it. An <code>UPDATE</code> is a delete plus an insert: the old version is stamped, and a new version is written, usually at a different position in the table.</p>
+<p>Row counts come from the cumulative statistics system, which sessions report to asynchronously. The small procedure below makes a session publish its pending numbers and pause for a second, and the examples call it before every statistics query:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">PROCEDURE</span> flush_stats() LANGUAGE sql</span>
+<span><span class="kw">AS</span> <span class="st">&#39;SELECT pg_stat_force_next_flush(), pg_sleep(1)&#39;</span>;</span></code></pre>
+<p>The position of a row version is its <code>ctid</code>, a (page, slot) pair. Ten small rows fit on the first page, and updating row 3 moves it:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span>    order_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    status    TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> orders</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;new&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10</span>) g;</span>
+<span></span>
+<span><span class="kw">SELECT</span> order_id, ctid <span class="kw">FROM</span> orders <span class="kw">WHERE</span> order_id <span class="op">=</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> order_id | ctid
+----------+-------
+        3 | (0,3)
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">UPDATE</span> orders <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;shipped&#39;</span> <span class="kw">WHERE</span> order_id <span class="op">=</span> <span class="dv">3</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> order_id, ctid <span class="kw">FROM</span> orders <span class="kw">WHERE</span> order_id <span class="op">=</span> <span class="dv">3</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> order_id |  ctid
+----------+--------
+        3 | (0,11)
+(1 row)</code></pre>
+<p>The new version sits in slot 11 of page 0. The version in slot 3 is still there, invisible to new queries, and it is what the statistics view counts as a dead tuple:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> n_live_tup, n_dead_tup</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;orders&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n_live_tup | n_dead_tup
+------------+------------
+         10 |          1
+(1 row)</code></pre>
+<p>Update the same row 99 more times and the table holds 10 live rows and 100 dead versions:</p>
+<pre class="code"><code><span>DO $$ <span class="cf">BEGIN</span> <span class="cf">FOR</span> i <span class="kw">IN</span> <span class="dv">1</span><span class="op">..</span><span class="dv">99</span> <span class="cf">LOOP</span> <span class="kw">UPDATE</span> orders <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;update &#39;</span> <span class="op">||</span> i <span class="kw">WHERE</span> order_id <span class="op">=</span> <span class="dv">3</span>; <span class="cf">END</span> <span class="cf">LOOP</span>; <span class="cf">END</span> $$;</span>
+<span></span>
+<span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> n_live_tup, n_dead_tup</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;orders&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n_live_tup | n_dead_tup
+------------+------------
+         10 |        100
+(1 row)</code></pre>
+<p><code>n_dead_tup</code> comes from the statistics system and is an estimate, not a count taken from the pages. For this table it is exact because nothing else touched it. PostgreSQL can also remove dead versions of an updated row on its own when it next visits a nearly full page (called pruning), so on a busy table the number can lag behind the physical state. Treat it as a gauge.</p>
+<h2 id="a-delete-does-not-shrink-the-file">A DELETE does not shrink the file</h2>
+<p>Take a table of 100,000 rows and delete the first half. The <code>size_log</code> table records the number of 8 kB pages at each step, so we can compare them without printing sizes that depend on the platform:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span>    event_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    payload   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span></span>
+<span><span class="kw">SELECT</span> g, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">100</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> size_log (</span>
+<span>    step   SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    <span class="kw">label</span>  TEXT,</span>
+<span>    pages  BIGINT</span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> size_log (<span class="kw">label</span>, pages)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;loaded&#39;</span>, pg_relation_size(<span class="st">&#39;events&#39;</span>) <span class="op">/</span> <span class="dv">8192</span>;</span>
+<span></span>
+<span><span class="kw">DELETE</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id <span class="op">&lt;=</span> <span class="dv">50000</span>;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> size_log (<span class="kw">label</span>, pages)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;after delete&#39;</span>, pg_relation_size(<span class="st">&#39;events&#39;</span>) <span class="op">/</span> <span class="dv">8192</span>;</span></code></pre>
+<p>The statistics now show half the table as dead:</p>
+<pre class="code"><code><span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> n_live_tup,</span>
+<span>       n_dead_tup,</span>
+<span>       <span class="fu">ROUND</span>(<span class="fl">100.0</span> <span class="op">*</span> n_dead_tup <span class="op">/</span> <span class="fu">NULLIF</span>(n_live_tup <span class="op">+</span> n_dead_tup, <span class="dv">0</span>), <span class="dv">1</span>) <span class="kw">AS</span> dead_pct</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;events&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n_live_tup | n_dead_tup | dead_pct
+------------+------------+----------
+      50000 |      50000 |     50.0
+(1 row)</code></pre>
+<pre class="code"><code><span><span class="kw">SELECT</span> <span class="kw">label</span>, pages <span class="op">=</span> <span class="fu">first_value</span>(pages) <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> step) <span class="kw">AS</span> same_as_loaded</span>
+<span><span class="kw">FROM</span> size_log</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> step;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>    label     | same_as_loaded
+--------------+----------------
+ loaded       | t
+ after delete | t
+(2 rows)</code></pre>
+<p>The file did not change. A sequential scan of <code>events</code> still reads every page, including the ones that now hold nothing but dead rows.</p>
+<h2 id="finding-bloat">Finding bloat</h2>
+<p>The same query without the <code>WHERE relname = ...</code> filter, ordered by <code>n_dead_tup DESC</code>, gives a per-database overview. Add <code>last_autovacuum</code> and <code>last_vacuum</code> to see whether cleanup is happening at all:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> relname,</span>
+<span>       pg_size_pretty(pg_relation_size(relid)) <span class="kw">AS</span> table_size,</span>
+<span>       n_live_tup, n_dead_tup,</span>
+<span>       <span class="fu">ROUND</span>(<span class="fl">100.0</span> <span class="op">*</span> n_dead_tup <span class="op">/</span> <span class="fu">NULLIF</span>(n_live_tup <span class="op">+</span> n_dead_tup, <span class="dv">0</span>), <span class="dv">1</span>) <span class="kw">AS</span> dead_pct,</span>
+<span>       last_autovacuum, last_vacuum</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> n_dead_tup <span class="kw">DESC</span></span>
+<span><span class="kw">LIMIT</span> <span class="dv">20</span>;</span></code></pre>
+<p>Two caveats. These numbers are estimates, and they only count dead rows, not free space inside pages that earlier cleanup already reclaimed but that was never given back to the operating system. There is also no universal threshold: 30% dead on a small table does not matter, and 5% of a table that is hundreds of gigabytes may be many gigabytes. If you need exact figures for one table, the <code>pgstattuple</code> extension reads the pages and reports dead tuple and free space percentages (<code>CREATE EXTENSION pgstattuple; SELECT * FROM pgstattuple('events');</code>). It scans the whole table, so run it deliberately.</p>
+<h2 id="what-plain-vacuum-does">What plain VACUUM does</h2>
+<p><code>VACUUM</code> goes through the table, finds row versions that no transaction can see any more, and marks their space as reusable. It also updates the visibility map and the free space map, and with <code>VACUUM ANALYZE</code> it refreshes planner statistics.</p>
+<pre class="code"><code><span>VACUUM <span class="kw">events</span>;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> size_log (<span class="kw">label</span>, pages)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;after vacuum&#39;</span>, pg_relation_size(<span class="st">&#39;events&#39;</span>) <span class="op">/</span> <span class="dv">8192</span>;</span>
+<span></span>
+<span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> n_live_tup, n_dead_tup</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;events&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n_live_tup | n_dead_tup
+------------+------------
+      50000 |          0
+(1 row)</code></pre>
+<p>The dead rows are gone, and the file is still the same size. The space is not lost, though. Insert another 50,000 rows and they go into the freed pages instead of extending the file:</p>
+<pre class="code"><code><span><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span></span>
+<span><span class="kw">SELECT</span> g, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">100</span>) <span class="kw">FROM</span> generate_series(<span class="dv">100001</span>, <span class="dv">150000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> size_log (<span class="kw">label</span>, pages)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;after reinsert&#39;</span>, pg_relation_size(<span class="st">&#39;events&#39;</span>) <span class="op">/</span> <span class="dv">8192</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> <span class="kw">label</span>, pages <span class="op">=</span> <span class="fu">first_value</span>(pages) <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> step) <span class="kw">AS</span> same_as_loaded</span>
+<span><span class="kw">FROM</span> size_log</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> step;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>     label      | same_as_loaded
+----------------+----------------
+ loaded         | t
+ after delete   | t
+ after vacuum   | t
+ after reinsert | t
+(4 rows)</code></pre>
+<p>So for a table with steady churn (rows deleted and inserted at a similar rate), plain <code>VACUUM</code> is all that is needed: the file stops growing at a size that fits the working set.</p>
+<h3 id="when-vacuum-does-shrink-the-file">When VACUUM does shrink the file</h3>
+<p>There is one exception to "plain <code>VACUUM</code> never returns space". If the pages at the end of the file are completely empty, <code>VACUUM</code> truncates them and gives that space back to the operating system. It takes a short exclusive lock to do so and skips the truncation if it cannot get the lock quickly.</p>
+<p>The <code>events</code> delete above emptied the front of the table, which cannot be truncated. Delete from the end instead:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> logs (</span>
+<span>    log_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    msg     TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> logs</span>
+<span><span class="kw">SELECT</span> g, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">100</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> size_log (<span class="kw">label</span>, pages)</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;logs loaded&#39;</span>, pg_relation_size(<span class="st">&#39;logs&#39;</span>) <span class="op">/</span> <span class="dv">8192</span>;</span>
+<span></span>
+<span><span class="kw">DELETE</span> <span class="kw">FROM</span> logs <span class="kw">WHERE</span> log_id <span class="op">&gt;</span> <span class="dv">50000</span>;</span>
+<span></span>
+<span>VACUUM logs;</span>
+<span></span>
+<span><span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;logs&#39;</span>) <span class="op">/</span> <span class="dv">8192</span> <span class="op">&lt;</span> (<span class="kw">SELECT</span> pages <span class="kw">FROM</span> size_log <span class="kw">WHERE</span> <span class="kw">label</span> <span class="op">=</span> <span class="st">&#39;logs loaded&#39;</span>) <span class="kw">AS</span> truncated;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> truncated
+-----------
+ t
+(1 row)</code></pre>
+<p>This is why deleting old rows from a table that is filled in time order (the oldest are at the front) does not shrink it, while deleting the newest rows does. If the table is partitioned by time, dropping a partition avoids the whole question: the file is removed and no dead rows exist.</p>
+<h3 id="locking">Locking</h3>
+<p>Plain <code>VACUUM</code> takes a <code>SHARE UPDATE EXCLUSIVE</code> lock on the table. That mode does not conflict with <code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code>, so the application keeps working. It does conflict with itself and with schema changes such as <code>ALTER TABLE</code>, which will wait until the vacuum finishes. I checked the first part by holding that lock in one session and running an <code>UPDATE</code> on the same table in another: the update went through.</p>
+<h2 id="vacuum-full">VACUUM FULL</h2>
+<p><code>VACUUM FULL</code> writes a new copy of the table containing only live rows and swaps it in. That is the only built-in way to shrink a table whose free space is spread through the file. <code>events</code> is full again after the reinsert, so delete every second row first and then rewrite it:</p>
+<pre class="code"><code><span><span class="kw">DELETE</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_id % <span class="dv">2</span> <span class="op">=</span> <span class="dv">0</span>;</span></code></pre>
+<pre class="code"><code><span>VACUUM <span class="kw">FULL</span> <span class="kw">events</span>;</span>
+<span></span>
+<span><span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;events&#39;</span>) <span class="op">/</span> <span class="dv">8192</span></span>
+<span>     <span class="op">&lt;</span> (<span class="kw">SELECT</span> pages <span class="kw">FROM</span> size_log <span class="kw">WHERE</span> <span class="kw">label</span> <span class="op">=</span> <span class="st">&#39;loaded&#39;</span>) <span class="kw">AS</span> smaller_than_loaded;</span></code></pre>
+<pre class="text"><code> smaller_than_loaded
+---------------------
+ t
+(1 row)</code></pre>
+<p>The result depends on what else is open on the server, because <code>VACUUM FULL</code> keeps any row that another open transaction might still see, so treat this block as an observation and not something to rerun on a busy system. On an otherwise idle database the table went from 1725 pages to 863; exact page counts depend on platform and version.</p>
+<p>The price is an <code>ACCESS EXCLUSIVE</code> lock for the whole rewrite. I confirmed it by running <code>VACUUM FULL</code> on a table and reading <code>pg_locks</code> from a second session, which showed <code>AccessExclusiveLock</code> granted. That mode blocks every other access to the table, reads included, and the rewrite needs enough free disk for a second copy of the table and its indexes. How long it takes depends on table size and disk speed; plan it as downtime, or look at online tools such as the <code>pg_repack</code> and <code>pg_squeeze</code> extensions, which rewrite the table while it stays available (they have their own requirements, so read their documentation first).</p>
+<h2 id="long-transactions-hold-back-cleanup">Long transactions hold back cleanup</h2>
+<p><code>VACUUM</code> can only remove a dead version if no running transaction could still see it. One transaction left open (an idle connection after a <code>BEGIN</code>, a forgotten report, an abandoned replication slot) pins everything that died after it started, in every table of the database. It is one of the most common reasons for a table that stays bloated despite vacuuming.</p>
+<p>This needs two sessions, so here is what I ran, as two <code>psql</code> processes started a couple of seconds apart. Session A opens a snapshot and sleeps; session B deletes rows and vacuums:</p>
+<pre class="code"><code><span><span class="co">-- session A</span></span>
+<span><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> jobs;      <span class="co">-- 1000 rows; takes the snapshot</span></span>
+<span><span class="kw">SELECT</span> pg_sleep(<span class="dv">8</span>);</span>
+<span><span class="kw">COMMIT</span>;</span>
+<span></span>
+<span><span class="co">-- session B, while A is sleeping</span></span>
+<span><span class="kw">DELETE</span> <span class="kw">FROM</span> jobs <span class="kw">WHERE</span> job_id <span class="op">&lt;=</span> <span class="dv">500</span>;</span>
+<span>VACUUM (VERBOSE) jobs;</span></code></pre>
+<p>The relevant line of <code>VACUUM VERBOSE</code> in session B:</p>
+<pre class="text"><code>tuples: 0 removed, 1000 remain, 500 are dead but not yet removable</code></pre>
+<p>Once session A had committed, the same <code>VACUUM (VERBOSE) jobs</code> reported:</p>
+<pre class="text"><code>tuples: 500 removed, 500 remain, 0 are dead but not yet removable</code></pre>
+<p>The phrase to look for is "dead but not yet removable". To find the culprit, list sessions that have an open transaction, oldest first. <code>backend_xmin</code> is the snapshot horizon a session is holding:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> pid, state, backend_xmin, now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_age,</span>
+<span>       <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">80</span>) <span class="kw">AS</span> <span class="kw">query</span></span>
+<span><span class="kw">FROM</span> pg_stat_activity</span>
+<span><span class="kw">WHERE</span> xact_start <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> xact_start;</span></code></pre>
+<p>Sessions in state <code>idle in transaction</code> are the usual suspects. Setting <code>idle_in_transaction_session_timeout</code> makes the server end them. Also check <code>pg_replication_slots</code> and <code>pg_prepared_xacts</code> for old entries, because they hold back the horizon in the same way.</p>
+<h2 id="autovacuum">Autovacuum</h2>
+<p>The autovacuum launcher starts a worker for a table when the number of dead tuples exceeds <code>autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * reltuples</code>. These are the defaults:</p>
+<pre class="code"><code><span><span class="kw">SELECT</span> name, setting</span>
+<span><span class="kw">FROM</span> pg_settings</span>
+<span><span class="kw">WHERE</span> name <span class="kw">IN</span> (<span class="st">&#39;autovacuum_vacuum_threshold&#39;</span>,</span>
+<span>               <span class="st">&#39;autovacuum_vacuum_scale_factor&#39;</span>,</span>
+<span>               <span class="st">&#39;autovacuum_naptime&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> name;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>              name              | setting
+--------------------------------+---------
+ autovacuum_naptime             | 60
+ autovacuum_vacuum_scale_factor | 0.2
+ autovacuum_vacuum_threshold    | 50
+(3 rows)</code></pre>
+<p>That is 50 dead rows plus 20% of the table, checked once a minute (<code>autovacuum_naptime</code> is in seconds). Since PostgreSQL 13 there is a similar trigger for insert-only tables (<code>autovacuum_vacuum_insert_threshold</code>, default 1000, with its own scale factor) so that the visibility map gets set after bulk loads.</p>
+<p>The 20% default is reasonable for a table of ten thousand rows and too lax for one with a hundred million: 20 million dead rows must pile up first. Both the trigger and the speed can be overridden per table:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> jobs (</span>
+<span>    job_id  <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    state   TEXT <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">ALTER</span> <span class="kw">TABLE</span> jobs <span class="kw">SET</span> (</span>
+<span>    autovacuum_vacuum_scale_factor <span class="op">=</span> <span class="fl">0.02</span>,</span>
+<span>    autovacuum_vacuum_cost_limit   <span class="op">=</span> <span class="dv">1000</span></span>
+<span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> reloptions <span class="kw">FROM</span> pg_class <span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;jobs&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                               reloptions
+-------------------------------------------------------------------------
+ {autovacuum_vacuum_scale_factor=0.02,autovacuum_vacuum_cost_limit=1000}
+(1 row)</code></pre>
+<p>The first setting starts autovacuum at 2% dead rows instead of 20%. The second raises the work budget per throttling pause: autovacuum is deliberately throttled by a cost budget so it does not saturate the disk, so a table with heavy write traffic may need a larger limit, not just an earlier trigger. After a very large delete you do not have to wait for the next autovacuum round: run <code>VACUUM</code> on that table yourself. It will not shrink the file unless the deleted rows were at the end, as shown above.</p>
+<h2 id="the-visibility-map-and-index-only-scans">The visibility map and index-only scans</h2>
+<p>The visibility map has one bit per table page, set by <code>VACUUM</code> when every row on the page is visible to all transactions. An <code>Index Only Scan</code> uses it to skip the table: if the page is all-visible, the answer is in the index entry alone, otherwise the executor must visit the page to check row visibility. EXPLAIN reports those visits as <code>Heap Fetches</code>.</p>
+<p>A freshly loaded table has an empty map. The planner knows how much of the table is all-visible (from <code>pg_class.relallvisible</code>) and takes that into account in its costs, so before the first vacuum it does not choose an index-only scan here:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> accounts (</span>
+<span>    <span class="kw">id</span>       <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    balance  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">SELECT</span> g, <span class="dv">0</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">id</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="kw">BETWEEN</span> <span class="dv">1</span> <span class="kw">AND</span> <span class="dv">1000</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                               QUERY PLAN
+------------------------------------------------------------------------
+ Bitmap Heap Scan on accounts (actual rows=1000.00 loops=1)
+   Recheck Cond: ((id &gt;= 1) AND (id &lt;= 1000))
+   Heap Blocks: exact=5
+   -&gt;  Bitmap Index Scan on accounts_pkey (actual rows=1000.00 loops=1)
+         Index Cond: ((id &gt;= 1) AND (id &lt;= 1000))
+         Index Searches: 1
+(6 rows)</code></pre>
+<p>After <code>VACUUM</code> the same query is an index-only scan that never touches the table:</p>
+<pre class="code"><code><span>VACUUM accounts;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">id</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="kw">BETWEEN</span> <span class="dv">1</span> <span class="kw">AND</span> <span class="dv">1000</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                  QUERY PLAN
+-------------------------------------------------------------------------------
+ Index Only Scan using accounts_pkey on accounts (actual rows=1000.00 loops=1)
+   Index Cond: ((id &gt;= 1) AND (id &lt;= 1000))
+   Heap Fetches: 0
+   Index Searches: 1
+(4 rows)</code></pre>
+<p>Now update those 1,000 rows. The pages that hold their new versions are no longer all-visible, and the old versions still have index entries:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">1</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">&lt;=</span> <span class="dv">1000</span>;</span>
+<span></span>
+<span><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, COSTS <span class="kw">OFF</span>, TIMING <span class="kw">OFF</span>, <span class="kw">SUMMARY</span> <span class="kw">OFF</span>, BUFFERS <span class="kw">OFF</span>)</span>
+<span><span class="kw">SELECT</span> <span class="kw">id</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="kw">BETWEEN</span> <span class="dv">1</span> <span class="kw">AND</span> <span class="dv">1000</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code>                                  QUERY PLAN
+-------------------------------------------------------------------------------
+ Index Only Scan using accounts_pkey on accounts (actual rows=1000.00 loops=1)
+   Index Cond: ((id &gt;= 1) AND (id &lt;= 1000))
+   Heap Fetches: 2000
+   Index Searches: 1
+(4 rows)</code></pre>
+<p>The plan is still an index-only scan, but each of the 2,000 index entries (1,000 old, 1,000 new) needs a visit to the table. It is sometimes said that the planner "falls back to an index scan" when vacuum is behind. What actually happens is that the plan keeps its shape and the work per row quietly goes back to what an ordinary index scan would do. When an index-only query gets slower over time, <code>Heap Fetches</code> in <code>EXPLAIN (ANALYZE)</code> tells you whether the visibility map is the reason.</p>
+<h2 id="index-bloat">Index bloat</h2>
+<p>Every row version needs its own entry in every index of the table, unless the update is HOT (next section). So an update of 10,000 rows adds 10,000 entries to each index, and the entries for the old versions are only removed by <code>VACUUM</code>. Even after that, the index file does not shrink, for the same reason the table does not: the space is reusable but stays in the file. To see it, update an indexed column and compare sizes before and after:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span>    user_id     <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span>    email       TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span>    last_login  <span class="dt">INT</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="dv">0</span></span>
+<span>) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">INDEX</span> users_email_idx <span class="kw">ON</span> users (email);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users (user_id, email)</span>
+<span><span class="kw">SELECT</span> g, <span class="st">&#39;u&#39;</span> <span class="op">||</span> g <span class="op">||</span> <span class="st">&#39;@example.com&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10000</span>) g;</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> index_size_log (<span class="kw">label</span> TEXT, bytes BIGINT) <span class="kw">WITH</span> (autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> index_size_log</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;loaded&#39;</span>, pg_relation_size(<span class="st">&#39;users_email_idx&#39;</span>);</span>
+<span></span>
+<span><span class="kw">UPDATE</span> users <span class="kw">SET</span> email <span class="op">=</span> <span class="st">&#39;x&#39;</span> <span class="op">||</span> email;</span>
+<span></span>
+<span>VACUUM users;</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> index_size_log</span>
+<span><span class="kw">SELECT</span> <span class="st">&#39;updated and vacuumed&#39;</span>, pg_relation_size(<span class="st">&#39;users_email_idx&#39;</span>);</span>
+<span></span>
+<span><span class="kw">SELECT</span> (<span class="kw">SELECT</span> bytes <span class="kw">FROM</span> index_size_log <span class="kw">WHERE</span> <span class="kw">label</span> <span class="op">=</span> <span class="st">&#39;updated and vacuumed&#39;</span>)</span>
+<span>     <span class="op">&gt;</span> (<span class="kw">SELECT</span> bytes <span class="kw">FROM</span> index_size_log <span class="kw">WHERE</span> <span class="kw">label</span> <span class="op">=</span> <span class="st">&#39;loaded&#39;</span>) <span class="kw">AS</span> index_grew;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> index_grew
+------------
+ t
+(1 row)</code></pre>
+<p><code>REINDEX ... CONCURRENTLY</code> builds a fresh copy of the index next to the old one and swaps them, without blocking reads or writes:</p>
+<pre class="code"><code><span>REINDEX <span class="kw">INDEX</span> CONCURRENTLY users_email_idx;</span>
+<span></span>
+<span><span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;users_email_idx&#39;</span>)</span>
+<span>     <span class="op">&lt;</span> (<span class="kw">SELECT</span> bytes <span class="kw">FROM</span> index_size_log <span class="kw">WHERE</span> <span class="kw">label</span> <span class="op">=</span> <span class="st">&#39;updated and vacuumed&#39;</span>) <span class="kw">AS</span> index_shrank;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> index_shrank
+--------------
+ t
+(1 row)</code></pre>
+<p>It takes longer than a plain <code>REINDEX</code>, needs disk for both copies, cannot run inside a transaction block, and if it fails it leaves an invalid index behind that you have to drop. <code>REINDEX TABLE CONCURRENTLY users</code> does the same for every index on the table.</p>
+<h2 id="hot-updates">HOT updates</h2>
+<p>A Heap-Only Tuple (HOT) update avoids the index growth above. It is possible when two conditions hold: the update changes no indexed column, and the new version fits on the same page as the old one. The index entry keeps pointing to the old version, which links to the new one inside the page.</p>
+<p>Whether the page has room is controlled by <code>fillfactor</code> (default 100, meaning pages are filled completely on insert). Compare two fresh copies of <code>users</code>, one with the default and one with <code>fillfactor = 80</code>, and update the non-indexed column <code>last_login</code> on every tenth row:</p>
+<pre class="code"><code><span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users100 (<span class="kw">LIKE</span> users <span class="kw">INCLUDING</span> <span class="kw">ALL</span>)</span>
+<span><span class="kw">WITH</span> (fillfactor <span class="op">=</span> <span class="dv">100</span>, autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">CREATE</span> <span class="kw">TABLE</span> users80 (<span class="kw">LIKE</span> users <span class="kw">INCLUDING</span> <span class="kw">ALL</span>)</span>
+<span><span class="kw">WITH</span> (fillfactor <span class="op">=</span> <span class="dv">80</span>, autovacuum_enabled <span class="op">=</span> <span class="kw">off</span>);</span>
+<span></span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users100 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users;</span>
+<span><span class="kw">INSERT</span> <span class="kw">INTO</span> users80 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users;</span>
+<span></span>
+<span><span class="kw">UPDATE</span> users100 <span class="kw">SET</span> last_login <span class="op">=</span> <span class="dv">1</span> <span class="kw">WHERE</span> user_id % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span>;</span>
+<span><span class="kw">UPDATE</span> users80 <span class="kw">SET</span> last_login <span class="op">=</span> <span class="dv">1</span> <span class="kw">WHERE</span> user_id % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span>;</span>
+<span></span>
+<span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> relname, n_tup_upd, n_tup_hot_upd</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="kw">IN</span> (<span class="st">&#39;users100&#39;</span>, <span class="st">&#39;users80&#39;</span>)</span>
+<span><span class="kw">ORDER</span> <span class="kw">BY</span> relname;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> relname  | n_tup_upd | n_tup_hot_upd
+----------+-----------+---------------
+ users100 |      1000 |             0
+ users80  |      1000 |          1000
+(2 rows)</code></pre>
+<p>All 1,000 updates on <code>users80</code> were HOT and none on <code>users100</code>, whose pages were full. Updating an indexed column is never HOT, whatever the fillfactor:</p>
+<pre class="code"><code><span><span class="kw">UPDATE</span> users80 <span class="kw">SET</span> email <span class="op">=</span> <span class="st">&#39;y&#39;</span> <span class="op">||</span> email <span class="kw">WHERE</span> user_id % <span class="dv">10</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span></span>
+<span><span class="kw">CALL</span> flush_stats();</span>
+<span></span>
+<span><span class="kw">SELECT</span> n_tup_upd, n_tup_hot_upd</span>
+<span><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;users80&#39;</span>;</span></code></pre>
+<pre class="out" aria-label="Query result"><code> n_tup_upd | n_tup_hot_upd
+-----------+---------------
+      2000 |          1000
+(1 row)</code></pre>
+<p>The cost of a lower <code>fillfactor</code> is a larger table (about 25% more pages at 80), so use it on tables that are updated often and where the updated columns are not indexed, not everywhere. Dead versions created by HOT updates can also be cleaned up by pruning, without waiting for <code>VACUUM</code>, which is the other reason such tables stay compact.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>DELETE</code> and <code>UPDATE</code> leave old row versions in the table. Plain <code>VACUUM</code> makes their space reusable but does not shrink the file, except for empty pages at the very end.</li>
+<li>A table with steady churn reaches a stable size under plain <code>VACUUM</code> or autovacuum. <code>VACUUM FULL</code> is for a one-off shrink and takes an <code>ACCESS EXCLUSIVE</code> lock.</li>
+<li>When vacuum seems to do nothing, look for old transactions in <code>pg_stat_activity</code> and for "dead but not yet removable" in <code>VACUUM VERBOSE</code>.</li>
+<li>For large or hot tables, lower <code>autovacuum_vacuum_scale_factor</code> for that table.</li>
+<li>Slow index-only scans: read <code>Heap Fetches</code> in <code>EXPLAIN (ANALYZE)</code>.</li>
+<li>Updates that change indexed columns grow every index. Updates that do not, with free space on the page, are HOT.</li>
+</ul>
+
+</main>
+
+<section class="wrap download" aria-labelledby="dl-title">
+  <h2 id="dl-title">Download</h2>
+  <p>This day as a PDF, same content as this page.</p>
+  <a class="btn" href="../../days/31DaysMaySQL-Day28.pdf" download>Download PDF · Day 28</a>
+</section>
+
+<nav class="bottom wrap" aria-label="Series">
+  <a href="../27/">← Day 27</a>
+  <a href="../../">All 31 days</a>
+  <a href="../29/">Day 29 →</a>
+</nav>
+
+<footer class="wrap">
+  Written by Imam Hambali · <a href="https://vvizh.com/">vvizh.com</a> · <span class="print-only">31daymaysql.vvizh.com/day/28/</span>
+</footer>
+
+</body>
+</html>
