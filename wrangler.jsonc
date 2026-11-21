@@ -1,0 +1,8 @@
+// Cloudflare Workers Builds config. The site is static: the Worker only serves ./public.
+{
+  "name": "31daymaysql",
+  "compatibility_date": "2026-11-19",
+  "assets": {
+    "directory": "./public"
+  }
+}
